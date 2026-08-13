@@ -42,12 +42,29 @@ interface FscPoint {
   fscRandom: number;         // random-phase FSC
 }
 
+interface GuinierPoint {
+  resolutionSquared: number; // 1/Å²
+  resolution: number;        // Å
+  logAmpOriginal: number;
+  logAmpWeighted: number;
+  logAmpSharpened: number;
+  logAmpIntercept: number;
+}
+
+interface GuinierFit {
+  slope: number;
+  intercept: number;
+  correlation: number;
+}
+
 interface AnalyzeResult {
   jobId: string;
   taskType: string;
   modelClasses: ModelClass[];
   orientations: Orientation[];
   fsc: FscPoint[];
+  guinier: GuinierPoint[];
+  guinierFit: GuinierFit | null;
   classAverageCount: number;
   boxSize: number;
   pixelSize: number;
@@ -79,6 +96,8 @@ export async function GET(req: NextRequest) {
     modelClasses: [],
     orientations: [],
     fsc: [],
+    guinier: [],
+    guinierFit: null,
     classAverageCount: 0,
     boxSize: 0,
     pixelSize: 0,
@@ -90,6 +109,16 @@ export async function GET(req: NextRequest) {
   // Find the latest iteration's star files in the job dir
   if (fs.existsSync(jobDir)) {
     const files = fs.readdirSync(jobDir);
+
+    // --- extract: parse particles.star for ground-truth orientations
+    if (job.taskType === "extract" || job.taskType === "select") {
+      const particlesStar = path.join(jobDir, "particles.star");
+      if (fs.existsSync(particlesStar)) {
+        const parsed = parseDataStar(particlesStar);
+        result.orientations = parsed.orientations;
+        result.nParticles = parsed.orientations.length;
+      }
+    }
 
     // --- class2d / class3d: parse model.star (per-class metrics) + data.star (orientations)
     if (job.taskType === "class2d" || job.taskType === "class3d") {
@@ -130,11 +159,15 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // --- postprocess: parse the postprocess.star FSC table
+    // --- postprocess: parse the postprocess.star FSC table + Guinier plot
     if (job.taskType === "postprocess") {
       const ppStar = files.find((f) => f === "postprocess.star");
       if (ppStar) {
-        result.fsc = parseFscStar(path.join(jobDir, ppStar));
+        const ppPath = path.join(jobDir, ppStar);
+        result.fsc = parseFscStar(ppPath);
+        const g = parseGuinierStar(ppPath);
+        result.guinier = g.points;
+        result.guinierFit = g.fit;
       }
     }
   }
@@ -279,6 +312,58 @@ function parseFscStar(fscStarPath: string): FscPoint[] {
     });
   }
   return points;
+}
+
+// Parse the data_guinier block + the fitted slope/intercept/correlation from
+// the data_general block of postprocess.star.
+function parseGuinierStar(ppStarPath: string): { points: GuinierPoint[]; fit: GuinierFit | null } {
+  const text = fs.readFileSync(ppStarPath, "utf8");
+  const points: GuinierPoint[] = [];
+  const guinierBlock = extractDataBlock(text, "data_guinier");
+  if (guinierBlock) {
+    const lines = guinierBlock.split("\n");
+    const colLines = lines.filter((l) => l.trim().startsWith("_rln"));
+    const colIdx: Record<string, number> = {};
+    for (const l of colLines) {
+      const m = l.trim().match(/^(_\S+)\s+#(\d+)/);
+      if (m) colIdx[m[1]] = parseInt(m[2]);
+    }
+    for (const line of lines) {
+      const s = line.trim();
+      if (!s || s.startsWith("_") || s.startsWith("#") || s.startsWith("data_") || s.startsWith("loop_")) continue;
+      const parts = s.split(/\s+/);
+      if (parts.length < 5) continue;
+      const resSq = parseFloat(parts[(colIdx["_rlnResolutionSquared"] || 1) - 1] || "0");
+      const logOrig = parseFloat(parts[(colIdx["_rlnLogAmplitudesOriginal"] || 2) - 1] || "0");
+      const logWeighted = parseFloat(parts[(colIdx["_rlnLogAmplitudesWeighted"] || 3) - 1] || "0");
+      const logSharp = parseFloat(parts[(colIdx["_rlnLogAmplitudesSharpened"] || 4) - 1] || "0");
+      const logIntercept = parseFloat(parts[(colIdx["_rlnLogAmplitudesIntercept"] || 5) - 1] || "0");
+      // skip -99 placeholders (RELION writes these beyond the fitting range)
+      if (logOrig <= -90 || logWeighted <= -90) continue;
+      const resolution = resSq > 0 ? Math.sqrt(1 / resSq) : 0;
+      points.push({
+        resolutionSquared: resSq,
+        resolution,
+        logAmpOriginal: logOrig,
+        logAmpWeighted: logWeighted,
+        logAmpSharpened: logSharp,
+        logAmpIntercept: logIntercept,
+      });
+    }
+  }
+  // fit from data_general
+  let fit: GuinierFit | null = null;
+  const slopeMatch = text.match(/_rlnFittedSlopeGuinierPlot\s+(-?[\d.]+)/);
+  const interceptMatch = text.match(/_rlnFittedInterceptGuinierPlot\s+(-?[\d.]+)/);
+  const corrMatch = text.match(/_rlnCorrelationFitGuinierPlot\s+(-?[\d.]+)/);
+  if (slopeMatch && interceptMatch) {
+    fit = {
+      slope: parseFloat(slopeMatch[1]),
+      intercept: parseFloat(interceptMatch[1]),
+      correlation: corrMatch ? parseFloat(corrMatch[1]) : 0,
+    };
+  }
+  return { points, fit };
 }
 
 function extractDataBlock(text: string, blockName: string): string | null {

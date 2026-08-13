@@ -11,6 +11,9 @@ interface Props {
   nJobs: number;
   nDone: number;
   taskCatalogCount: number;
+  projectId: string | null;
+  onExport?: () => void;
+  exporting?: boolean;
 }
 
 const STATUS_LABEL: Record<string, { label: string; color: string }> = {
@@ -22,7 +25,7 @@ const STATUS_LABEL: Record<string, { label: string; color: string }> = {
   error: { label: "Error", color: "text-rose-400 border-rose-500/50" },
 };
 
-export function Header({ projectName, status, resolution, nJobs, nDone, taskCatalogCount }: Props) {
+export function Header({ projectName, status, resolution, nJobs, nDone, taskCatalogCount, projectId, onExport, exporting }: Props) {
   const st = STATUS_LABEL[status] || STATUS_LABEL.idle;
   return (
     <header className="border-b border-border/60 bg-card/40 backdrop-blur cryo-grid-bg">
@@ -64,6 +67,17 @@ export function Header({ projectName, status, resolution, nJobs, nDone, taskCata
             <Icon name="Boxes" className="h-3 w-3" />
             {taskCatalogCount} tasks
           </Badge>
+          {projectId && nJobs > 0 && (
+            <button
+              onClick={onExport}
+              disabled={exporting}
+              className="flex items-center gap-1 text-[11px] rounded-md border border-border/60 bg-muted/30 hover:bg-emerald-500/10 hover:border-emerald-500/40 hover:text-emerald-300 px-2 py-1 text-muted-foreground transition-colors disabled:opacity-50"
+              title="Download all project outputs as a .zip"
+            >
+              <Icon name={exporting ? "Loader2" : "Download"} className={cn("h-3 w-3", exporting && "animate-spin")} />
+              {exporting ? "zipping…" : "Export"}
+            </button>
+          )}
           <Badge variant="outline" className={cn("gap-1 capitalize", st.color)}>
             {status === "running" && <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 cryo-pulse" />}
             {st.label}

@@ -26,6 +26,7 @@ export default function Home() {
   const [sending, setSending] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<string>("workflow");
+  const [exporting, setExporting] = useState(false);
 
   // ---- load project list on mount -----------------------------------------
   useEffect(() => {
@@ -164,6 +165,30 @@ export default function Home() {
     }
   }
 
+  // ---- export project as zip ----------------------------------------------
+  async function handleExport() {
+    if (!selectedId) return;
+    setExporting(true);
+    try {
+      const res = await fetch(`/api/export?projectId=${selectedId}`);
+      if (!res.ok) throw new Error("export failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `cryoagent-${selectedId}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast.success("Project exported as .zip");
+    } catch (e: any) {
+      toast.error(e.message || "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   // ---- derived ------------------------------------------------------------
   const selectedProject = projects.find((p) => p.id === selectedId) || null;
   const jobs = workflow?.jobs || [];
@@ -196,6 +221,9 @@ export default function Home() {
         nJobs={jobs.length}
         nDone={nDone}
         taskCatalogCount={RELION_TASKS.length}
+        projectId={selectedId}
+        onExport={handleExport}
+        exporting={exporting}
       />
 
       {/* 3-pane body */}

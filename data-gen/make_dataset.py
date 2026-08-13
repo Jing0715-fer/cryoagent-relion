@@ -36,19 +36,38 @@ def make_truth(box=64, angpix=4.0):
     z /= z.max()
     return z, angpix
 
-def project(map3d, angle_deg=0, shift=(0, 0)):
-    """Simple projection along z, with in-plane rotation and shift (2D)."""
+def project(map3d, rot_deg=0.0, tilt_deg=0.0, psi_deg=0.0, shift=(0, 0)):
+    """Project a 3D density onto a 2D image using full Euler angles (rot, tilt, psi)
+    in RELION convention (ZYZ). The 3D volume is rotated then summed along the
+    new z-axis, giving a physically correct projection for any viewing direction.
+    This is what makes the angular-distribution heatmap show a real spread of
+    orientations instead of all particles at tilt=0."""
+    from scipy.ndimage import affine_transform
     box = map3d.shape[0]
-    # rotate around z by angle
-    a = math.radians(angle_deg)
-    cos, sin = math.cos(a), math.sin(a)
-    c = box // 2
-    yy, xx = np.meshgrid(np.arange(box), np.arange(box), indexing='ij')
-    xr = c + cos * (xx - c) - sin * (yy - c) + shift[0]
-    yr = c + sin * (xx - c) + cos * (yy - c) + shift[1]
-    xi = np.clip(np.round(xr).astype(int), 0, box - 1)
-    yi = np.clip(np.round(yr).astype(int), 0, box - 1)
-    proj = map3d[xi, yi, :].sum(axis=-1)
+    c = box / 2.0
+    # Build the ZYZ rotation matrix (RELION convention: rot around z, tilt around y, psi around z)
+    rot = math.radians(rot_deg)
+    tilt = math.radians(tilt_deg)
+    psi = math.radians(psi_deg)
+    cr, sr = math.cos(rot), math.sin(rot)
+    ct, st = math.cos(tilt), math.sin(tilt)
+    cp, sp = math.cos(psi), math.sin(psi)
+    # R = Rz(psi) * Ry(tilt) * Rz(rot)
+    R = np.array([
+        [cp*ct*cr - sp*sr, -cp*ct*sr - sp*cr,  cp*st],
+        [sp*ct*cr + cp*sr, -sp*ct*sr + cp*cr,  sp*st],
+        [-st*cr,            st*sr,             ct    ],
+    ], dtype=np.float64)
+    # affine_transform expects the INVERSE transform (output -> input)
+    Rinv = np.linalg.inv(R)
+    # offset so the center stays at center
+    offset = c - Rinv @ np.array([c, c, c])
+    rotated = affine_transform(map3d.astype(np.float32), Rinv, offset=offset, order=1, mode='constant', cval=0.0)
+    # project along z (sum)
+    proj = rotated.sum(axis=2)
+    # in-plane shift
+    if shift[0] != 0 or shift[1] != 0:
+        proj = np.roll(proj, (int(round(shift[0])), int(round(shift[1]))), axis=(0, 1))
     return proj
 
 def ctf_image(box, angpix, defocus, kv=300, cs=2.7, phase=0):
@@ -89,10 +108,15 @@ def make_movies(truth, angpix, n_movies=12, frames=10, micro_box=256, particle_b
                     if all((px - qx)**2 + (py - qy)**2 > (particle_box*0.7)**2 for qx, qy in positions):
                         positions.append((int(px), int(py)))
             for (px, py) in positions:
-                ang = float(rng.uniform(0, 360))
+                # random orientation over the full sphere: rot uniform 0-360,
+                # tilt with cosine-weighted distribution (uniform on the sphere),
+                # psi uniform 0-360.
+                rot = float(rng.uniform(0, 360))
+                tilt = float(math.degrees(math.acos(1 - 2*rng.uniform(0, 1))))
+                psi = float(rng.uniform(0, 360))
                 shift = (rng.normal(0, 0.5), rng.normal(0, 0.5))
-                pj = project(truth, ang, shift)
-                pj = pj / pj.max() * 0.8
+                pj = project(truth, rot, tilt, psi, shift)
+                pj = pj / (pj.max() + 1e-9) * 0.8
                 defocus = float(rng.uniform(8000, 14000))
                 ctf = ctf_image(particle_box, angpix, defocus)
                 # apply CTF
@@ -101,12 +125,11 @@ def make_movies(truth, angpix, n_movies=12, frames=10, micro_box=256, particle_b
                 half = particle_box // 2
                 frame[px-half:px+half, py-half:py+half] += pj_ctf.astype(np.float32)
                 if f == 0:
-                    particles.append((m, f"movie_{m:03d}.mrcs", px, py, ang, defocus))
-            # apply per-frame drift
-            yy, xx = np.indices(frame.shape)
+                    particles.append((m, f"movie_{m:03d}.mrcs", px, py, rot, tilt, psi, defocus))
+            # apply per-frame drift (small, ~0.2px/frame)
             shifted = np.roll(frame, (int(round(drift[0])), int(round(drift[1]))), axis=(0, 1))
             frames_stack.append(shifted)
-            drift = drift + rng.normal(0, 0.3, 2)
+            drift = drift + rng.normal(0, 0.2, 2)
         movie = np.stack(frames_stack, axis=0)  # (frames, Y, X)
         movie_path = os.path.join(out_dir, "Movies", f"movie_{m:03d}.mrcs")
         with mrcfile.new(movie_path, overwrite=True) as m:
@@ -140,7 +163,8 @@ def write_movies_star(particles, out_dir, angpix, frames, micro_box):
         f.write("_movies.rlnMicrographPreExposure #4\n")
         f.write("_movies.rlnMicrographDosePerFrame #5\n")
         seen = set()
-        for (midx, mname, _, _, _, _) in particles:
+        for p in particles:
+            midx = p[0]; mname = p[1]
             if midx in seen: continue
             seen.add(midx)
             base = mname.replace(".mrcs", ".mrc")
@@ -163,9 +187,12 @@ def write_particles_star(particles, out_dir, particle_box, angpix):
         f.write("_rlnImageName #3\n_rlnMicrographName #4\n")
         f.write("_rlnOpticsGroup #5\n_rlnDefocusU #6\n_rlnDefocusV #7\n")
         f.write("_rlnDefocusAngle #8\n_rlnAngleRot #9\n_rlnAngleTilt #10\n_rlnAnglePsi #11\n")
-        # we don't have an actual particle stack here; write coords only (for select)
-        for i, (midx, mname, px, py, ang, defocus) in enumerate(particles, start=1):
-            f.write(f"{px} {py} 000001@Particles/particles.mrcs Movies/{mname.replace('.mrcs', '.mrc')} 1 {defocus:.0f} {defocus:.0f} 0 {ang:.2f} 0 0\n")
+        # write the ground-truth orientation for each particle so downstream
+        # class2d/refine3d start from realistic angles
+        for i, p in enumerate(particles, start=1):
+            # tuple is (midx, mname, px, py, rot, tilt, psi, defocus)
+            midx, mname, px, py, rot, tilt, psi, defocus = p
+            f.write(f"{px} {py} 000001@Particles/particles.mrcs Movies/{mname.replace('.mrcs', '.mrc')} 1 {defocus:.0f} {defocus:.0f} 0 {rot:.2f} {tilt:.2f} {psi:.2f}\n")
     print(f"wrote {path}")
     return path
 

@@ -33,7 +33,9 @@ def parse_coords(coords_star):
                 current_mic = mic
                 defocus = float(parts[5]) if len(parts) > 5 else 10000
                 angle_rot = float(parts[8]) if len(parts) > 8 else 0
-                coords.append((mic, x, y, defocus, angle_rot))
+                angle_tilt = float(parts[9]) if len(parts) > 9 else 0
+                angle_psi = float(parts[10]) if len(parts) > 10 else 0
+                coords.append((mic, x, y, defocus, angle_rot, angle_tilt, angle_psi))
             except (ValueError, IndexError):
                 continue
     return coords
@@ -76,7 +78,7 @@ def main():
     mic_cache = {}
     particles_data = []
     idx = 1
-    for (mic_name, x, y, defocus, angle_rot) in coords:
+    for (mic_name, x, y, defocus, angle_rot, angle_tilt, angle_psi) in coords:
         # find the micrograph file
         mic_full = mic_paths.get(mic_name)
         if not mic_full:
@@ -105,7 +107,7 @@ def main():
             yy = np.linspace(0, args.box-1, args.final_box).astype(int)
             xx = np.linspace(0, args.box-1, args.final_box).astype(int)
             box_img = box_img[np.ix_(yy, xx)]
-        particles_data.append((idx, box_img, mic_name, x, y, defocus, angle_rot))
+        particles_data.append((idx, box_img, mic_name, x, y, defocus, angle_rot, angle_tilt, angle_psi))
         idx += 1
 
     # write particles.mrcs (stack) into Particles/ subdir so the star file's
@@ -134,8 +136,8 @@ def main():
         f.write("_rlnImageName #1 \n_rlnMicrographName #2 \n_rlnCoordinateX #3 \n")
         f.write("_rlnCoordinateY #4 \n_rlnOpticsGroup #5 \n_rlnDefocusU #6 \n")
         f.write("_rlnDefocusV #7 \n_rlnAngleRot #8 \n_rlnAngleTilt #9 \n_rlnAnglePsi #10 \n")
-        for i, (_, _, mic, x, y, defocus, angle_rot) in enumerate(particles_data, start=1):
-            f.write(f"{i:06d}@Particles/particles.mrcs {mic} {x:.1f} {y:.1f} 1 {defocus:.1f} {defocus:.1f} {angle_rot:.2f} 0 0 \n")
+        for i, (_, _, mic, x, y, defocus, angle_rot, angle_tilt, angle_psi) in enumerate(particles_data, start=1):
+            f.write(f"{i:06d}@Particles/particles.mrcs {mic} {x:.1f} {y:.1f} 1 {defocus:.1f} {defocus:.1f} {angle_rot:.2f} {angle_tilt:.2f} {angle_psi:.2f} \n")
 
     print(f"[extract] wrote {stack_path} ({stack.shape})")
     print(f"[extract] wrote {star_path} ({len(particles_data)} particles)")

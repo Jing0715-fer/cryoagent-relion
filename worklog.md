@@ -166,3 +166,69 @@ polling fetches.
   via `setsid -f bun run dev`).
 - Created a 15-minute recurring webDevReview cron job (Quartz `0 0/15 * * * ?`)
   that will autonomously continue development (fix bugs or add features).
+
+## Phase 5: CryoSPARC-style visualizations + scientific correctness fixes
+
+### What was fixed/added this phase
+
+#### 1. Synthetic dataset generator — real 3D Euler-angle projection (BUG FIX)
+- **Before**: the generator only projected the z=0 plane (tilt=0 for all
+  particles), so the angular-distribution heatmap showed only the equator.
+- **After**: rewrote `project()` to use full ZYZ Euler angles (rot, tilt, psi)
+  via `scipy.ndimage.affine_transform`. Particles now have random orientations
+  uniformly distributed over the sphere (tilt 15°–168°, mean 92°).
+- Also reduced per-frame drift from 0.3px to 0.2px.
+
+#### 2. extract_cpu.py — preserve all 3 Euler angles (BUG FIX)
+- **Before**: only `_rlnAngleRot` was read from the coords.star; tilt and psi
+  were hardcoded to 0.
+- **After**: reads and preserves rot, tilt, psi from the ground-truth
+  particles.star, so the extract job's particles.star carries real
+  orientations.
+
+#### 3. Angular heatmap — use extract job for orientations (BUG FIX)
+- 2D classification's data.star has tilt=0 because RELION only searches
+  in-plane angles during 2D class. The dashboard now uses the extract job's
+  particles.star (ground truth) for the angular heatmap when refine3d/class3d
+  are not available. Priority: refine3d > class3d > extract.
+
+#### 4. extract box-size cap (BUG FIX)
+- The LLM sometimes set `rescale=1` which produced 1px particles (causing
+  "circular mask radius too large" in class2d). Now capped: `rescale =
+  max(32, min(rescale_raw, box))` so the final box is always ≥ 32px.
+
+#### 5. Guinier plot (NEW visualization)
+- Parses the `data_guinier` block from `postprocess.star` (ln(amplitude) vs
+  resolution²). Shows original, dose-weighted, and sharpened curves, plus the
+  fitted B-factor line. Annotates B = -4 × slope and correlation.
+- Canvas-rendered with hover tooltips.
+
+#### 6. 3D WebGL volume renderer (NEW visualization)
+- True 3D ray-marched volume rendering using WebGL2 + GLSL ES 3.00.
+- Loads the raw MRC file client-side, creates a 3D R8 texture, and renders
+  with a viridis color ramp + density threshold slider + drag-to-rotate.
+- Falls back gracefully to an error message if WebGL2 is unavailable.
+- 40 ray-march steps for performance on headless/slow GPUs.
+
+#### 7. Project export as .zip (NEW feature)
+- New `/api/export` route zips the entire project data directory (RELION
+  outputs + star files + maps + logs) for download.
+- "Export" button in the header (visible when jobs exist).
+
+#### 8. UI polish
+- Header now has an Export button with loading state.
+- Viz cards use icons matching their task type.
+- Better empty-state messages.
+- 3D volume canvases have "drag to rotate" hint + density slider.
+
+### Verified end-to-end (agent-browser)
+- New project "Sphere-tilt viz test" → 13-job plan → all CPU-feasible jobs
+  succeeded. 3D tasks auto-skipped.
+- Angular heatmap: 96 particles, tilt range 15°–168°, mean 92° (real sphere).
+- FSC curve: 32 points, crosses 0.143 at ~7 Å.
+- Guinier plot: 9 points, B-factor = 216.5 Ų, correlation = 1.0.
+- 3D volume renderer: 2 canvases (postprocess + mask), 64³, no shader errors.
+- 5 canvases total (FSC + angular + Guinier + 2× volume), 12 images (class
+  averages + slices).
+- Export: 36 MB zip downloaded successfully.
+- No console errors, no shader errors, lint clean.

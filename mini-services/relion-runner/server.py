@@ -291,10 +291,13 @@ def task_extract(p, inputs, out, on_line, env):
     # The LLM sometimes proposes 256px boxes for 4Å/px data which is correct for
     # real microscopes but breaks our 256x256 synthetic micrographs.
     box = min(int(p.get("extract_size", 64)), 64)
-    rescale = min(int(p.get("rescale", 64)), 64) if p.get("do_rescale", True) else box
+    # Ensure rescale is sensible — the LLM sometimes sets rescale=1 which would
+    # produce 1px particles. Cap to at least 32px and at most = box.
+    rescale_raw = int(p.get("rescale", 64)) if p.get("do_rescale", True) else box
+    rescale = max(32, min(rescale_raw, box))
     final_box = min(box, rescale)
-    if int(p.get("extract_size", 64)) != box:
-        on_line("warn", f"extract: capped box size from {p.get('extract_size')} to {box} for synthetic micrographs")
+    if int(p.get("extract_size", 64)) != box or rescale_raw != rescale:
+        on_line("warn", f"extract: capped box={box} rescale={rescale} (LLM proposed extract_size={p.get('extract_size')}, rescale={p.get('rescale')})")
     cmd = ["python3", EXTRACT_CPU, "--coords", coords_star, "--micrographs", mc_star,
            "--outdir", jd, "--box", str(box), "--final_box", str(final_box),
            "--angpix", str(p.get("angpix", 4.0))]

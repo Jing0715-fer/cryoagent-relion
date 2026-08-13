@@ -4,9 +4,11 @@ import { useEffect, useState } from "react";
 import { Icon } from "./icon";
 import { cn } from "@/lib/utils";
 import { FscCurve } from "./viz/fsc-curve";
+import { GuinierPlot } from "./viz/guinier-plot";
 import { AngularHeatmap } from "./viz/angular-heatmap";
 import { ClassAveragesGallery } from "./viz/class-averages";
 import { SliceViewer } from "./viz/slice-viewer";
+import { VolumeRenderer } from "./viz/volume-renderer";
 import { RELION_TASK_MAP } from "@/lib/relion/tasks";
 
 interface VizGroup {
@@ -60,6 +62,12 @@ export function VisualizationsDashboard({ projectId, refreshKey }: Props) {
   const postprocess = groups.find((g) => g.taskType === "postprocess" && g.status === "done");
   const maskcreate = groups.find((g) => g.taskType === "maskcreate" && g.status === "done");
   const initialmodel = groups.find((g) => g.taskType === "initialmodel" && g.status === "done");
+  // For the angular heatmap: prefer refine3d > class3d > extract (ground truth).
+  // class2d's data.star has tilt=0 because 2D classification only searches
+  // in-plane angles, so we fall back to the extract job's particles.star
+  // (which carries the ground-truth Euler angles from the dataset generator).
+  const extract = groups.find((g) => g.taskType === "extract" && g.status === "done");
+  const angularJob = refine3d || class3d || extract;
 
   const hasAny = class2d || class3d || refine3d || postprocess || maskcreate;
 
@@ -85,19 +93,40 @@ export function VisualizationsDashboard({ projectId, refreshKey }: Props) {
         </VizCard>
       )}
 
-      {/* angular distribution (from class2d or refine3d) */}
-      {(class2d || refine3d) && (
+      {/* angular distribution (from refine3d > class3d > extract) + FSC curve + Guinier */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {angularJob && (
+          <VizCard title="Angular distribution" taskType={angularJob.taskType} jobId={angularJob.jobId} icon="Compass">
+            <AngularHeatmap projectId={projectId} jobId={angularJob.jobId} />
+          </VizCard>
+        )}
+
+        {/* postprocess FSC */}
+        {postprocess && (
+          <VizCard title="FSC curve" taskType="postprocess" jobId={postprocess.jobId} icon="TrendingUp">
+            <FscCurve projectId={projectId} jobId={postprocess.jobId} />
+          </VizCard>
+        )}
+      </div>
+
+      {/* Guinier plot (B-factor estimation) */}
+      {postprocess && (
+        <VizCard title="Guinier plot (B-factor)" taskType="postprocess" jobId={postprocess.jobId} icon="Activity">
+          <GuinierPlot projectId={projectId} jobId={postprocess.jobId} />
+        </VizCard>
+      )}
+
+      {/* 3D volume renderer — true 3D map display */}
+      {(postprocess || maskcreate || refine3d || initialmodel) && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {(class2d || refine3d) && (
-            <VizCard title="Angular distribution" taskType={(refine3d || class2d)!.taskType} jobId={(refine3d || class2d)!.jobId} icon="Compass">
-              <AngularHeatmap projectId={projectId} jobId={(refine3d || class2d)!.jobId} />
+          {postprocess && postprocess.primaryOutput && (
+            <VizCard title="3D volume — postprocessed map" taskType="postprocess" jobId={postprocess.jobId} icon="Box">
+              <VolumeRenderer projectId={projectId} path={postprocess.primaryOutput} label={postprocess.primaryOutput.split("/").pop()} />
             </VizCard>
           )}
-
-          {/* postprocess FSC */}
-          {postprocess && (
-            <VizCard title="FSC curve" taskType="postprocess" jobId={postprocess.jobId} icon="TrendingUp">
-              <FscCurve projectId={projectId} jobId={postprocess.jobId} />
+          {maskcreate && maskcreate.primaryOutput && (
+            <VizCard title="3D volume — mask" taskType="maskcreate" jobId={maskcreate.jobId} icon="Hexagon">
+              <VolumeRenderer projectId={projectId} path={maskcreate.primaryOutput} label={maskcreate.primaryOutput.split("/").pop()} />
             </VizCard>
           )}
         </div>
@@ -106,12 +135,12 @@ export function VisualizationsDashboard({ projectId, refreshKey }: Props) {
       {/* map slices */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
         {maskcreate && maskcreate.primaryOutput && (
-          <VizCard title="Mask (3D)" taskType="maskcreate" jobId={maskcreate.jobId} icon="Hexagon">
+          <VizCard title="Mask (z-slice)" taskType="maskcreate" jobId={maskcreate.jobId} icon="Hexagon">
             <SliceViewer projectId={projectId} path={maskcreate.primaryOutput} label={maskcreate.primaryOutput.split("/").pop()} />
           </VizCard>
         )}
         {postprocess && postprocess.primaryOutput && (
-          <VizCard title="Postprocessed map" taskType="postprocess" jobId={postprocess.jobId} icon="Sparkles">
+          <VizCard title="Postprocessed map (z-slice)" taskType="postprocess" jobId={postprocess.jobId} icon="Sparkles">
             <SliceViewer projectId={projectId} path={postprocess.primaryOutput} label={postprocess.primaryOutput.split("/").pop()} />
           </VizCard>
         )}

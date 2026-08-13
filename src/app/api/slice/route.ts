@@ -101,9 +101,12 @@ Image.fromarray(rgb).save(buf, format='PNG')
 sys.stdout.buffer.write(buf.getvalue())
 `;
   return new Promise((resolve) => {
-    execFile("python3", ["-c", script, fullPath, String(z)], { maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+    execFile("python3", ["-c", script, fullPath, String(z)], {
+      maxBuffer: 8 * 1024 * 1024,
+      encoding: "buffer",  // Return stdout as Buffer, not string (prevents UTF-8 corruption of binary PNG)
+    }, (err, stdout) => {
       if (err || !stdout) resolve(null);
-      else resolve(Buffer.from(stdout));
+      else resolve(stdout as Buffer);
     });
   });
 }

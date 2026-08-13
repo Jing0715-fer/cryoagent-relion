@@ -366,3 +366,24 @@ polling fetches.
 - extract: 1897 particles extracted at 64×64 (box auto-computed from 130Å diameter + 1.77Å/px) ✅
 - class2d: real relion_refine with 1897 particles ✅
 - maskcreate: running (placeholder reference map generated) — testing
+
+## Phase 9: Critical binary PNG fix + class2d images working
+
+### ROOT CAUSE FOUND: PNG binary corruption
+The slice API (`/api/slice`) and thumbnail API (`/api/files?thumb=1`) were
+corrupting PNG binary data. `execFile` was returning stdout as a string, and
+when `Buffer.from(stdout)` was called, non-UTF-8 bytes (like `\x89` — the PNG
+magic number) were replaced with the UTF-8 replacement character `\xef\xbf\xbd`.
+This made every PNG invalid — the browser couldn't render them, so all MRC-slice
+images (class averages, micrograph thumbnails, map slices) showed "No image".
+
+**Fix**: Set `encoding: "buffer"` in the `execFile` options so stdout is
+returned as a Buffer directly, bypassing the string conversion entirely.
+
+### Also fixed:
+- Rewrote `prompts.ts` to use string concatenation instead of template literals
+  (eliminates the Turbopack parsing error with escaped backticks)
+- Simplified `ClassThumb` component: parent fetches the classes.mrcs path once,
+  passes it to each thumb; img src is set directly (no verify-fetch needed)
+- Fixed stuck maskcreate job (was marked running but never completed)
+- Verified: class2d images now load correctly (64x64, loaded=true)

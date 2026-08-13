@@ -90,9 +90,12 @@ Image.fromarray(img).save(buf, format='PNG')
 sys.stdout.buffer.write(buf.getvalue())
 `;
   return new Promise((resolve) => {
-    execFile("python3", ["-c", script, fullPath], { maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+    execFile("python3", ["-c", script, fullPath], {
+      maxBuffer: 8 * 1024 * 1024,
+      encoding: "buffer",
+    }, (err, stdout) => {
       if (err || !stdout) resolve(null);
-      else resolve(Buffer.from(stdout));
+      else resolve(stdout as Buffer);
     });
   });
 }

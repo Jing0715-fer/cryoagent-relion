@@ -25,17 +25,34 @@ export function ClassAveragesGallery({ projectId, jobId }: Props) {
   const [loading, setLoading] = useState(true);
   const [hasClassesMrcs, setHasClassesMrcs] = useState(false);
   const [nParticles, setNParticles] = useState(0);
+  const [classesMrcsPath, setClassesMrcsPath] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
       try {
-        const res = await fetch(`/api/analyze?projectId=${projectId}&jobId=${jobId}`);
-        const d = await res.json();
-        if (!cancelled) {
-          setClasses(d.modelClasses || []);
-          setHasClassesMrcs(!!d.hasClassesMrcs);
-          setNParticles(d.nParticles || 0);
+        // Fetch analyze + job-files in parallel
+        const [analyzeRes, filesRes] = await Promise.all([
+          fetch(`/api/analyze?projectId=${projectId}&jobId=${jobId}`).then(r => r.json()),
+          fetch(`/api/job-files?projectId=${projectId}`).then(r => r.json()),
+        ]);
+        if (cancelled) return;
+        setClasses(analyzeRes.modelClasses || []);
+        setHasClassesMrcs(!!analyzeRes.hasClassesMrcs);
+        setNParticles(analyzeRes.nParticles || 0);
+        // Find the latest classes.mrcs path from the job-files response
+        const group = (filesRes.groups || []).find((g: any) => g.jobId === jobId);
+        if (group) {
+          const classesFiles = (group.files || []).filter((f: any) => /_classes\.mrcs$/.test(f.path));
+          if (classesFiles.length > 0) {
+            // Sort by iteration number and take the latest
+            classesFiles.sort((a: any, b: any) => {
+              const aNum = parseInt(a.path.match(/run_it(\d+)_/)?.[1] || "0");
+              const bNum = parseInt(b.path.match(/run_it(\d+)_/)?.[1] || "0");
+              return aNum - bNum;
+            });
+            setClassesMrcsPath(classesFiles[classesFiles.length - 1].path);
+          }
         }
       } catch {
         if (!cancelled) setClasses([]);
@@ -54,9 +71,6 @@ export function ClassAveragesGallery({ projectId, jobId }: Props) {
     </div>
   );
 
-  // find the job's primary output dir to construct the classes.mrcs path
-  // (we look it up from the analyze result's jobId and rely on the API to
-  // also return the classes mrcs path)
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
@@ -71,10 +85,15 @@ export function ClassAveragesGallery({ projectId, jobId }: Props) {
       </div>
 
       {/* class averages thumbnails grid */}
-      {hasClassesMrcs && (
+      {classesMrcsPath && (
         <div className="grid grid-cols-5 gap-1.5">
           {classes.slice(0, 25).map((c) => (
-            <ClassThumb key={c.classNumber} projectId={projectId} jobId={jobId} cls={c} />
+            <ClassThumb
+              key={c.classNumber}
+              projectId={projectId}
+              mrcsPath={classesMrcsPath}
+              cls={c}
+            />
           ))}
         </div>
       )}
@@ -120,46 +139,20 @@ export function ClassAveragesGallery({ projectId, jobId }: Props) {
   );
 }
 
-function ClassThumb({ projectId, jobId, cls }: { projectId: string; jobId: string; cls: ModelClass }) {
-  const [src, setSrc] = useState<string | null>(null);
-  const [loaded, setLoaded] = useState(false);
+// Simple, reliable class thumbnail — sets the img src directly to the slice API
+// URL and handles errors via onError. No pre-verification fetch needed.
+function ClassThumb({ projectId, mrcsPath, cls }: {
+  projectId: string;
+  mrcsPath: string;
+  cls: ModelClass;
+}) {
   const [error, setError] = useState(false);
-  useEffect(() => {
-    async function load() {
-      try {
-        // Fetch the job-files listing to find the latest _classes.mrcs path
-        const res = await fetch(`/api/job-files?projectId=${projectId}`);
-        const d = await res.json();
-        const group = (d.groups || []).find((g: any) => g.jobId === jobId);
-        if (!group) { setError(true); return; }
-        const classesFiles = (group.files || []).filter((f: any) => /_classes\.mrcs$/.test(f.path));
-        if (classesFiles.length === 0) { setError(true); return; }
-        // Use the last classes.mrcs (latest iteration)
-        const classesFile = classesFiles[classesFiles.length - 1];
-        const p = classesFile.path;
-        // Use the slice API to render class N (z = classNumber - 1, 0-indexed)
-        const url = `/api/slice?projectId=${projectId}&path=${encodeURIComponent(p)}&z=${cls.classNumber - 1}`;
-        // Verify the URL works before setting it (avoid broken img)
-        const testRes = await fetch(url);
-        if (testRes.ok && testRes.headers.get("content-type")?.startsWith("image/")) {
-          setSrc(url);
-        } else {
-          setError(true);
-        }
-      } catch {
-        setError(true);
-      }
-    }
-    load();
-  }, [projectId, jobId, cls.classNumber]);
+  const [loaded, setLoaded] = useState(false);
+  const src = `/api/slice?projectId=${projectId}&path=${encodeURIComponent(mrcsPath)}&z=${cls.classNumber - 1}`;
 
   return (
     <div className="relative aspect-square rounded bg-black border border-border/40 overflow-hidden group">
-      {error ? (
-        <div className="absolute inset-0 grid place-items-center text-[9px] text-muted-foreground p-1 text-center">
-          No image
-        </div>
-      ) : src ? (
+      {!error ? (
         <img
           src={src}
           alt={`class ${cls.classNumber}`}
@@ -169,8 +162,8 @@ function ClassThumb({ projectId, jobId, cls }: { projectId: string; jobId: strin
           onError={() => setError(true)}
         />
       ) : (
-        <div className="absolute inset-0 grid place-items-center">
-          <div className="h-4 w-4 rounded-full border-2 border-emerald-400/30 border-t-emerald-400 animate-spin" />
+        <div className="absolute inset-0 grid place-items-center text-[9px] text-muted-foreground p-1 text-center">
+          No image
         </div>
       )}
       <div className="absolute top-0.5 left-1 text-[9px] font-mono text-emerald-300 bg-black/60 rounded px-1">

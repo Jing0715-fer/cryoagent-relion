@@ -152,3 +152,17 @@ polling fetches.
 5. Add "Export project as zip" for reproducibility.
 6. Deploy on a GPU node and run the full 3D pipeline (initialmodel → class3d
    → refine3d → multibody → polish → localres) for real.
+
+## Phase 4: GitHub push + cron
+
+- Pushed the full project to GitHub: https://github.com/Jing0715-fer/cryoagent-relion
+- Cleaned git history (orphan branch + gc) — repo is now 264 KB (was 151 MB
+  with old data-file binaries in history).
+- Excluded `data/`, `relion-pkg/`, `db/`, `download/`, screenshots from
+  version control via `.gitignore`.
+- Added a comprehensive README.md documenting architecture, the 18 RELION tasks,
+  the 4 visualizations, the tech stack, and local-run instructions.
+- Fixed the "page won't load" issue (Next dev server had crashed — restarted
+  via `setsid -f bun run dev`).
+- Created a 15-minute recurring webDevReview cron job (Quartz `0 0/15 * * * ?`)
+  that will autonomously continue development (fix bugs or add features).

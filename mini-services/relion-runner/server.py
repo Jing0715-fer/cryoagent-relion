@@ -46,7 +46,7 @@ os.makedirs(RESULTS_ROOT, exist_ok=True)
 
 def relion_env():
     env = os.environ.copy()
-    env["PATH"] = RELION_BIN + ":" + env.get("PATH", "")
+    env["PATH"] = RELION_BIN + ":/home/z/.venv/bin:" + env.get("PATH", "")
     env["LD_LIBRARY_PATH"] = RELION_LIB + ":" + env.get("LD_LIBRARY_PATH", "")
     env["RELION_CTFFIND_EXECUTABLE"] = CTFFIND
     env["OMP_NUM_THREADS"] = "2"

@@ -382,9 +382,10 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
 
   if (useReal) {
     // REAL EXECUTION PATH: pick the next ready queued job and run it on the runner.
-    // Skip slow tasks (initialmodel uses denovo_3dref which is impractical on CPU
-    // for small datasets — we fall back to the dataset's reference.mrc instead).
-    const CPU_SKIPPED = new Set(["initialmodel", "class3d", "refine3d", "multibody", "polish", "movierefine", "localres"]);
+    // On CPU, 3D tasks are slow but can run with reduced iterations.
+    // We DON'T skip them — the runner caps iterations/sampling for CPU.
+    // Only skip tasks that genuinely need a GPU (multibody, polish with movie frames).
+    const CPU_SKIPPED = new Set<string>(["multibody", "polish", "movierefine"]);
 
     // Check if the import job reported single-frame data (micrographs, not movies).
     // If so, skip motioncorr — single-frame micrographs don't need motion correction.

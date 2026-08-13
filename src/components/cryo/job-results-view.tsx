@@ -11,6 +11,8 @@ import { FscCurve } from "./viz/fsc-curve";
 import { GuinierPlot } from "./viz/guinier-plot";
 import { AngularHeatmap } from "./viz/angular-heatmap";
 import { ClassAveragesGallery } from "./viz/class-averages";
+import { ClassEssHistogram } from "./viz/class-ess-histogram";
+import { MicrographGrid } from "./viz/micrograph-grid";
 import { SliceViewer } from "./viz/slice-viewer";
 import { VolumeRenderer } from "./viz/volume-renderer";
 
@@ -238,31 +240,85 @@ export function JobResultsView({ projectId, job, onBack, onRetry }: Props) {
 }
 
 // The visualizations relevant to a single job, rendered inline.
+// Reference: CryoSPARC job result displays (guide.cryosparc.com)
 function JobVisualizations({ projectId, job }: { projectId: string; job: Job }) {
   const t = RELION_TASK_MAP[job.taskType];
+  const hasViz =
+    ["import", "motioncorr", "ctffind", "autopick", "extract", "select",
+     "class2d", "class3d", "refine3d", "maskcreate", "postprocess", "initialmodel"].includes(job.taskType);
+  if (!hasViz) return null;
   return (
     <>
       <Section title={`${t?.name} visualizations`} icon="BarChart3">
         <div className="space-y-4">
-          {/* class2d / class3d: class averages + angular heatmap */}
-          {(job.taskType === "class2d" || job.taskType === "class3d") && (
+          {/* import / motioncorr: micrograph thumbnail grid */}
+          {(job.taskType === "import" || job.taskType === "motioncorr") && (
+            <div>
+              <div className="text-[11px] text-muted-foreground mb-2">Micrograph preview (click to enlarge)</div>
+              <MicrographGrid projectId={projectId} jobId={job.id} jobType={job.taskType} />
+            </div>
+          )}
+
+          {/* ctffind: micrograph grid + CTF fit quality */}
+          {job.taskType === "ctffind" && (
+            <div>
+              <div className="text-[11px] text-muted-foreground mb-2">Micrographs with CTF fits (click to enlarge)</div>
+              <MicrographGrid projectId={projectId} jobId={job.id} jobType={job.taskType} />
+            </div>
+          )}
+
+          {/* autopick: micrograph grid with picked particles overlay */}
+          {job.taskType === "autopick" && (
+            <div>
+              <div className="text-[11px] text-muted-foreground mb-2">Micrographs with picked particles</div>
+              <MicrographGrid projectId={projectId} jobId={job.id} jobType={job.taskType} />
+            </div>
+          )}
+
+          {/* extract: micrograph grid + angular heatmap */}
+          {job.taskType === "extract" && (
             <>
-              <ClassAveragesGallery projectId={projectId} jobId={job.id} />
+              <div>
+                <div className="text-[11px] text-muted-foreground mb-2">Extracted particles (micrograph preview)</div>
+                <MicrographGrid projectId={projectId} jobId={job.id} jobType={job.taskType} />
+              </div>
               <div className="border-t border-border/30 pt-3">
-                <div className="text-[11px] text-muted-foreground mb-2">Angular distribution (from this job's particles)</div>
+                <div className="text-[11px] text-muted-foreground mb-2">Angular distribution (ground-truth orientations)</div>
                 <AngularHeatmap projectId={projectId} jobId={job.id} />
               </div>
             </>
           )}
 
-          {/* extract: angular heatmap (ground-truth orientations) */}
-          {job.taskType === "extract" && (
-            <AngularHeatmap projectId={projectId} jobId={job.id} />
+          {/* class2d / class3d: class averages + ESS histogram + angular heatmap */}
+          {(job.taskType === "class2d" || job.taskType === "class3d") && (
+            <>
+              <div>
+                <div className="text-[11px] text-muted-foreground mb-2">2D class averages (click a class to inspect)</div>
+                <ClassAveragesGallery projectId={projectId} jobId={job.id} />
+              </div>
+              <div className="border-t border-border/30 pt-3">
+                <div className="text-[11px] text-muted-foreground mb-2">Class ESS & probability histograms</div>
+                <ClassEssHistogram projectId={projectId} jobId={job.id} />
+              </div>
+              <div className="border-t border-border/30 pt-3">
+                <div className="text-[11px] text-muted-foreground mb-2">Angular distribution</div>
+                <AngularHeatmap projectId={projectId} jobId={job.id} />
+              </div>
+            </>
           )}
 
-          {/* refine3d: angular heatmap */}
-          {job.taskType === "refine3d" && (
-            <AngularHeatmap projectId={projectId} jobId={job.id} />
+          {/* refine3d: angular heatmap + 3D volume */}
+          {job.taskType === "refine3d" && job.primaryOutput && (
+            <>
+              <div>
+                <div className="text-[11px] text-muted-foreground mb-2">Angular distribution</div>
+                <AngularHeatmap projectId={projectId} jobId={job.id} />
+              </div>
+              <div className="border-t border-border/30 pt-3">
+                <div className="text-[11px] text-muted-foreground mb-2">3D refined map</div>
+                <VolumeRenderer projectId={projectId} path={job.primaryOutput} label={job.primaryOutput.split("/").pop()} />
+              </div>
+            </>
           )}
 
           {/* postprocess: FSC + Guinier + 3D volume */}

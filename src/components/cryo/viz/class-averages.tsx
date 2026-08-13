@@ -122,34 +122,56 @@ export function ClassAveragesGallery({ projectId, jobId }: Props) {
 
 function ClassThumb({ projectId, jobId, cls }: { projectId: string; jobId: string; cls: ModelClass }) {
   const [src, setSrc] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(false);
   useEffect(() => {
-    // The classes.mrcs is a stack; ask the slice API for slice N
-    // (we need to find the path first; we look it up by hitting /api/analyze
-    // which already told us classesMrcs exists)
     async function load() {
-      // The classes.mrcs is at <jobDir>/run_it<N>_classes.mrcs; we use the
-      // /api/files?thumb=1 endpoint which renders the central slice. For a
-      // stack, central slice == middle image. To show class N, we'd need a
-      // per-index slice endpoint — use /api/slice with z=N.
-      // First find the actual path:
       try {
+        // Fetch the job-files listing to find the latest _classes.mrcs path
         const res = await fetch(`/api/job-files?projectId=${projectId}`);
         const d = await res.json();
         const group = (d.groups || []).find((g: any) => g.jobId === jobId);
-        if (!group) return;
-        const classesFile = (group.files || []).find((f: any) => /_classes\.mrcs$/.test(f.path));
-        if (!classesFile) return;
+        if (!group) { setError(true); return; }
+        const classesFiles = (group.files || []).filter((f: any) => /_classes\.mrcs$/.test(f.path));
+        if (classesFiles.length === 0) { setError(true); return; }
+        // Use the last classes.mrcs (latest iteration)
+        const classesFile = classesFiles[classesFiles.length - 1];
         const p = classesFile.path;
-        setSrc(`/api/slice?projectId=${projectId}&path=${encodeURIComponent(p)}&z=${cls.classNumber - 1}`);
-      } catch { /* ignore */ }
+        // Use the slice API to render class N (z = classNumber - 1, 0-indexed)
+        const url = `/api/slice?projectId=${projectId}&path=${encodeURIComponent(p)}&z=${cls.classNumber - 1}`;
+        // Verify the URL works before setting it (avoid broken img)
+        const testRes = await fetch(url);
+        if (testRes.ok && testRes.headers.get("content-type")?.startsWith("image/")) {
+          setSrc(url);
+        } else {
+          setError(true);
+        }
+      } catch {
+        setError(true);
+      }
     }
     load();
   }, [projectId, jobId, cls.classNumber]);
 
   return (
     <div className="relative aspect-square rounded bg-black border border-border/40 overflow-hidden group">
-      {src && (
-        <img src={src} alt={`class ${cls.classNumber}`} className="w-full h-full object-contain" />
+      {error ? (
+        <div className="absolute inset-0 grid place-items-center text-[9px] text-muted-foreground p-1 text-center">
+          No image
+        </div>
+      ) : src ? (
+        <img
+          src={src}
+          alt={`class ${cls.classNumber}`}
+          className="w-full h-full object-contain transition-opacity"
+          style={{ opacity: loaded ? 1 : 0.3 }}
+          onLoad={() => setLoaded(true)}
+          onError={() => setError(true)}
+        />
+      ) : (
+        <div className="absolute inset-0 grid place-items-center">
+          <div className="h-4 w-4 rounded-full border-2 border-emerald-400/30 border-t-emerald-400 animate-spin" />
+        </div>
       )}
       <div className="absolute top-0.5 left-1 text-[9px] font-mono text-emerald-300 bg-black/60 rounded px-1">
         #{cls.classNumber}

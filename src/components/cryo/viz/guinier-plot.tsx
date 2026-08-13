@@ -1,5 +1,6 @@
 "use client";
 
+import { Skeleton } from "./skeletons";
 import { useEffect, useRef, useState } from "react";
 
 interface GuinierPoint {
@@ -165,7 +166,7 @@ export function GuinierPlot({ projectId, jobId }: Props) {
     setHover({ x, y, p: nearest });
   }
 
-  if (loading) return <div className="text-xs text-muted-foreground p-4">Loading Guinier plot…</div>;
+  if (loading) return <Skeleton className="h-[220px] w-full" />;
   if (!points.length) return (
     <div className="text-xs text-muted-foreground p-4 text-center">
       No Guinier data — postprocess.star not found or refine3d was skipped on CPU.

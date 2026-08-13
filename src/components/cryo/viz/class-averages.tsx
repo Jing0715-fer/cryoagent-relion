@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
+import { GridSkeleton } from "./skeletons";
 
 interface ModelClass {
   classNumber: number;
@@ -64,7 +65,7 @@ export function ClassAveragesGallery({ projectId, jobId }: Props) {
     return () => { cancelled = true; };
   }, [projectId, jobId]);
 
-  if (loading) return <div className="text-xs text-muted-foreground p-4">Loading class averages…</div>;
+  if (loading) return <GridSkeleton count={10} />;
   if (!classes.length) return (
     <div className="text-xs text-muted-foreground p-4 text-center">
       No class data — class2d did not produce a model.star.

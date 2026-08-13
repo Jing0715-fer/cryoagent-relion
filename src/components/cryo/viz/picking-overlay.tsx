@@ -1,5 +1,6 @@
 "use client";
 
+import { Skeleton } from "./skeletons";
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "../icon";
 import { cn } from "@/lib/utils";
@@ -163,7 +164,7 @@ export function PickingOverlay({ projectId, jobId }: Props) {
     // (we need to re-parse, but for simplicity just use what we have)
   }
 
-  if (loading) return <div className="text-xs text-muted-foreground p-3">Loading picking overlay…</div>;
+  if (loading) return <Skeleton className="h-[300px] w-full" />;
   if (!micrographs.length) return <div className="text-xs text-muted-foreground p-3">No picked coordinates found.</div>;
 
   return (

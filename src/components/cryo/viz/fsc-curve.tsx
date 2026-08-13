@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Skeleton } from "./skeletons";
 
 interface FscPoint {
   resolution: number;
@@ -218,7 +219,7 @@ export function FscCurve({ projectId, jobId }: Props) {
     setHover({ x, y, point: nearest });
   }
 
-  if (loading) return <div className="text-xs text-muted-foreground p-4">Loading FSC curve…</div>;
+  if (loading) return <Skeleton className="h-[220px] w-full" />;
   if (error) return (
     <div className="text-xs text-muted-foreground p-4 text-center">
       <div className="opacity-60">{error}</div>

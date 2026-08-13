@@ -537,3 +537,27 @@ returned as a Buffer directly, bypassing the string conversion entirely.
 ### Verified
 - CTFFind page: 2 canvases (defocus distribution + CTF quality scatter), 0 errors
 - All 3 sections visible: micrograph grid, defocus distribution, CTF fit quality
+
+## Phase 16: Loading skeletons + QA
+
+### QA results
+- Class2D page: 3 canvases + 10 images, 0 errors, 0 skeletons (data loaded) ✅
+- All job pages working correctly, 0 page errors
+- Skeletons appear briefly during data loading then disappear when data arrives
+
+### New feature: Loading skeleton components
+- Created `skeletons.tsx` with:
+  - `Skeleton` — base shimmer animation component
+  - `VizSkeleton` — for viz panels (title bar + content area)
+  - `GridSkeleton` — for class averages gallery (grid of shimmer squares)
+  - `LogSkeleton` — for live log panel (multiple shimmer lines)
+- Replaced all "Loading..." text placeholders across 7 viz components:
+  - FSC curve, Guinier plot, angular heatmap, iteration progress,
+    defocus distribution, CTF quality scatter, picking overlay
+- Class averages gallery uses GridSkeleton (10 shimmer squares)
+- All skeletons use a CSS shimmer animation (gradient sweep) for smooth UX
+
+### Verified
+- Class2D page: 3 canvases + 10 images after load, 0 errors
+- Skeletons appear briefly during loading then replaced by actual content
+- No layout shift when transitioning from skeleton to real content

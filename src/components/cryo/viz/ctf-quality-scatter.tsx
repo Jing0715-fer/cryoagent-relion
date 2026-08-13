@@ -1,5 +1,6 @@
 "use client";
 
+import { Skeleton } from "./skeletons";
 import { useEffect, useRef, useState } from "react";
 
 interface CtfPoint {
@@ -188,7 +189,7 @@ export function CtfQualityScatter({ projectId, jobId }: Props) {
     else setHover(null);
   }
 
-  if (loading) return <div className="text-xs text-muted-foreground p-3">Loading CTF quality plot…</div>;
+  if (loading) return <Skeleton className="h-[200px] w-full" />;
   if (!data.length) return <div className="text-xs text-muted-foreground p-3">No CTF data available.</div>;
   return (
     <div className="relative">

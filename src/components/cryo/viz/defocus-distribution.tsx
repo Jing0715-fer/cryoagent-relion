@@ -1,5 +1,6 @@
 "use client";
 
+import { Skeleton } from "./skeletons";
 import { useEffect, useRef, useState } from "react";
 
 interface Props {
@@ -138,7 +139,7 @@ export function DefocusDistribution({ projectId, jobId }: Props) {
     ctx.fillText("n=" + data.length + "  mean=" + (mean / 1000).toFixed(2) + "μm", w - pad.r - 120, pad.t + 14);
   }, [data]);
 
-  if (loading) return <div className="text-xs text-muted-foreground p-3">Loading defocus distribution…</div>;
+  if (loading) return <Skeleton className="h-[180px] w-full" />;
   if (!data.length) return <div className="text-xs text-muted-foreground p-3">No CTF data available.</div>;
   return <canvas ref={canvasRef} className="w-full h-[180px]" />;
 }

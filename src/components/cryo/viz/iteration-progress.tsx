@@ -1,5 +1,6 @@
 "use client";
 
+import { Skeleton } from "./skeletons";
 import { useEffect, useRef, useState } from "react";
 
 interface IterationPoint {
@@ -171,7 +172,7 @@ export function IterationProgress({ projectId, jobId }: Props) {
     ctx.fillText("Avg Pmax", w - 88, pad.t + 27);
   }, [data]);
 
-  if (loading) return <div className="text-xs text-muted-foreground p-3">Loading iteration progress…</div>;
+  if (loading) return <Skeleton className="h-[180px] w-full" />;
   if (!data.length) return <div className="text-xs text-muted-foreground p-3">No iteration data found.</div>;
   return <canvas ref={canvasRef} className="w-full h-[180px]" />;
 }

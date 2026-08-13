@@ -1,5 +1,6 @@
 "use client";
 
+import { Skeleton } from "./skeletons";
 import { useEffect, useRef, useState } from "react";
 
 interface Orientation {
@@ -154,7 +155,7 @@ export function AngularHeatmap({ projectId, jobId }: Props) {
     setHover({ x, y, count, rot: rot % 360, tilt });
   }
 
-  if (loading) return <div className="text-xs text-muted-foreground p-4">Loading orientations…</div>;
+  if (loading) return <Skeleton className="h-[260px] max-w-[260px] mx-auto" />;
   if (!orientations.length) return (
     <div className="text-xs text-muted-foreground p-4 text-center">
       No orientation data — refine3d / class3d must run to produce Euler angles. (Skipped on CPU.)

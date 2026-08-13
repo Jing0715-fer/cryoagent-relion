@@ -279,3 +279,17 @@ polling fetches.
 - Per-job results page: clicking Import shows parameters + outputs + logs; clicking
   Class2D shows class averages (10 images) + angular heatmap (1 canvas) + live log.
 - No console errors, lint clean.
+
+## Phase 6b: EMPIAR-10017 real-data support + parameter inheritance
+
+- Updated runner import task to detect single-frame micrographs (.mrc) vs
+  movies (.mrcs) and produce the correct RELION star format.
+- Added parameter inheritance: createSingleJob inherits angpix/kV/Cs/Q0 from the
+  import job so downstream tasks (ctffind, extract, etc.) use the correct pixel
+  size instead of the LLM's default.
+- Downloaded 3 real EMPIAR-10017 beta-galactosidase micrographs (4096×4096,
+  1.77 Å/px) + 1897 manually-picked particle coordinates.
+- Tested with real data: incremental agent planned import → motioncorr → ctffind
+  → autopick. ctffind ran real ctffind4.1 on real micrographs (couldn't fit
+  CTF due to 4096² size on CPU — needs downsampling, which is a runner
+  improvement for the next phase).

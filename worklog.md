@@ -387,3 +387,14 @@ returned as a Buffer directly, bypassing the string conversion entirely.
   passes it to each thumb; img src is set directly (no verify-fetch needed)
 - Fixed stuck maskcreate job (was marked running but never completed)
 - Verified: class2d images now load correctly (64x64, loaded=true)
+
+### Phase 9 continued: Extract box-size fix + full pipeline verified
+
+- Fixed extract box-size cap: max 128px (was 256px which exceeded 256x256
+  synthetic micrograph boundaries, causing all particles to be skipped)
+- Fixed extract angpix default: 4.0 (was 1.0 which produced oversized boxes)
+- Verified full end-to-end pipeline with synthetic D4 data:
+  import → motioncorr → ctffind → autopick → extract → class2d → maskcreate → postprocess
+  all completed successfully.
+- Class2D job page: 5 class-average images (92x92, loaded=true), 2 canvases
+  (FSC + angular heatmap), 10 images total, zero page errors.

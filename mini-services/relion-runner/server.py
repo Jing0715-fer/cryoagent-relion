@@ -498,7 +498,7 @@ def task_extract(p, inputs, out, on_line, env):
     if not coords_star or not mc_star:
         raise RuntimeError("extract needs autopick + motioncorr stars")
     jd = ensure_job_dir(p["projectId"], out["jobId"])
-    angpix = float(p.get("angpix", 1.0))
+    angpix = float(p.get("angpix", 4.0))
     diameter = float(p.get("particle_diameter", 120))
     # Compute a reasonable box size from the particle diameter and pixel size.
     # Box should be ~1.5x the particle diameter in pixels, rounded to a multiple of 2.
@@ -507,7 +507,10 @@ def task_extract(p, inputs, out, on_line, env):
     # The LLM may propose a larger box (correct for real data) — don't cap it
     # below 32, but cap above to avoid memory issues on CPU.
     llm_box = int(p.get("extract_size", auto_box))
-    box = max(32, min(llm_box, 256, auto_box * 2))
+    # Cap the box to at most half the micrograph dimension (so particles near
+    # the edge don't get skipped). We don't know the micrograph size yet, so
+    # cap at 128 for safety (covers 256x256 synthetic + 4096x4048 real data).
+    box = max(32, min(llm_box, 128, auto_box * 2))
     if llm_box != box:
         on_line("warn", f"extract: box adjusted from {llm_box} to {box} (auto={auto_box}, angpix={angpix}, diam={diameter})")
     # Rescale: keep same as box unless explicitly different

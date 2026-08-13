@@ -134,26 +134,73 @@ def task_import(p, inputs, out, on_line, env):
         else:
             pattern = "*.mrc*"
     files = sorted(glob.glob(os.path.join(data_dir, pattern)))
+    # Auto-downsample large micrographs (>2048px) for CPU feasibility.
+    # 4096x4096 EMPIAR micrographs need too much memory for ctffind/Topaz on CPU.
+    # We downsample by factor 2 (binning) and adjust the pixel size accordingly.
+    angpix_orig = float(p.get("angpix", 1.77))
+    angpix_eff = angpix_orig
+    downsample_factor = 1
+    if files and is_single_frame:
+        try:
+            import mrcfile as _mrc
+            with _mrc.open(files[0], permissive=True) as _m:
+                _shape = _m.data.shape
+            max_dim = max(_shape[-2], _shape[-1]) if len(_shape) >= 2 else 0
+            if max_dim > 2048:
+                downsample_factor = 2
+                angpix_eff = angpix_orig * downsample_factor
+                on_line("info", f"Large micrographs ({max_dim}px) -- downsampling by {downsample_factor}x to {max_dim//downsample_factor}px, angpix {angpix_orig} -> {angpix_eff} A/px")
+                # Create downsampled copies in a Downsampled/ dir
+                ds_dir = os.path.join(pd, "relion_run", "Micrographs_downsampled")
+                os.makedirs(ds_dir, exist_ok=True)
+                import numpy as _np
+                for m in files:
+                    basename = os.path.basename(m)
+                    ds_path = os.path.join(ds_dir, basename)
+                    if not os.path.exists(ds_path):
+                        with _mrc.open(m, permissive=True) as _m2:
+                            _data = _np.asarray(_m2.data, dtype=_np.float32)
+                        # bin by factor 2
+                        if _data.ndim == 2:
+                            h, w = _data.shape
+                            _data = _data[:h//2*2, :w//2*2].reshape(h//2, 2, w//2, 2).mean(axis=(1, 3))
+                        elif _data.ndim == 3:
+                            d, h, w = _data.shape
+                            _data = _data[:, :h//2*2, :w//2*2].reshape(d, h//2, 2, w//2, 2).mean(axis=(2, 4))
+                        with _mrc.new(ds_path, overwrite=True) as _m3:
+                            _m3.set_data(_data.astype(_np.float32))
+                            _m3.voxel_size = (angpix_eff, angpix_eff, angpix_eff)
+                # Point the Micrographs symlink to the downsampled dir
+                if os.path.islink(micro_link):
+                    os.unlink(micro_link)
+                os.symlink(ds_dir, micro_link)
+                files = sorted(glob.glob(os.path.join(micro_link, "*.mrc")))
+        except Exception as e:
+            on_line("warn", f"Downsampling skipped: {e}")
     star_path = os.path.join(pd, "relion_run", out["jobId"], "movies.star" if not is_single_frame else "micrographs.star")
     with open(star_path, "w") as f:
         f.write("\n# version 30001\n\ndata_optics\n\nloop_\n")
         f.write("_rlnOpticsGroup #1 \n_rlnOpticsGroupName #2 \n_rlnOpticsGroupNumber #3 \n")
         f.write("_rlnMicrographPixelSize #4 \n_rlnVoltage #5 \n_rlnSphericalAberration #6 \n")
         f.write("_rlnAmplitudeContrast #7 \n")
-        f.write(f"1 opticsGroup1 1 {p.get('angpix',1.77)} {p.get('kV',300)} {p.get('Cs',2.7)} {p.get('Q0',0.1)} \n \n")
+        f.write(f"1 opticsGroup1 1 {angpix_eff} {p.get('kV',300)} {p.get('Cs',2.7)} {p.get('Q0',0.1)} \n \n")
         if is_single_frame:
             f.write("\ndata_micrographs\n\nloop_\n_rlnMicrographName #1 \n_rlnOpticsGroup #2 \n")
             for m in files:
                 f.write(f"Micrographs/{os.path.basename(m)} 1 \n")
-            on_line("info", f"Detected {len(files)} single-frame micrographs (.mrc) — skipping motion correction")
+            on_line("info", f"Detected {len(files)} single-frame micrographs (.mrc) -- skipping motion correction")
         else:
             f.write("\ndata_movies\n\nloop_\n_rlnMicrographMovieName #1 \n_rlnOpticsGroup #2 \n")
             for m in files:
                 f.write(f"Movies/{os.path.basename(m)} 1 \n")
     on_line("success", f"Imported {len(files)} {'micrographs' if is_single_frame else 'movies'} -> {star_path}")
-    summary = {"n_movies" if not is_single_frame else "n_micrographs": len(files),
-               "pixel_size": p.get("angpix", 1.77), "voltage_kV": p.get("kV", 300),
-               "single_frame": is_single_frame}
+    summary_key = "n_movies" if not is_single_frame else "n_micrographs"
+    summary = {summary_key: len(files),
+               "pixel_size": angpix_eff, "voltage_kV": p.get("kV", 300),
+               "single_frame": is_single_frame,
+               "downsampled": downsample_factor > 1,
+               "downsample_factor": downsample_factor,
+               "original_pixel_size": angpix_orig}
     return star_path, summary
 
 def task_motioncorr(p, inputs, out, on_line, env):
@@ -549,7 +596,45 @@ def task_class2d(p, inputs, out, on_line, env):
     # job finishes in seconds-to-minutes instead of hours.
     nr_classes = min(int(p.get("nr_classes", 10)), 10)
     n_iter = min(int(p.get("iter_nr_iter", 5)), 5)
+    # Cap the particle diameter to be reasonable for the pixel size.
+    # The LLM sometimes proposes 160Å which at 3.54Å/px = 45px radius, exceeding
+    # the 32px box. Read the box size from the extract summary if available,
+    # otherwise estimate from the particles.star.
+    angpix_cls = float(p.get("angpix", 4.0))
+    # Try to read box size from the particles.star optics block
+    box = 64  # default
+    try:
+        with open(particles_star) as pf:
+            in_optics = False
+            for line in pf:
+                s = line.strip()
+                if s.startswith("data_optics"):
+                    in_optics = True
+                    continue
+                if s.startswith("data_") and in_optics:
+                    break
+                if in_optics and "_rlnImageSize" in s:
+                    parts = s.split()
+                    # find the value (last numeric token on the next data row)
+                if in_optics and not s.startswith("_") and not s.startswith("#") and not s.startswith("loop"):
+                    parts = s.split()
+                    for part in parts:
+                        try:
+                            val = int(part)
+                            if 16 <= val <= 1024:
+                                box = val
+                                break
+                        except:
+                            pass
+    except:
+        pass
     diameter = int(p.get("particle_diameter", 150))
+    max_diameter = int(box * angpix_cls * 0.8)
+    if diameter > max_diameter:
+        on_line("warn", f"class2d: particle_diameter {diameter} > {max_diameter} (box={box}*angpix={angpix_cls}*0.8) -- capping")
+        diameter = max_diameter
+    if diameter < 10:
+        diameter = int(angpix_cls * box * 0.5)
     out_root = os.path.join(jd, "run")
     on_line("info", f"class2d: capped to K={nr_classes}, iter={n_iter} for CPU")
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,

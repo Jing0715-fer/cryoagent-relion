@@ -1025,6 +1025,7 @@ async function createSingleJob(
     const importJob = allJobs.find((j) => j.taskType === "import");
     if (importJob) {
       const importParams = JSON.parse(importJob.parameters) as Record<string, string | number | boolean>;
+      const importSummary = JSON.parse(importJob.outputSummary || "{}") as Record<string, unknown>;
       for (const key of ["angpix", "kV", "Cs", "Q0"]) {
         if (importParams[key] !== undefined && params[key] !== undefined) {
           // only override if the LLM left the default (didn't explicitly set it)
@@ -1033,6 +1034,11 @@ async function createSingleJob(
             params[key] = importParams[key];
           }
         }
+      }
+      // If import downsampled, use the EFFECTIVE pixel size from the import
+      // output summary (which has the adjusted angpix after binning).
+      if (importSummary.downsampled && importSummary.pixel_size) {
+        params["angpix"] = importSummary.pixel_size as number | string;
       }
     }
   }

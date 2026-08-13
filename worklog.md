@@ -426,3 +426,26 @@ returned as a Buffer directly, bypassing the string conversion entirely.
   visualization pages render correctly.
 - Timeline shows all 8 jobs with durations, status colors, and metrics.
 - Defocus distribution shows 12 micrographs with backfilled defocus values.
+
+## Phase 11: Auto-downsampling for large micrographs + class2d diameter fix
+
+### New feature: Auto-downsampling for large micrographs
+- Import task now detects micrographs >2048px and auto-downsamples by 2x binning
+- 4096x4096 EMPIAR micrographs -> 2048x2048, angpix 1.77 -> 3.54 A/px
+- Downsampled copies stored in Micrographs_downsampled/ dir
+- Effective angpix propagated to all downstream jobs via parameter inheritance
+- Import output summary reports downsampled=true, downsample_factor, original_pixel_size
+
+### Fix: class2d particle_diameter too large for box
+- The LLM proposed 160Å diameter at 3.54Å/px = 45px radius, exceeding the 32px box
+- class2d now reads the box size from the particles.star optics block and caps
+  the diameter to box * angpix * 0.8
+
+### EMPIAR-10017 downsampled test results
+- import: 3 micrographs, downsampled 2x (4096->2048, angpix 1.77->3.54) ✅
+- motioncorr: auto-skipped (single-frame) ✅
+- ctffind: 3 micrographs fit ✅
+- autopick: 1898 particles (known coords fallback) ✅
+- extract: 464 particles, box=32px ✅
+- class2d: 10 classes, best resolution 12Å ✅
+- maskcreate: running (placeholder ref map) ✅

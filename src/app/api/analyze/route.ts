@@ -38,8 +38,11 @@ interface Orientation {
 interface FscPoint {
   resolution: number;       // Angstrom
   frequency: number;         // 1/resolution
-  fsc: number;               // 0..1
+  fsc: number;               // corrected FSC (main curve)
   fscRandom: number;         // random-phase FSC
+  fscUnmasked: number;       // unmasked maps FSC
+  fscMasked: number;         // masked maps FSC
+  fscParticleMask: number;   // particle mask fraction FSC
 }
 
 interface GuinierPoint {
@@ -302,13 +305,20 @@ function parseFscStar(fscStarPath: string): FscPoint[] {
       resolution = 1 / resolution;
     }
     if (resolution <= 0 || resolution > 9999 || resolution === 999) continue;
-    const fsc = parseFloat(parts[fscCol - 1] || "0");
-    const fscRandom = parseFloat(parts[fscUnmaskedCol - 1] || "0");
+    // Parse all FSC columns from RELION postprocess.star
+    const fscCorrected = parseFloat(parts[(colIdx["_rlnFourierShellCorrelationCorrected"] || 4) - 1] || "0");
+    const fscParticleMask = parseFloat(parts[(colIdx["_rlnFourierShellCorrelationParticleMaskFraction"] || 5) - 1] || "0");
+    const fscUnmasked = parseFloat(parts[(colIdx["_rlnFourierShellCorrelationUnmaskedMaps"] || 6) - 1] || "0");
+    const fscMasked = parseFloat(parts[(colIdx["_rlnFourierShellCorrelationMaskedMaps"] || 7) - 1] || "0");
+    const fscRandom = parseFloat(parts[(colIdx["_rlnCorrectedFourierShellCorrelationPhaseRandomizedMaskedMaps"] || 8) - 1] || "0");
     points.push({
       resolution,
       frequency: 1 / resolution,
-      fsc,
+      fsc: fscCorrected,
       fscRandom,
+      fscUnmasked,
+      fscMasked,
+      fscParticleMask,
     });
   }
   return points;

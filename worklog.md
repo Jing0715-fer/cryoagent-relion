@@ -491,3 +491,26 @@ returned as a Buffer directly, bypassing the string conversion entirely.
 - Autopick page: 1 canvas (picking overlay) + 1 img (micrograph), 8 particles shown
 - Micrograph selector shows 12 movie names
 - 0 page errors
+
+## Phase 14: FSC multi-curve plot + QA
+
+### QA results
+- Class2D page: 3 canvases + 10 images, 0 errors ✅
+- PostProcess page: 3 canvases (FSC + Guinier + 3D volume), 0 errors ✅
+- All job pages working correctly, 0 page errors
+
+### New feature: FSC multi-curve plot
+- CryoSPARC-style FSC plot now shows 4 curves in different colors:
+  1. **Corrected FSC** (emerald, solid, 2px) — the main resolution curve
+  2. **Unmasked maps FSC** (blue, dashed 5/3) — raw half-map correlation
+  3. **Masked maps FSC** (amber, dashed 3/2) — masked half-map correlation
+  4. **Phase-randomized FSC** (gray, dotted 2/2) — noise floor estimate
+- Updated legend with all 5 items (including 0.143 cutoff line)
+- Parses all FSC columns from RELION postprocess.star:
+  _rlnFourierShellCorrelationCorrected, _rlnFourierShellCorrelationParticleMaskFraction,
+  _rlnFourierShellCorrelationUnmaskedMaps, _rlnFourierShellCorrelationMaskedMaps,
+  _rlnCorrectedFourierShellCorrelationPhaseRandomizedMaskedMaps
+
+### Verified
+- PostProcess page: 3 canvases, 0 errors, all 4 FSC legend items visible
+  (corrected FSC, unmasked maps, masked maps, phase-randomized)

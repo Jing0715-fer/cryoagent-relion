@@ -7,6 +7,9 @@ interface FscPoint {
   frequency: number;
   fsc: number;
   fscRandom: number;
+  fscUnmasked: number;
+  fscMasked: number;
+  fscParticleMask: number;
 }
 
 interface Props {
@@ -104,7 +107,7 @@ export function FscCurve({ projectId, jobId }: Props) {
     ctx.fillStyle = "rgba(251, 191, 36, 0.9)";
     ctx.fillText("FSC=0.143", w - pad.r - 56, cutoffY - 4);
 
-    // FSC curve (corrected)
+    // FSC curve (corrected) — main emerald line
     ctx.strokeStyle = "#34d399";
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -115,7 +118,37 @@ export function FscCurve({ projectId, jobId }: Props) {
     });
     ctx.stroke();
 
-    // FSC uncorrected (random) — if present
+    // FSC unmasked maps (blue, dashed)
+    if (data.some((d) => d.fscUnmasked > 0)) {
+      ctx.strokeStyle = "rgba(96, 165, 250, 0.7)";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 3]);
+      ctx.beginPath();
+      data.forEach((d, i) => {
+        const x = xScale(d.resolution);
+        const y = yScale(d.fscUnmasked);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // FSC masked maps (amber, dashed)
+    if (data.some((d) => d.fscMasked > 0)) {
+      ctx.strokeStyle = "rgba(251, 191, 36, 0.7)";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 2]);
+      ctx.beginPath();
+      data.forEach((d, i) => {
+        const x = xScale(d.resolution);
+        const y = yScale(d.fscMasked);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // FSC random/phase-randomized (gray, dotted)
     if (data.some((d) => d.fscRandom > 0)) {
       ctx.strokeStyle = "rgba(148, 163, 184, 0.5)";
       ctx.lineWidth = 1;
@@ -210,9 +243,11 @@ export function FscCurve({ projectId, jobId }: Props) {
           <div className="text-slate-300">FSC: {hover.point.fsc.toFixed(3)}</div>
         </div>
       )}
-      <div className="flex items-center gap-3 text-[10px] text-muted-foreground px-2 pb-1">
+      <div className="flex items-center gap-3 text-[10px] text-muted-foreground px-2 pb-1 flex-wrap">
         <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-emerald-400" /> corrected FSC</span>
-        <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-slate-400" style={{ borderTop: "1px dashed" }} /> uncorrected</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-blue-400" style={{ borderTop: "2px dashed" }} /> unmasked maps</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-amber-400" style={{ borderTop: "2px dashed" }} /> masked maps</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-slate-400" style={{ borderTop: "1px dotted" }} /> phase-randomized</span>
         <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-amber-400" style={{ borderTop: "1px dashed" }} /> 0.143 cutoff</span>
       </div>
     </div>

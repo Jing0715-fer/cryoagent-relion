@@ -14,6 +14,7 @@ import { ClassAveragesGallery } from "./viz/class-averages";
 import { ClassEssHistogram } from "./viz/class-ess-histogram";
 import { MicrographGrid } from "./viz/micrograph-grid";
 import { DefocusDistribution } from "./viz/defocus-distribution";
+import { IterationProgress } from "./viz/iteration-progress";
 import { SliceViewer } from "./viz/slice-viewer";
 import { VolumeRenderer } from "./viz/volume-renderer";
 
@@ -300,10 +301,14 @@ function JobVisualizations({ projectId, job }: { projectId: string; job: Job }) 
             </>
           )}
 
-          {/* class2d / class3d: class averages + ESS histogram + angular heatmap */}
+          {/* class2d / class3d: class averages + iteration progress + ESS + angular */}
           {(job.taskType === "class2d" || job.taskType === "class3d") && (
             <>
               <div>
+                <div className="text-[11px] text-muted-foreground mb-2">Iteration progress (log-likelihood convergence)</div>
+                <IterationProgress projectId={projectId} jobId={job.id} />
+              </div>
+              <div className="border-t border-border/30 pt-3">
                 <div className="text-[11px] text-muted-foreground mb-2">2D class averages (click a class to inspect)</div>
                 <ClassAveragesGallery projectId={projectId} jobId={job.id} />
               </div>

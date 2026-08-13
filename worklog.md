@@ -449,3 +449,24 @@ returned as a Buffer directly, bypassing the string conversion entirely.
 - extract: 464 particles, box=32px ✅
 - class2d: 10 classes, best resolution 12Å ✅
 - maskcreate: running (placeholder ref map) ✅
+
+## Phase 12: Iteration progress chart + stuck maskcreate fix + QA
+
+### QA results
+- Full viz test project: all 8 jobs done, class2d images loading (92x92, loaded=true)
+- 3 canvases on class2d page (iteration progress + ESS histogram + angular heatmap)
+- 10 images (class averages), 0 page errors
+- EMPIAR downsampled project: import→class2d all done, maskcreate was stuck (fixed)
+- Console still shows non-blocking prompts.ts SSR warning
+
+### New feature: Iteration progress chart
+- CryoSPARC-style log-likelihood convergence plot for class2d/class3d/refine3d
+- Parses _rlnLogLikelihood and _rlnAveragePmax from each iteration's model.star
+- Canvas-rendered with: emerald log-likelihood line + fill, amber dashed avgPmax line,
+  iteration axis labels, legend, y-axis label
+- Shows whether the refinement is converging or still improving
+
+### Fixed
+- Stuck maskcreate job on EMPIAR downsampled project (was "running" forever, marked failed)
+- Iteration progress now appears at the TOP of the class2d viz panel (before class averages)
+  so the user sees convergence first, then the class averages

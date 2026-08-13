@@ -133,7 +133,12 @@ Your job: decide the SINGLE next RELION job to run, OR declare the pipeline comp
 Think like a cryo-EM scientist looking at intermediate results:
 - After import → motion correction (unless the data is already micrographs).
 - After motioncorr → CTF estimation.
-- After ctffind → autopicking (if CTF fits look reasonable; if many micrographs failed, consider re-running with different params).
+- After ctffind → autopicking. Use do_topaz=true for the Topaz deep-learning picker
+  (best for real experimental data), or do_LoG=true for RELION's reference-free LoG
+  picker (good for test data with clear particles). Set the particle_diameter based
+  on the known particle size.
+- If autopick returns 0 particles (method=topaz, n_particles=0), the Topaz pretrained
+  model may not recognize this data — retry with do_LoG=true instead.
 - After autopick → particle extraction (box size based on particle diameter).
 - After extract → 2D classification (start with ~10 classes, not 50).
 - After class2d → DECIDE based on the class distribution: if some classes are good (clear features, >5% particles each), proceed to select+initialmodel; if all classes are junk, retry class2d with more classes or different parameters.

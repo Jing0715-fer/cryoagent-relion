@@ -205,8 +205,8 @@ export const RELION_TASKS: RelionTask[] = [
       { key: "coords", label: "Particle coordinates", kind: "star", metrics: ["n_particles", "n_micrographs", "pick_density"] },
     ],
     parameters: [
-      { key: "do_LoG", label: "Laplacian of Gaussian", type: "bool", default: true, group: "Picking", help: "Reference-free LoG picker." },
-      { key: "do_topaz", label: "Use Topaz", type: "bool", default: false, group: "Picking", help: "Use Topaz deep-learning picker." },
+      { key: "do_LoG", label: "Laplacian of Gaussian", type: "bool", default: false, group: "Picking", help: "Reference-free LoG picker (RELION built-in)." },
+      { key: "do_topaz", label: "Use Topaz (deep learning)", type: "bool", default: true, group: "Picking", help: "Topaz pretrained resnet16 picker — best general-purpose method." },
       { key: "diameter_min", label: "LoG min diameter (Å)", type: "int", default: 140, group: "Picking", help: "Minimum diameter for LoG." },
       { key: "diameter_max", label: "LoG max diameter (Å)", type: "int", default: 180, group: "Picking", help: "Maximum diameter for LoG." },
       { key: "threshold", label: "Picking threshold", type: "float", default: 0.4, group: "Picking", help: "Particle score threshold." },

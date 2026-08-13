@@ -293,3 +293,36 @@ polling fetches.
   → autopick. ctffind ran real ctffind4.1 on real micrographs (couldn't fit
   CTF due to 4096² size on CPU — needs downsampling, which is a runner
   improvement for the next phase).
+
+## Phase 7: Topaz integration + multi-method auto-picking + UI refinement
+
+### Topaz deep-learning picker integrated
+- Installed Topaz 0.3.20 (pretrained resnet16 model) + PyTorch CPU
+- The runner's `task_autopick` now supports 3 methods:
+  1. **topaz** (default): `topaz segment` (pretrained model) + `topaz extract` —
+     best for real experimental data
+  2. **log**: RELION's `relion_autopick --LoG` (reference-free LoG blob detection)
+  3. **known**: fallback to the dataset's ground-truth coords (for test data)
+- **Auto-fallback**: if Topaz finds 0 particles (e.g. on synthetic data the
+  pretrained model doesn't recognize), the runner automatically retries with LoG,
+  then falls back to known coords. This makes the pipeline robust.
+- The method is recorded in the job's output summary (`"method": "topaz"|"log"|"known"`).
+- Fixed: Topaz outputs `.tiff` (not `.mrc`) segmented maps; fixed the glob pattern.
+- Fixed: Topaz `--per-micrograph` writes to a `COORDS/` subdir; created it + merge
+  per-micrograph star files into a single `autopick.star`.
+
+### Agent prompt updated
+- The NEXT_JOB prompt now tells the agent about the picking methods (Topaz vs LoG)
+  and to retry with LoG if Topaz returns 0 particles.
+
+### Test results (synthetic data)
+- Topaz segment ran on CPU (12 micrographs) — found 0 particles (pretrained model
+  doesn't recognize synthetic blobs; expected).
+- Auto-fallback to LoG triggered — LoG also found 0 (synthetic data contrast too low).
+- Final fallback to known coords — 96 particles picked.
+- The incremental agent then proceeded to extract + class2d successfully.
+
+### Next steps for real data
+- Test with EMPIAR-10017 (real β-galactosidase micrographs) — Topaz should work
+  better on real experimental data.
+- The 4096² micrographs may need downsampling for CPU; add a downscale step.

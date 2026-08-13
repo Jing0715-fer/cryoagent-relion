@@ -291,17 +291,155 @@ def task_ctffind(p, inputs, out, on_line, env):
                        "avg_resolution_A": round(avg_res, 2)}
 
 def task_autopick(p, inputs, out, on_line, env):
-    # For the test dataset we use the known particle coords (since we generated them).
-    # Real autopick would use relion_autopick LoG; we synthesize coords.star from the
-    # generation record if present.
+    """Particle picking. Supports multiple methods:
+      - method="topaz": Topaz deep-learning picker (pretrained resnet16 model)
+      - method="log": RELION's Laplacian-of-Gaussian picker (relion_autopick)
+      - method="known": use known coords from the source dataset (fallback for test data)
+    The method is chosen from parameters.do_topaz / do_LoG, defaulting to topaz.
+    """
     mc_star = inputs.get("motioncorr_star") or inputs.get("ctf_star")
     jd = ensure_job_dir(p["projectId"], out["jobId"])
     src = p.get("source_dataset") or os.path.join(PROJECT_ROOT, "data", "projects", "test_d4")
-    parts_star = os.path.join(src, "particles.star")
-    if not os.path.exists(parts_star):
-        raise RuntimeError("No particles.star available for autopick coordinates")
+    angpix = p.get("angpix", 1.77)
+    diameter = int(p.get("particle_diameter", 130))
+
+    # decide the picking method
+    use_topaz = p.get("do_topaz", True)
+    use_log = p.get("do_LoG", False)
+    method = "topaz" if use_topaz else ("log" if use_log else "known")
+
     out_star = os.path.join(jd, "autopick.star")
-    shutil.copy(parts_star, out_star)
+
+    if method == "topaz":
+        # --- Topaz: segment (pretrained model) + extract
+        on_line("info", f"Topaz picking: pretrained resnet16, diameter={diameter}Å, angpix={angpix}")
+        # gather micrograph paths from the star
+        mic_paths = []
+        if mc_star and os.path.exists(mc_star):
+            star_dir = os.path.dirname(mc_star)
+            with open(mc_star) as f:
+                in_mic = False
+                for line in f:
+                    s = line.strip()
+                    if s.startswith("data_"):
+                        in_mic = s.startswith("data_micrographs") or s.startswith("data_movies")
+                        continue
+                    if in_mic and s and not s.startswith("#") and not s.startswith("_") and not s.startswith("loop_"):
+                        parts = s.split()
+                        if parts and (parts[0].endswith(".mrc") or parts[0].endswith(".mrcs")):
+                            # resolve relative to the star file's directory, then its parent
+                            mic_rel = parts[0]
+                            mic_full = os.path.join(star_dir, mic_rel)
+                            if not os.path.exists(mic_full):
+                                mic_full = os.path.join(star_dir, "..", mic_rel)
+                                mic_full = os.path.normpath(mic_full)
+                            if os.path.exists(mic_full):
+                                mic_paths.append(mic_full)
+        if not mic_paths:
+            raise RuntimeError("Topaz: no micrographs found")
+        on_line("info", f"Topaz: processing {len(mic_paths)} micrographs")
+        # segment: produces probability maps (note: -s downscale is NOT a segment option,
+        # only extract supports -s. Topaz handles different pixel sizes internally.)
+        seg_dir = os.path.join(jd, "segmented")
+        os.makedirs(seg_dir, exist_ok=True)
+        seg_cmd = ["topaz", "segment", "-o", seg_dir, "-d", "0", "-j", "2"]
+        seg_cmd += mic_paths
+        on_line("info", f"$ topaz segment -o segmented -d 0 -j 2 ... ({len(mic_paths)} mics)")
+        rc = run_cmd(seg_cmd, jd, env, on_line)
+        if rc != 0:
+            on_line("warn", "Topaz segment failed — falling back to LoG picker")
+            method = "log"
+
+    if method == "log":
+        # --- RELION Laplacian-of-Gaussian picker
+        if not mc_star:
+            raise RuntimeError("LoG picker needs a motioncorr/ctf star")
+        on_line("info", f"RELION LoG picking: diameter {diameter-20}-{diameter+20}Å, angpix={angpix}")
+        # relion_autopick needs the micrographs star (not movies)
+        # write a temp micrographs star if needed
+        cmd = ["relion_autopick", "--i", mc_star, "--odir", jd + "/",
+               "--particle_diameter", str(diameter),
+               "--LoG", "--LoG_diam_min", str(max(10, diameter - 20)),
+               "--LoG_diam_max", str(diameter + 20),
+               "--shrink", "1", "--lowpass", str(max(8, angpix * 4)),
+               "--angpix", str(angpix),
+               "--threshold", str(p.get("threshold", 0.0)),
+               "--gpu", ""]
+        rc = run_cmd(cmd, jd, env, on_line)
+        if rc != 0:
+            on_line("warn", "RELION LoG failed — falling back to known coords")
+            method = "known"
+
+    if method in ("topaz", "log"):
+        # find the output star / coord files
+        # Topaz extract writes .star per micrograph or a single star
+        if method == "topaz":
+            # run extract on the segmented maps (Topaz outputs .tiff by default)
+            seg_files = sorted(glob.glob(os.path.join(jd, "segmented", "*.tiff")) +
+                               glob.glob(os.path.join(jd, "segmented", "*.mrc")) +
+                               glob.glob(os.path.join(jd, "segmented", "*.tif")))
+            if not seg_files:
+                on_line("warn", "Topaz: no segmented maps — falling back to known coords")
+                method = "known"
+            else:
+                radius = max(3, int(diameter / max(angpix, 1.0) / 2))
+                # Topaz --per-micrograph writes to <out_dir>/COORDS/<name>.star
+                coords_dir = os.path.join(jd, "COORDS")
+                os.makedirs(coords_dir, exist_ok=True)
+                ext_cmd = ["topaz", "extract", "-r", str(radius),
+                           "-t", str(p.get("threshold", -3.0)),
+                           "-o", coords_dir, "--format", "star", "--per-micrograph"]
+                ext_cmd += seg_files
+                on_line("info", f"$ topaz extract -r {radius} -t {p.get('threshold', -3.0)} -o COORDS ... ({len(seg_files)} maps)")
+                rc = run_cmd(ext_cmd, jd, env, on_line)
+                # merge per-micrograph star files into one autopick.star
+                coord_stars = sorted(glob.glob(os.path.join(coords_dir, "*.star")))
+                if rc == 0 and coord_stars:
+                    with open(out_star, "w") as outf:
+                        outf.write("data_particles\n\nloop_\n")
+                        outf.write("_rlnCoordinateX #1\n_rlnCoordinateY #2\n_rlnMicrographName #3\n")
+                        for cs in coord_stars:
+                            # parse the Topaz star: columns are score, mic_name, x, y
+                            # but the mic_name is the SEGMENTED file, not the original.
+                            # We use the basename (without "segmented/") as the mic name.
+                            seg_basename = os.path.basename(cs).replace(".star", "")
+                            with open(cs) as f:
+                                cols = {}
+                                for l in f:
+                                    s = l.strip()
+                                    if s.startswith("_rln"):
+                                        m = s.replace("#","").split()
+                                        if len(m) >= 2:
+                                            cols[m[0]] = int(m[-1])
+                                        continue
+                                    if not s or s.startswith("#") or s.startswith("loop") or s.startswith("data"):
+                                        continue
+                                    parts = s.split()
+                                    if len(parts) < 3:
+                                        continue
+                                    # find the x/y columns
+                                    x_idx = cols.get("_rlnCoordinateX", 3) - 1
+                                    y_idx = cols.get("_rlnCoordinateY", 4) - 1
+                                    if x_idx >= len(parts) or y_idx >= len(parts):
+                                        continue
+                                    try:
+                                        x = float(parts[x_idx])
+                                        y = float(parts[y_idx])
+                                        outf.write(f"{x:.1f} {y:.1f} {seg_basename}\n")
+                                    except: pass
+                    on_line("success", f"Topaz: merged {len(coord_stars)} coord files -> {out_star}")
+                elif rc != 0 or not os.path.exists(out_star):
+                    on_line("warn", "Topaz extract failed — falling back to known coords")
+                    method = "known"
+
+    if method == "known":
+        # Fallback: use the source dataset's known coords
+        parts_star = os.path.join(src, "particles.star")
+        if not os.path.exists(parts_star):
+            raise RuntimeError("No picking method succeeded and no particles.star available")
+        shutil.copy(parts_star, out_star)
+        on_line("info", f"Using known coordinates from {parts_star}")
+
     # count particles
     n = 0
     with open(out_star) as f:
@@ -309,9 +447,48 @@ def task_autopick(p, inputs, out, on_line, env):
             parts = l.split()
             if len(parts) >= 4 and parts[0].replace(".", "").isdigit():
                 n += 1
-    on_line("info", f"Using known coordinates from {parts_star}")
-    on_line("success", f"AutoPick: {n} particles across micrographs")
-    return out_star, {"n_particles": n, "pick_density": round(n/12, 1)}
+    # If Topaz found 0 particles, automatically retry with LoG before giving up
+    if method == "topaz" and n == 0:
+        on_line("warn", "Topaz found 0 particles — retrying with RELION LoG picker")
+        method = "log"
+        if mc_star:
+            cmd = ["relion_autopick", "--i", mc_star, "--odir", jd + "/",
+                   "--particle_diameter", str(diameter),
+                   "--LoG", "--LoG_diam_min", str(max(10, diameter - 20)),
+                   "--LoG_diam_max", str(diameter + 20),
+                   "--shrink", "1", "--lowpass", str(max(8, angpix * 4)),
+                   "--angpix", str(angpix),
+                   "--threshold", str(p.get("threshold", 0.0))]
+            rc = run_cmd(cmd, jd, env, on_line)
+            if rc == 0:
+                # find the autopick star that relion wrote
+                autopick_stars = sorted(glob.glob(os.path.join(jd, "autopick*.star")))
+                if autopick_stars:
+                    shutil.copy(autopick_stars[-1], out_star)
+                    n = 0
+                    with open(out_star) as f:
+                        for l in f:
+                            parts = l.split()
+                            if len(parts) >= 4 and parts[0].replace(".", "").isdigit():
+                                n += 1
+                    method = "log"
+        if n == 0:
+            on_line("warn", "LoG also found 0 particles — falling back to known coords")
+            method = "known"
+    if method == "known":
+        parts_star = os.path.join(src, "particles.star")
+        if os.path.exists(parts_star):
+            shutil.copy(parts_star, out_star)
+            n = 0
+            with open(out_star) as f:
+                for l in f:
+                    parts = l.split()
+                    if len(parts) >= 4 and parts[0].replace(".", "").isdigit():
+                        n += 1
+            on_line("info", f"Fallback: using known coordinates from {parts_star}")
+    on_line("success", f"AutoPick ({method}): {n} particles")
+    return out_star, {"n_particles": n, "pick_density": round(n / max(1, 12), 1),
+                      "method": method}
 
 def task_extract(p, inputs, out, on_line, env):
     # CPU extraction via our extract_cpu.py: read corrected micrographs, slice boxes

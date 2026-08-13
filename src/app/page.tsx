@@ -5,14 +5,11 @@ import { Header } from "@/components/cryo/header";
 import { ProjectSidebar } from "@/components/cryo/project-sidebar";
 import { ChatPanel } from "@/components/cryo/chat-panel";
 import { WorkflowDag } from "@/components/cryo/workflow-dag";
-import { JobDetail } from "@/components/cryo/job-detail";
-import { ResultsGallery } from "@/components/cryo/results-gallery";
-import { VisualizationsDashboard } from "@/components/cryo/visualizations-dashboard";
+import { JobResultsView } from "@/components/cryo/job-results-view";
 import { NewProjectDialog } from "@/components/cryo/new-project-dialog";
 import { Icon } from "@/components/cryo/icon";
 import { Project, Message, Workflow, Job, Decision } from "@/lib/types";
 import { RELION_TASKS } from "@/lib/relion/tasks";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
@@ -23,9 +20,9 @@ export default function Home() {
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [viewJobId, setViewJobId] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<string>("workflow");
   const [exporting, setExporting] = useState(false);
 
   // ---- load project list on mount -----------------------------------------
@@ -201,6 +198,29 @@ export default function Home() {
   })();
 
   const selectedJob: Job | null = jobs.find((j) => j.id === selectedJobId) || null;
+  const viewJob: Job | null = jobs.find((j) => j.id === viewJobId) || null;
+
+  // ---- retry a failed job -------------------------------------------------
+  async function handleRetry(jobId: string) {
+    try {
+      const res = await fetch(`/api/jobs/retry?jobId=${jobId}`, { method: "POST" });
+      if (!res.ok) throw new Error("retry failed");
+      // reset workflow + project to running so the tick loop resumes
+      if (selectedId) {
+        await db_updateProjectRunning(selectedId);
+      }
+      toast.success("Job retried — agent will continue");
+      setViewJobId(null);
+    } catch (e: any) {
+      toast.error(e.message || "Retry failed");
+    }
+  }
+  // helper to flip project/workflow back to running after a retry
+  async function db_updateProjectRunning(pid: string) {
+    try {
+      await fetch(`/api/agent/run?projectId=${pid}`, { method: "POST" });
+    } catch { /* ignore */ }
+  }
 
   // auto-select running or last done job for convenience
   useEffect(() => {
@@ -256,60 +276,37 @@ export default function Home() {
           )}
         </main>
 
-        {/* right: workflow + job detail (tabbed) */}
+        {/* right: workflow DAG (click a job → per-job results page) */}
         <section className="flex flex-col min-h-0">
-          <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 min-h-0 flex flex-col">
-            <div className="border-b border-border/60 px-2 pt-2">
-              <TabsList className="bg-transparent p-0 h-9">
-                <TabsTrigger value="workflow" className="gap-1.5 text-xs">
+          {viewJob ? (
+            <JobResultsView
+              projectId={selectedId}
+              job={viewJob}
+              onBack={() => setViewJobId(null)}
+              onRetry={handleRetry}
+            />
+          ) : (
+            <div className="flex flex-col h-full min-h-0">
+              <div className="border-b border-border/60 px-3 py-2 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
                   <Icon name="Workflow" className="h-3.5 w-3.5" />
                   Workflow
-                </TabsTrigger>
-                <TabsTrigger value="job" className="gap-1.5 text-xs">
-                  <Icon name="Terminal" className="h-3.5 w-3.5" />
-                  Job inspector
-                </TabsTrigger>
-                <TabsTrigger value="viz" className="gap-1.5 text-xs">
-                  <Icon name="BarChart3" className="h-3.5 w-3.5" />
-                  Visualizations
-                </TabsTrigger>
-                <TabsTrigger value="results" className="gap-1.5 text-xs">
-                  <Icon name="FolderOpen" className="h-3.5 w-3.5" />
-                  Results
-                </TabsTrigger>
-                <TabsTrigger value="catalog" className="gap-1.5 text-xs">
-                  <Icon name="Library" className="h-3.5 w-3.5" />
-                  RELION tasks
-                </TabsTrigger>
-              </TabsList>
-            </div>
-
-            <TabsContent value="workflow" className="flex-1 min-h-0 m-0 p-0">
-              <div className="h-full min-h-0">
+                </div>
+                {jobs.length > 0 && (
+                  <div className="text-[10px] text-muted-foreground">
+                    {nDone}/{jobs.length} done · click a job to inspect
+                  </div>
+                )}
+              </div>
+              <div className="flex-1 min-h-0">
                 <WorkflowDag
                   jobs={jobs}
                   selectedJobId={selectedJobId}
-                  onSelectJob={(id) => { setSelectedJobId(id); setActiveTab("job"); }}
+                  onSelectJob={(id) => { setSelectedJobId(id); setViewJobId(id); }}
                 />
               </div>
-            </TabsContent>
-
-            <TabsContent value="job" className="flex-1 min-h-0 m-0 p-0">
-              <JobDetail job={selectedJob} />
-            </TabsContent>
-
-            <TabsContent value="viz" className="flex-1 min-h-0 m-0 p-0">
-              {selectedId && <VisualizationsDashboard projectId={selectedId} refreshKey={jobs.length + nDone} />}
-            </TabsContent>
-
-            <TabsContent value="results" className="flex-1 min-h-0 m-0 p-0">
-              {selectedId && <ResultsGallery projectId={selectedId} refreshKey={jobs.length + nDone} />}
-            </TabsContent>
-
-            <TabsContent value="catalog" className="flex-1 min-h-0 m-0 p-0 overflow-y-auto cryo-scroll">
-              <TaskCatalog />
-            </TabsContent>
-          </Tabs>
+            </div>
+          )}
         </section>
       </div>
 
@@ -332,51 +329,6 @@ export default function Home() {
       </footer>
 
       <NewProjectDialog open={newProjectOpen} onOpenChange={setNewProjectOpen} onCreate={handleNewProject} />
-    </div>
-  );
-}
-
-// ---- RELION task catalog (right tab) --------------------------------------
-function TaskCatalog() {
-  const [open, setOpen] = useState<Record<string, boolean>>({});
-  return (
-    <div className="p-3 space-y-1.5">
-      <div className="text-[11px] text-muted-foreground mb-1 px-1">
-        The full RELION task set the agent can plan with. Click to expand parameters.
-      </div>
-      {RELION_TASKS.map((t) => (
-        <div key={t.key} className="rounded-md border border-border/50 bg-muted/20 overflow-hidden">
-          <button
-            onClick={() => setOpen((o) => ({ ...o, [t.key]: !o[t.key] }))}
-            className="w-full flex items-center gap-2.5 px-2.5 py-2 text-left hover:bg-muted/40"
-          >
-            <div className={`h-7 w-7 rounded-md grid place-items-center bg-background/60 ${t.color}`}>
-              <Icon name={t.icon} className="h-3.5 w-3.5" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="text-[13px] font-medium">{t.name}</div>
-              <div className="text-[10px] text-muted-foreground truncate">{t.description}</div>
-            </div>
-            <Icon name={open[t.key] ? "ChevronDown" : "ChevronRight"} className="h-4 w-4 text-muted-foreground" />
-          </button>
-          {open[t.key] && (
-            <div className="px-2.5 pb-2.5 pt-1 border-t border-border/40">
-              <div className="text-[11px] text-muted-foreground mb-1.5">{t.decisionHints.when}</div>
-              <div className="grid grid-cols-1 gap-x-3 gap-y-0.5 text-[11px] mb-2">
-                {t.parameters.map((p) => (
-                  <div key={p.key} className="flex justify-between gap-2 border-b border-border/30 py-0.5">
-                    <span className="font-mono text-muted-foreground shrink-0">--{p.key}</span>
-                    <span className="font-mono text-foreground text-right truncate">{String(p.default)}</span>
-                  </div>
-                ))}
-              </div>
-              <div className="text-[10px] text-amber-300/80 bg-amber-500/5 border border-amber-500/20 rounded px-2 py-1">
-                <span className="font-medium">Decides:</span> {t.decisionHints.decides}
-              </div>
-            </div>
-          )}
-        </div>
-      ))}
     </div>
   );
 }

@@ -25,8 +25,8 @@ export async function POST(req: NextRequest) {
   await db.message.create({
     data: { projectId, role: "user", content },
   });
-  // agent plans + replies
+  // agent plans the FIRST job + replies (incremental: subsequent jobs decided after each completes)
   await db.project.update({ where: { id: projectId }, data: { status: "running" } });
-  const { plan, workflowId, assistantMessage } = await chatReply(projectId, content);
-  return NextResponse.json({ plan, workflowId, assistantMessage });
+  const { workflowId, assistantMessage } = await chatReply(projectId, content);
+  return NextResponse.json({ workflowId, assistantMessage });
 }

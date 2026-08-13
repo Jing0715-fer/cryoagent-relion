@@ -232,3 +232,50 @@ polling fetches.
   averages + slices).
 - Export: 36 MB zip downloaded successfully.
 - No console errors, no shader errors, lint clean.
+
+## Phase 6: Incremental agentic planning + per-job results pages + EMPIAR-10017
+
+### Architectural change: incremental agent (one job at a time)
+- **Before**: the LLM planned the ENTIRE workflow upfront (13-job DAG), then the
+  engine executed them one-by-one. This was not truly agentic — the agent never
+  looked at intermediate results to decide the next step.
+- **After**: `chatReply()` now plans ONLY the first job (import). After each job
+  completes, `planNextJob()` calls the LLM with the completed job's output + full
+  history, and the LLM decides the SINGLE next job (or declares done). This makes
+  the agent truly adaptive — e.g. after class2d, it looks at the class distribution
+  and decides whether to retry with more classes or proceed to 3D.
+
+### Cycle detection
+- If the LLM tries to create the same task type >2 times (e.g. re-running class2d
+  after class3d is skipped), the agent declares done to prevent infinite loops.
+
+### CPU-skip continuation
+- After a CPU-impractical task (initialmodel, class3d, refine3d) is auto-skipped,
+  `planNextJob` is now triggered so the agent can decide the next CPU-feasible step
+  (e.g. maskcreate + postprocess using reference.mrc). Previously the pipeline
+  would stall after a skip.
+
+### Per-job results pages (UI refactor)
+- **Before**: all visualizations were crammed into one scrolling "Visualizations"
+  tab, plus a separate "Results" tab and "Job inspector" tab.
+- **After**: clicking a job card in the workflow DAG navigates to a dedicated
+  **per-job results page** showing: parameters, output summary, output files
+  (with download), live log, and the visualizations specific to THAT job
+  (class averages + angular heatmap for class2d; FSC + Guinier + 3D volume for
+  postprocess; slice viewer + 3D volume for maskcreate). A "Workflow" back button
+  returns to the DAG.
+
+### EMPIAR-10017 real data
+- Downloaded 2 real beta-galactosidase micrographs (4096×4096, 1.77 Å/px, 67MB
+  each) from EMPIAR-10017 + their manually-picked .coord files.
+- Located at `data/projects/empiar10017/`.
+- The runner's import task needs updating to handle single-frame micrographs
+  (not movies) — this is the next step for real-data testing.
+
+### Verified end-to-end (agent-browser)
+- Incremental agent: created project → agent planned only "import" → after import
+  done, agent decided "motioncorr" → after motioncorr, "ctffind" → etc. Each
+  decision references the prior result.
+- Per-job results page: clicking Import shows parameters + outputs + logs; clicking
+  Class2D shows class averages (10 images) + angular heatmap (1 canvas) + live log.
+- No console errors, lint clean.

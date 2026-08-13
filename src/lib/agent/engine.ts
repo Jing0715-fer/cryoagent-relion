@@ -18,7 +18,7 @@ import path from "path";
 import { db } from "@/lib/db";
 import { getTask } from "@/lib/relion/tasks";
 import { buildContext, getLogPlan, getOutput, taskDuration } from "@/lib/relion/executor";
-import { CHAT_SYSTEM_PROMPT, DECIDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT } from "./prompts";
+import { CHAT_SYSTEM_PROMPT, DECIDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, FIRST_JOB_SYSTEM_PROMPT, NEXT_JOB_SYSTEM_PROMPT } from "./prompts";
 
 let _zai: Awaited<ReturnType<typeof ZAI.create>> | null = null;
 async function zai() {
@@ -357,18 +357,20 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
     const next = allJobs.find(
       (j) => j.status === "queued" && canStart(j, jobById) && !CPU_SKIPPED.has(j.taskType),
     );
-    // auto-skip CPU-impractical tasks
+    // auto-skip CPU-impractical tasks; track them so we can trigger planNextJob
+    const skippedNow: string[] = [];
     for (const j of allJobs) {
       if (j.status === "queued" && CPU_SKIPPED.has(j.taskType)) {
         await db.job.update({
           where: { id: j.id },
           data: { status: "skipped", progress: 100, finishedAt: new Date() },
         });
+        skippedNow.push(j.id);
         await db.message.create({
           data: {
             projectId,
             role: "tool",
-            content: `⏭️ ${j.taskType} skipped on CPU — this task requires a GPU for practical runtime. The agent produced real RELION outputs for all CPU-feasible tasks. Switch to GPU mode for the full 3D pipeline.`,
+            content: `⏭️ ${j.taskType} skipped on CPU — this task requires a GPU for practical runtime. The agent will decide the next CPU-feasible step.`,
             meta: JSON.stringify({ jobId: j.id, taskType: j.taskType, kind: "job-skipped", real: true }),
           },
         });
@@ -472,22 +474,52 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
       decisionsMade.push({ jobId, taskType: job.taskType, decision: decision.decision });
     }
 
-    // finalize workflow if all done/failed/skipped
-    const refreshed = await db.job.findMany({ where: { workflowId: workflow.id } });
-    const terminal = refreshed.every((j) => ["done", "failed", "skipped"].includes(j.status));
+    // ---- Incremental agent: after a job finishes OR is skipped, decide the NEXT job ----
     let workflowStatus = "running";
-    if (terminal) {
-      const anyFailed = refreshed.some((j) => j.status === "failed");
-      await db.workflow.update({
-        where: { id: workflow.id },
-        data: { status: anyFailed ? "error" : "done" },
-      });
-      await db.project.update({
-        where: { id: projectId },
-        data: { status: anyFailed ? "error" : "done" },
-      });
-      if (!anyFailed) await summarize(projectId);
-      workflowStatus = anyFailed ? "error" : "done";
+    const refreshed = await db.job.findMany({ where: { workflowId: workflow.id } });
+    const hasQueued = refreshed.some((j) => j.status === "queued");
+    const hasRunning = refreshed.some((j) => j.status === "running");
+    const triggerIds = [...finishedNow, ...skippedNow];
+    // Fallback: if the workflow is idle (no queued/running) but we haven't
+    // triggered planNextJob this tick, check if the last terminal job needs
+    // a next-step decision (e.g. it was skipped/completed in a prior tick).
+    if (triggerIds.length === 0 && !hasQueued && !hasRunning && refreshed.length > 0) {
+      const terminal = refreshed.filter((j) => ["done", "skipped", "failed"].includes(j.status));
+      if (terminal.length > 0) {
+        const lastTerminal = terminal[terminal.length - 1];
+        // only trigger if this job was completed very recently (within 5s)
+        // to avoid re-triggering on every idle tick
+        if (lastTerminal.finishedAt) {
+          const ageSec = (Date.now() - lastTerminal.finishedAt.getTime()) / 1000;
+          if (ageSec < 10) {
+            triggerIds.push(lastTerminal.id);
+          }
+        }
+      }
+    }
+    if (!hasQueued && !hasRunning && triggerIds.length > 0) {
+      const lastId = triggerIds[triggerIds.length - 1];
+      const lastJob = await db.job.findUnique({ where: { id: lastId } });
+      // plan next if the last job succeeded or was skipped (not failed)
+      if (lastJob && (lastJob.status === "done" || lastJob.status === "skipped")) {
+        const r = await planNextJob(projectId, lastId);
+        if (r.done) {
+          workflowStatus = "done";
+        }
+      } else if (lastJob && lastJob.status === "failed") {
+        // a failed job halts the incremental pipeline
+        await db.workflow.update({ where: { id: workflow.id }, data: { status: "error" } });
+        await db.project.update({ where: { id: projectId }, data: { status: "error" } });
+        await db.message.create({
+          data: {
+            projectId,
+            role: "assistant",
+            content: `❌ Job **${lastJob.taskType}** failed. The incremental pipeline is paused. Inspect the job's logs, fix the issue, and retry the failed job to continue.`,
+            meta: JSON.stringify({ kind: "pipeline-paused", jobId: lastJob.id }),
+          },
+        });
+        workflowStatus = "error";
+      }
     }
 
     return {
@@ -800,42 +832,283 @@ Write a concise final summary (2-3 sentences) for the user, in markdown.`,
   });
 }
 
-// ---- 5. chatReply -----------------------------------------------------------
+// ---- 5. chatReply (incremental: plans only the FIRST job) ------------------
+
+// The agent is now incremental: chatReply plans ONLY the first job. After each
+// job completes, planNextJob() decides the next single job based on the result.
+// This makes the agent truly adaptive — it doesn't pre-commit to a fixed DAG.
 
 export async function chatReply(
   projectId: string,
   userMessage: string,
-): Promise<{ plan: Plan | null; workflowId: string | null; assistantMessage: string }> {
-  const plan = await planWorkflow(projectId, userMessage);
-  const workflowId = await persistPlan(projectId, plan);
+): Promise<{ workflowId: string | null; assistantMessage: string }> {
+  const project = await db.project.findUnique({ where: { id: projectId } });
+  const datasetMeta = project?.datasetMeta ? JSON.parse(project.datasetMeta) : {};
 
-  // Announce the plan in chat
-  const jobLines = plan.jobs
-    .map((j) => `- \`${j.task}\`${j.alias ? ` (${j.alias})` : ""}${j.rationale ? ` — ${j.rationale}` : ""}`)
-    .join("\n");
-  const decisionLines = plan.decisions?.length
-    ? `\n\n**Autonomous decision points:**\n${plan.decisions
-        .map((d) => `- after \`${d.afterJob}\`: ${d.description}`)
-        .join("\n")}`
-    : "";
+  // Decide the FIRST job via the LLM
+  const client = await zai();
+  const completion = await client.chat.completions.create({
+    messages: [
+      { role: "assistant", content: FIRST_JOB_SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: `User request:
+"""
+${userMessage}
+"""
 
-  const assistantMessage = `## 🧬 Workflow planned: ${plan.workflowName}
+Dataset metadata:
+${JSON.stringify(datasetMeta, null, 2)}
 
-${plan.summary}
+Source dataset path: ${project?.sourceDataset || "unknown"}
 
-**Pipeline (${plan.jobs.length} jobs):**
-${jobLines}${decisionLines}
+Decide the single first RELION job now.`,
+      },
+    ],
+    thinking: { type: "disabled" },
+  });
+  const raw = completion.choices[0]?.message?.content ?? "";
+  const parsed = parseJsonLoose(raw) as
+    | { firstJob?: PlannedJob; ackMessage?: string; done?: boolean }
+    | null;
 
-I'll start executing now — you can watch progress in the workflow panel and read live logs in the job inspector.`;
+  // Create the workflow (empty — jobs are added one at a time)
+  const workflow = await db.workflow.create({
+    data: {
+      projectId,
+      name: "Incremental RELION pipeline",
+      status: "running",
+    },
+  });
+  await db.project.update({ where: { id: projectId }, data: { status: "running" } });
+
+  let assistantMessage: string;
+  if (parsed?.firstJob) {
+    // store the user's original goal on the workflow for the next-job planner
+    await db.message.create({
+      data: {
+        projectId,
+        role: "system",
+        content: `USER_GOAL: ${userMessage}`,
+        meta: JSON.stringify({ kind: "user-goal" }),
+      },
+    });
+    // create the first job
+    await createSingleJob(workflow.id, projectId, parsed.firstJob, []);
+    assistantMessage =
+      parsed.ackMessage ||
+      `I'll start with **${parsed.firstJob.task}** and decide each next step based on the results. Watch the workflow panel — each job's results appear as it completes.`;
+  } else {
+    assistantMessage = `I understood your request but couldn't decide on a first step. Could you give me more detail about the dataset (pixel size, voltage, particle)?`;
+  }
 
   await db.message.create({
     data: {
       projectId,
       role: "assistant",
       content: assistantMessage,
-      meta: JSON.stringify({ kind: "plan", workflowId }),
+      meta: JSON.stringify({ kind: "first-job", workflowId: workflow.id }),
     },
   });
 
-  return { plan, workflowId, assistantMessage };
+  return { workflowId: workflow.id, assistantMessage };
+}
+
+// ---- 6. planNextJob (called after a job completes) -------------------------
+
+// Creates a single job in the DB with its parameters + input dependencies.
+async function createSingleJob(
+  workflowId: string,
+  projectId: string,
+  job: PlannedJob,
+  inputJobIds: string[],
+): Promise<string> {
+  const task = getTask(job.task);
+  if (!task) throw new Error(`unknown task ${job.task}`);
+  const params: Record<string, string | number | boolean> = {};
+  for (const p of task.parameters) params[p.key] = p.default;
+  for (const [k, v] of Object.entries(job.parameters || {})) params[k] = v;
+  const created = await db.job.create({
+    data: {
+      workflowId,
+      taskType: job.task,
+      alias: job.alias || "",
+      status: "queued",
+      parameters: JSON.stringify(params),
+      inputJobIds: JSON.stringify(inputJobIds),
+    },
+  });
+  return created.id;
+}
+
+// After a job completes, ask the LLM what the next single job should be (or done).
+export async function planNextJob(
+  projectId: string,
+  completedJobId: string,
+): Promise<{ created: boolean; done: boolean }> {
+  const workflow = await db.workflow.findFirst({
+    where: { projectId, status: "running" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!workflow) return { created: false, done: true };
+
+  const allJobs = await db.job.findMany({
+    where: { workflowId: workflow.id },
+    orderBy: { createdAt: "asc" },
+  });
+  const completedJob = allJobs.find((j) => j.id === completedJobId);
+  if (!completedJob) return { created: false, done: false };
+
+  // Find the user's original goal (stored as a system message)
+  const goalMsg = await db.message.findFirst({
+    where: { projectId, role: "system", content: { startsWith: "USER_GOAL:" } },
+  });
+  const userGoal = goalMsg?.content?.replace("USER_GOAL:", "").trim() || "";
+
+  // Build a summary of all completed jobs + their outputs
+  const doneJobs = allJobs.filter((j) => ["done", "skipped"].includes(j.status));
+  const jobHistory = doneJobs
+    .map((j) => {
+      const o = JSON.parse(j.outputSummary);
+      const summaryEntries = Object.entries(o)
+        .slice(0, 6)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(", ");
+      return `- ${j.taskType} (${j.status}): ${summaryEntries || "no metrics"}`;
+    })
+    .join("\n");
+
+  const justOut = JSON.parse(completedJob.outputSummary);
+
+  const client = await zai();
+  const completion = await client.chat.completions.create({
+    messages: [
+      { role: "assistant", content: NEXT_JOB_SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: `User's original goal:
+"""
+${userGoal}
+"""
+
+Pipeline history so far:
+${jobHistory || "(no jobs completed yet)"}
+
+NOTE: On this CPU-only deployment, the heavy 3D tasks (initialmodel, class3d, refine3d,
+multibody, polish, localres) are AUTOMATICALLY SKIPPED because they require a GPU. When they
+are skipped, the pipeline falls back to the dataset's reference.mrc as the 3D reference, so
+maskcreate and postprocess can still run. Do NOT re-run class2d or try 3D tasks again —
+proceed to maskcreate (using the reference map) and postprocess instead.
+
+The just-completed/skipped job was: ${completedJob.taskType} (${completedJob.status})
+Its output summary: ${JSON.stringify(justOut)}
+
+Decide the SINGLE next RELION job to run (or declare done). If all feasible steps are done, declare done.`,
+      },
+    ],
+    thinking: { type: "disabled" },
+  });
+  const raw = completion.choices[0]?.message?.content ?? "";
+  const parsed = parseJsonLoose(raw) as
+    | { nextJob?: PlannedJob; done?: boolean; summary?: string }
+    | null;
+
+  if (parsed?.done) {
+    // pipeline complete
+    await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
+    await db.project.update({ where: { id: projectId }, data: { status: "done" } });
+    const summary = parsed.summary || "Pipeline complete.";
+    await db.message.create({
+      data: {
+        projectId,
+        role: "assistant",
+        content: `## ✅ Pipeline complete\n\n${summary}`,
+        meta: JSON.stringify({ kind: "summary" }),
+      },
+    });
+    return { created: false, done: true };
+  }
+
+  if (parsed?.nextJob) {
+    const nj = parsed.nextJob;
+    // Cycle detection: if this task type has already been run 2+ times, don't
+    // create another — declare done to prevent infinite loops.
+    const sameTypeCount = doneJobs.filter((j) => j.taskType === nj.task).length;
+    if (sameTypeCount >= 2) {
+      await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
+      await db.project.update({ where: { id: projectId }, data: { status: "done" } });
+      await db.message.create({
+        data: {
+          projectId,
+          role: "assistant",
+          content: `## ✅ Pipeline complete\n\nThe agent has run all feasible steps. ${nj.task} was already attempted ${sameTypeCount} times — stopping to avoid a cycle.`,
+          meta: JSON.stringify({ kind: "summary", cycleBreak: true }),
+        },
+      });
+      return { created: false, done: true };
+    }
+    // resolve dependsOn: by task key → last done job of that type
+    const inputJobIds: string[] = [];
+    for (const dep of nj.dependsOn || []) {
+      const cand = doneJobs.filter((j) => j.taskType === dep);
+      if (cand.length) inputJobIds.push(cand[cand.length - 1].id);
+    }
+    await createSingleJob(workflow.id, projectId, nj, inputJobIds);
+    await db.message.create({
+      data: {
+        projectId,
+        role: "assistant",
+        content: `🧭 Next: **${nj.task}**${nj.rationale ? ` — ${nj.rationale}` : ""}`,
+        meta: JSON.stringify({ kind: "next-job", taskType: nj.task }),
+      },
+    });
+    return { created: true, done: false };
+  }
+
+  // fallback: if LLM gave nothing usable, try a heuristic next-step
+  const heuristicNext = heuristicNextJob(completedJob.taskType, justOut);
+  if (heuristicNext) {
+    const inputJobIds = [completedJob.id];
+    await createSingleJob(workflow.id, projectId, heuristicNext, inputJobIds);
+    await db.message.create({
+      data: {
+        projectId,
+        role: "assistant",
+        content: `🧭 Next: **${heuristicNext.task}** (heuristic — LLM gave no usable plan)`,
+        meta: JSON.stringify({ kind: "next-job", taskType: heuristicNext.task, heuristic: true }),
+      },
+    });
+    return { created: true, done: false };
+  }
+
+  // nothing more to do
+  await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
+  await db.project.update({ where: { id: projectId }, data: { status: "done" } });
+  return { created: false, done: true };
+}
+
+// Heuristic next-step fallback (used if the LLM plan is unparseable).
+function heuristicNextJob(
+  taskType: string,
+  output: Record<string, number | string>,
+): PlannedJob | null {
+  const seq: Record<string, string> = {
+    import: "motioncorr",
+    motioncorr: "ctffind",
+    ctffind: "autopick",
+    autopick: "extract",
+    extract: "select",
+    select: "class2d",
+    class2d: "maskcreate",
+    maskcreate: "postprocess",
+    postprocess: "localres",
+  };
+  const next = seq[taskType];
+  if (!next) return null;
+  return {
+    task: next,
+    dependsOn: [taskType],
+    parameters: {},
+    rationale: `Heuristic next step after ${taskType}.`,
+  };
 }

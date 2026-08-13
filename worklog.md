@@ -514,3 +514,26 @@ returned as a Buffer directly, bypassing the string conversion entirely.
 ### Verified
 - PostProcess page: 3 canvases, 0 errors, all 4 FSC legend items visible
   (corrected FSC, unmasked maps, masked maps, phase-randomized)
+
+## Phase 15: CTF fit quality scatter plot + QA
+
+### QA results
+- All job pages working, 0 page errors
+- CTFFind page now has 2 canvases (defocus distribution + CTF quality scatter)
+- Class2D page: 3 canvases + 10 images, 0 errors
+- PostProcess page: 3 canvases, 0 errors
+
+### New feature: CTF fit quality scatter plot
+- CryoSPARC-style scatter plot on the ctffind job page
+- Plots defocus (x-axis, μm) vs CTF fit resolution (y-axis, Å) for each micrograph
+- Points colored by Figure of Merit (FOM):
+  - Green = good (FOM > 0.66 of max)
+  - Amber = ok (FOM 0.33-0.66)
+  - Rose = poor (FOM < 0.33)
+- Hover tooltip shows micrograph name, defocus, resolution, FOM
+- Helps identify micrographs with poor CTF fits that should be excluded
+- Parses _rlnDefocusU, _rlnCtfMaxResolution, _rlnCtfFigureOfMerit from micrographs_ctf.star
+
+### Verified
+- CTFFind page: 2 canvases (defocus distribution + CTF quality scatter), 0 errors
+- All 3 sections visible: micrograph grid, defocus distribution, CTF fit quality

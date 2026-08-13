@@ -16,6 +16,7 @@ import { MicrographGrid } from "./viz/micrograph-grid";
 import { DefocusDistribution } from "./viz/defocus-distribution";
 import { IterationProgress } from "./viz/iteration-progress";
 import { PickingOverlay } from "./viz/picking-overlay";
+import { CtfQualityScatter } from "./viz/ctf-quality-scatter";
 import { SliceViewer } from "./viz/slice-viewer";
 import { VolumeRenderer } from "./viz/volume-renderer";
 
@@ -266,7 +267,7 @@ function JobVisualizations({ projectId, job }: { projectId: string; job: Job }) 
             </div>
           )}
 
-          {/* ctffind: micrograph grid + defocus distribution plot */}
+          {/* ctffind: micrograph grid + defocus distribution + CTF quality scatter */}
           {job.taskType === "ctffind" && (
             <>
               <div>
@@ -276,6 +277,10 @@ function JobVisualizations({ projectId, job }: { projectId: string; job: Job }) 
               <div className="border-t border-border/30 pt-3">
                 <div className="text-[11px] text-muted-foreground mb-2">Defocus distribution</div>
                 <DefocusDistribution projectId={projectId} jobId={job.id} />
+              </div>
+              <div className="border-t border-border/30 pt-3">
+                <div className="text-[11px] text-muted-foreground mb-2">CTF fit quality (defocus vs resolution, colored by FOM)</div>
+                <CtfQualityScatter projectId={projectId} jobId={job.id} />
               </div>
             </>
           )}

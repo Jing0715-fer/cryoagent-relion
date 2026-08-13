@@ -15,6 +15,7 @@ import { ClassEssHistogram } from "./viz/class-ess-histogram";
 import { MicrographGrid } from "./viz/micrograph-grid";
 import { DefocusDistribution } from "./viz/defocus-distribution";
 import { IterationProgress } from "./viz/iteration-progress";
+import { PickingOverlay } from "./viz/picking-overlay";
 import { SliceViewer } from "./viz/slice-viewer";
 import { VolumeRenderer } from "./viz/volume-renderer";
 
@@ -281,10 +282,16 @@ function JobVisualizations({ projectId, job }: { projectId: string; job: Job }) 
 
           {/* autopick: micrograph grid with picked particles overlay */}
           {job.taskType === "autopick" && (
-            <div>
-              <div className="text-[11px] text-muted-foreground mb-2">Micrographs with picked particles</div>
-              <MicrographGrid projectId={projectId} jobId={job.id} jobType={job.taskType} />
-            </div>
+            <>
+              <div>
+                <div className="text-[11px] text-muted-foreground mb-2">Particle picking overlay (green circles = picked particles)</div>
+                <PickingOverlay projectId={projectId} jobId={job.id} />
+              </div>
+              <div className="border-t border-border/30 pt-3">
+                <div className="text-[11px] text-muted-foreground mb-2">Micrograph preview</div>
+                <MicrographGrid projectId={projectId} jobId={job.id} jobType={job.taskType} />
+              </div>
+            </>
           )}
 
           {/* extract: micrograph grid + angular heatmap */}

@@ -470,3 +470,24 @@ returned as a Buffer directly, bypassing the string conversion entirely.
 - Stuck maskcreate job on EMPIAR downsampled project (was "running" forever, marked failed)
 - Iteration progress now appears at the TOP of the class2d viz panel (before class averages)
   so the user sees convergence first, then the class averages
+
+## Phase 13: Particle picking overlay + QA
+
+### QA results
+- Class2D page: 3 canvases + 10 images, 0 errors ✅
+- Iteration progress chart renders at top of class2d viz panel ✅
+- All job pages working correctly
+
+### New feature: Particle picking overlay
+- CryoSPARC-style picking overlay on the autopick job page
+- Shows micrograph thumbnail with green circles drawn at picked particle coordinates
+- Micrograph selector buttons to switch between micrographs
+- Particle count displayed in the overlay corner
+- Parses _rlnCoordinateX, _rlnCoordinateY, _rlnMicrographName from autopick.star
+- Searches ALL jobs' files for matching .mrc micrographs (not just autopick job)
+- Canvas-rendered overlay with proper aspect ratio handling
+
+### Verified
+- Autopick page: 1 canvas (picking overlay) + 1 img (micrograph), 8 particles shown
+- Micrograph selector shows 12 movie names
+- 0 page errors

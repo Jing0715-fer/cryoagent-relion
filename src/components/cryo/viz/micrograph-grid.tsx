@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { Icon } from "../icon";
 import { cn } from "@/lib/utils";
+import { Skeleton } from "./skeletons";
 
 interface MicrographInfo {
   name: string;
@@ -20,6 +21,8 @@ interface Props {
 
 // CryoSPARC-style micrograph thumbnail grid — shows corrected micrographs
 // (motioncorr) or CTF-fit micrographs (ctffind) with per-micrograph metrics.
+// For import jobs, searches ALL jobs in the project for .mrc files since
+// the import job itself only outputs a .star file.
 export function MicrographGrid({ projectId, jobId, jobType }: Props) {
   const [micrographs, setMicrographs] = useState<MicrographInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -31,16 +34,24 @@ export function MicrographGrid({ projectId, jobId, jobType }: Props) {
       try {
         const res = await fetch(`/api/job-files?projectId=${projectId}`);
         const d = await res.json();
-        const group = (d.groups || []).find((g: any) => g.jobId === jobId);
-        if (!group || !group.files) { if (!cancelled) setMicrographs([]); return; }
-        // find .mrc files that are micrographs (not particle stacks)
-        const mrcs = group.files.filter((f: any) => /\.mrc$/.test(f.path) && !/Particles\//.test(f.path));
-        if (!cancelled) {
-          setMicrographs(mrcs.map((f: any) => ({
-            name: f.path.split("/").pop(),
-            path: f.path,
-          })));
+        const allGroups = d.groups || [];
+        // Search ALL jobs for .mrc micrograph files (not just this job)
+        // because import outputs a .star, not .mrc files directly.
+        const allMrcs: MicrographInfo[] = [];
+        const seen = new Set<string>();
+        for (const g of allGroups) {
+          if (!g.files) continue;
+          for (const f of g.files) {
+            if (/\.mrc$/.test(f.path) && !/Particles\//.test(f.path) && !/CtfFind\//.test(f.path)) {
+              const name = f.path.split("/").pop();
+              if (!seen.has(name)) {
+                seen.add(name);
+                allMrcs.push({ name, path: f.path });
+              }
+            }
+          }
         }
+        if (!cancelled) setMicrographs(allMrcs);
       } catch { if (!cancelled) setMicrographs([]); }
       finally { if (!cancelled) setLoading(false); }
     }
@@ -48,10 +59,15 @@ export function MicrographGrid({ projectId, jobId, jobType }: Props) {
     return () => { cancelled = true; };
   }, [projectId, jobId]);
 
-  if (loading) return <div className="text-xs text-muted-foreground p-3">Loading micrographs…</div>;
+  if (loading) return (
+    <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-2">
+      {Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="aspect-square" />)}
+    </div>
+  );
   if (!micrographs.length) return (
     <div className="text-xs text-muted-foreground p-3 text-center">
-      No micrograph files found for this job.
+      No micrograph files found. The imported data may be in movie format (.mrcs) —
+      micrograph thumbnails will appear after motion correction.
     </div>
   );
 

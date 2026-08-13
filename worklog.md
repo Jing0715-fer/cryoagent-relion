@@ -561,3 +561,42 @@ returned as a Buffer directly, bypassing the string conversion entirely.
 - Class2D page: 3 canvases + 10 images after load, 0 errors
 - Skeletons appear briefly during loading then replaced by actual content
 - No layout shift when transitioning from skeleton to real content
+
+## Phase 17: Micrograph previews + CTF fit curves + manual job builder + data recovery
+
+### Data recovery
+- RELION binaries and test datasets were lost (disk cleanup). Reinstalled:
+  - RELION 3.1.3 + ctffind 4.1.14 from .deb packages (re-extracted to relion-pkg/)
+  - Synthetic D4 test dataset regenerated (12 movies, 96 particles)
+  - Python dependencies (scipy, mrcfile, topaz-em, torch) reinstalled
+
+### New features
+1. **Micrograph previews for import jobs**
+   - MicrographGrid now searches ALL jobs' files (not just the current job)
+   - Shows .mrc thumbnail previews even when import only outputs a .star
+   - Skeleton loading animation while data loads
+
+2. **CTF fit curves (CtfFitPlot)**
+   - CryoSPARC-style CTF fit plot on the ctffind job page
+   - Shows simulated CTF curve (sin of phase shift) computed from fitted defocus
+   - Cross-correlation overlay + resolution cutoff line
+   - Micrograph selector to switch between micrographs
+   - Displays defocus, resolution, FOM per micrograph
+
+3. **Manual job builder**
+   - "Add job" button in the workflow panel header
+   - Dialog with RELION task selector (all 18 tasks with icons)
+   - Dependency selector (checkbox list of completed jobs)
+   - Optional alias field
+   - Creates job with proper parameter inheritance from import job
+   - New API routes: /api/jobs/create and /api/jobs/connect
+
+### API routes added
+- POST /api/jobs/create — manually create a job in an existing workflow
+- POST /api/jobs/connect — connect two jobs (add a dependency edge)
+
+### Pipeline status
+- Fresh pipeline started with regenerated synthetic data
+- import → motioncorr → ctffind completed
+- autopick failed (Topaz: no micrographs found — path resolution issue after data recovery)
+- Being retried

@@ -7,6 +7,7 @@ import { ChatPanel } from "@/components/cryo/chat-panel";
 import { WorkflowDag } from "@/components/cryo/workflow-dag";
 import { JobResultsView } from "@/components/cryo/job-results-view";
 import { WorkflowTimeline } from "@/components/cryo/workflow-timeline";
+import { AddJobDialog } from "@/components/cryo/add-job-dialog";
 import { NewProjectDialog } from "@/components/cryo/new-project-dialog";
 import { Icon } from "@/components/cryo/icon";
 import { Project, Message, Workflow, Job, Decision } from "@/lib/types";
@@ -25,6 +26,7 @@ export default function Home() {
   const [sending, setSending] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [addJobOpen, setAddJobOpen] = useState(false);
 
   // ---- load project list on mount -----------------------------------------
   useEffect(() => {
@@ -293,11 +295,19 @@ export default function Home() {
                   <Icon name="Workflow" className="h-3.5 w-3.5" />
                   Workflow
                 </div>
-                {jobs.length > 0 && (
-                  <div className="text-[10px] text-muted-foreground">
-                    {nDone}/{jobs.length} done · click a job to inspect
-                  </div>
-                )}
+                <div className="flex items-center gap-2">
+                  {jobs.length > 0 && (
+                    <div className="text-[10px] text-muted-foreground">
+                      {nDone}/{jobs.length} done · click a job to inspect
+                    </div>
+                  )}
+                  {selectedId && (
+                    <Button variant="outline" size="sm" onClick={() => setAddJobOpen(true)} className="h-7 gap-1 text-[11px]">
+                      <Icon name="Plus" className="h-3 w-3" />
+                      Add job
+                    </Button>
+                  )}
+                </div>
               </div>
               <div className="flex-1 min-h-0 overflow-hidden">
                 <WorkflowDag
@@ -339,6 +349,15 @@ export default function Home() {
       </footer>
 
       <NewProjectDialog open={newProjectOpen} onOpenChange={setNewProjectOpen} onCreate={handleNewProject} />
+      {selectedId && (
+        <AddJobDialog
+          open={addJobOpen}
+          onOpenChange={setAddJobOpen}
+          projectId={selectedId}
+          existingJobs={jobs}
+          onCreated={() => { if (selectedId) refreshProject(selectedId); }}
+        />
+      )}
     </div>
   );
 }

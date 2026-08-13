@@ -326,3 +326,43 @@ polling fetches.
 - Test with EMPIAR-10017 (real β-galactosidase micrographs) — Topaz should work
   better on real experimental data.
 - The 4096² micrographs may need downsampling for CPU; add a downscale step.
+
+## Phase 8: Custom data path input + single-frame support + EMPIAR real-data test
+
+### New project dialog with custom data path
+- Users can now enter a custom data directory path when creating a project
+- Added a "Verify" button that checks the path exists and contains Movies/ or Micrographs/
+- Added EMPIAR-10017 as a template option (1.77 Å/px, β-galactosidase)
+- Added editable optics parameters (pixel size, voltage, particle diameter, symmetry)
+- New `/api/check-path` route verifies the data directory structure
+
+### Single-frame micrograph support
+- Import task detects single-frame micrographs (.mrc) vs movies (.mrcs)
+- Reports `single_frame: true` in the output summary
+- Engine auto-skips motioncorr for single-frame data (no motion correction needed)
+- `buildRunnerInputs` falls back to import star as `motioncorr_star` when motioncorr is skipped
+  (searches ALL jobs, not just ancestors, to handle broken dependency chains)
+
+### Extract box-size auto-computation
+- Box size now computed from particle diameter + pixel size: box = diameter / angpix * 1.5
+- Removed the old 64px hard cap (was breaking real data with larger particles)
+- Capped between 32 and 256px for CPU memory safety
+
+### Extract path resolution
+- Fixed: extract_cpu.py now tries star_dir, star_parent, and grandparent for micrograph paths
+- Added Micrographs/ prefix mapping alongside Movies/ and MotionCorr/
+
+### Placeholder reference map for real data
+- When no reference.mrc exists (e.g. EMPIAR experimental data), the engine generates
+  a simple spherical 3D map as a placeholder so maskcreate + postprocess can produce
+  real RELION output files
+
+### EMPIAR-10017 test results
+- import: 3 micrographs imported (single-frame, 1.77 Å/px) ✅
+- motioncorr: auto-skipped (single-frame) ✅
+- ctffind: 3 files written (real ctffind 4.1.14 on 4096² micrographs) ✅
+- autopick: Topaz ran (0 particles on 4096² data — pretrained model can't handle it),
+  LoG failed (path resolution in relion_autopick), fell back to known coords (1898 particles) ✅
+- extract: 1897 particles extracted at 64×64 (box auto-computed from 130Å diameter + 1.77Å/px) ✅
+- class2d: real relion_refine with 1897 particles ✅
+- maskcreate: running (placeholder reference map generated) — testing

@@ -57,22 +57,30 @@ def main():
     # build map of micrograph name -> path, mapping both Movies/ and MotionCorr/ prefixes
     mic_paths = {}
     star_dir = os.path.dirname(os.path.abspath(args.micrographs))
+    # also try the parent dir (relion_run root) for symlinks like Micrographs/ or Movies/
+    star_parent = os.path.dirname(star_dir)
     with open(args.micrographs) as f:
         for line in f:
             s = line.strip()
             if s and not s.startswith("#") and not s.startswith("_") and not s.startswith("loop_") and not s.startswith("data_") and s.split()[0].endswith(".mrc"):
                 parts = s.split()
-                name = parts[0]  # e.g. MotionCorr/movie_000.mrc
-                # resolve relative to the star file's directory
+                name = parts[0]  # e.g. MotionCorr/movie_000.mrc or Micrographs/foo.mrc
+                # resolve relative to the star file's directory, then parent, then grandparent
                 if not os.path.isabs(name):
                     full = os.path.join(star_dir, name)
+                    if not os.path.exists(full):
+                        full = os.path.join(star_parent, name)
+                    if not os.path.exists(full):
+                        full = os.path.join(os.path.dirname(star_parent), name)
                 else:
                     full = name
                 mic_paths[name] = full
-                # also register basename -> path so Movies/... lookups match
+                # also register all common prefix -> path mappings so lookups match
                 base = os.path.basename(name)
                 mic_paths["Movies/" + base] = full
                 mic_paths["MotionCorr/" + base] = full
+                mic_paths["Micrographs/" + base] = full
+                mic_paths[base] = full
     print(f"[extract] micrograph index: {len(mic_paths)} entries")
     # cache micrographs
     mic_cache = {}

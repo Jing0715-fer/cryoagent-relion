@@ -498,17 +498,23 @@ def task_extract(p, inputs, out, on_line, env):
     if not coords_star or not mc_star:
         raise RuntimeError("extract needs autopick + motioncorr stars")
     jd = ensure_job_dir(p["projectId"], out["jobId"])
-    # Cap box size to the micrograph dimensions (test micrographs are 256x256).
-    # The LLM sometimes proposes 256px boxes for 4Å/px data which is correct for
-    # real microscopes but breaks our 256x256 synthetic micrographs.
-    box = min(int(p.get("extract_size", 64)), 64)
-    # Ensure rescale is sensible — the LLM sometimes sets rescale=1 which would
-    # produce 1px particles. Cap to at least 32px and at most = box.
-    rescale_raw = int(p.get("rescale", 64)) if p.get("do_rescale", True) else box
+    angpix = float(p.get("angpix", 1.0))
+    diameter = float(p.get("particle_diameter", 120))
+    # Compute a reasonable box size from the particle diameter and pixel size.
+    # Box should be ~1.5x the particle diameter in pixels, rounded to a multiple of 2.
+    auto_box = int(diameter / angpix * 1.5)
+    auto_box = max(32, (auto_box + 1) & ~1)  # even, min 32
+    # The LLM may propose a larger box (correct for real data) — don't cap it
+    # below 32, but cap above to avoid memory issues on CPU.
+    llm_box = int(p.get("extract_size", auto_box))
+    box = max(32, min(llm_box, 256, auto_box * 2))
+    if llm_box != box:
+        on_line("warn", f"extract: box adjusted from {llm_box} to {box} (auto={auto_box}, angpix={angpix}, diam={diameter})")
+    # Rescale: keep same as box unless explicitly different
+    rescale_raw = int(p.get("rescale", box)) if p.get("do_rescale", True) else box
     rescale = max(32, min(rescale_raw, box))
     final_box = min(box, rescale)
-    if int(p.get("extract_size", 64)) != box or rescale_raw != rescale:
-        on_line("warn", f"extract: capped box={box} rescale={rescale} (LLM proposed extract_size={p.get('extract_size')}, rescale={p.get('rescale')})")
+    on_line("info", f"extract: box={box} final_box={final_box} angpix={angpix} diameter={diameter}Å")
     cmd = ["python3", EXTRACT_CPU, "--coords", coords_star, "--micrographs", mc_star,
            "--outdir", jd, "--box", str(box), "--final_box", str(final_box),
            "--angpix", str(p.get("angpix", 4.0))]

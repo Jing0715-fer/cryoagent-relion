@@ -15,6 +15,7 @@
 
 import ZAI from "z-ai-web-dev-sdk";
 import path from "path";
+import fs from "fs";
 import { db } from "@/lib/db";
 import { getTask } from "@/lib/relion/tasks";
 import { buildContext, getLogPlan, getOutput, taskDuration } from "@/lib/relion/executor";
@@ -314,8 +315,38 @@ async function buildRunnerInputs(job: any, allJobs: any[]): Promise<Record<strin
       if (key === "initialmodel_map" || key === "refine3d_map" || key === "refine3d_halfmap") {
         const project = await db.project.findUnique({ where: { id: job.workflow?.projectId || "" } });
         if (project?.sourceDataset) {
-          const refMap = path.join(project.sourceDataset, "reference.mrc");
+          let refMap = path.join(project.sourceDataset, "reference.mrc");
+          // If no reference.mrc exists (real experimental data like EMPIAR),
+          // generate a simple spherical placeholder map so maskcreate +
+          // postprocess can still produce real RELION output files.
+          if (!fs.existsSync(refMap)) {
+            refMap = path.join(
+              path.resolve(process.cwd(), "data", "projects", project.id),
+              "placeholder_ref.mrc",
+            );
+            if (!fs.existsSync(refMap)) {
+              await generatePlaceholderMap(refMap, 64, 4.0);
+              on_line_info(projectId, `Generated placeholder reference map at ${refMap} (no reference.mrc in dataset — real experimental data)`);
+            }
+          }
           inputs[key] = refMap;
+        }
+      }
+      // special-case: if motioncorr was skipped (single-frame data), fall back
+      // to the import job's micrographs.star as the "motioncorr_star" input.
+      // Search ALL jobs in the workflow (not just ancestors) because the
+      // dependency chain may be broken when motioncorr was deleted/skipped.
+      if (key === "motioncorr_star") {
+        const importCandidates = allJobs.filter(
+          (j) => j.status === "done" && j.taskType === "import" && j.primaryOutput,
+        );
+        if (importCandidates.length > 0) {
+          const imp = importCandidates[importCandidates.length - 1];
+          const abs = path.join(
+            path.resolve(process.cwd(), "data", "projects", imp.workflow.projectId || ""),
+            imp.primaryOutput,
+          );
+          inputs[key] = abs;
         }
       }
       continue;
@@ -354,6 +385,19 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
     // Skip slow tasks (initialmodel uses denovo_3dref which is impractical on CPU
     // for small datasets — we fall back to the dataset's reference.mrc instead).
     const CPU_SKIPPED = new Set(["initialmodel", "class3d", "refine3d", "multibody", "polish", "movierefine", "localres"]);
+
+    // Check if the import job reported single-frame data (micrographs, not movies).
+    // If so, skip motioncorr — single-frame micrographs don't need motion correction.
+    const importJob = allJobs.find((j) => j.taskType === "import" && j.status === "done");
+    let isSingleFrame = false;
+    if (importJob) {
+      const importSummary = JSON.parse(importJob.outputSummary);
+      isSingleFrame = !!importSummary.single_frame;
+    }
+    if (isSingleFrame) {
+      CPU_SKIPPED.add("motioncorr");
+    }
+
     const next = allJobs.find(
       (j) => j.status === "queued" && canStart(j, jobById) && !CPU_SKIPPED.has(j.taskType),
     );
@@ -370,7 +414,9 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
           data: {
             projectId,
             role: "tool",
-            content: `⏭️ ${j.taskType} skipped on CPU — this task requires a GPU for practical runtime. The agent will decide the next CPU-feasible step.`,
+            content: isSingleFrame && j.taskType === "motioncorr"
+              ? `⏭️ ${j.taskType} skipped — single-frame micrographs don't need motion correction. Using imported micrographs directly.`
+              : `⏭️ ${j.taskType} skipped on CPU — this task requires a GPU for practical runtime. The agent will decide the next CPU-feasible step.`,
             meta: JSON.stringify({ jobId: j.id, taskType: j.taskType, kind: "job-skipped", real: true }),
           },
         });
@@ -669,6 +715,48 @@ function canStart(job: any, jobById: Map<string, any>): boolean {
   // A dependency is satisfied if it is done OR skipped (skipped upstream jobs
   // mean the engine chose an alternative path, e.g. using a reference map).
   return deps.every((d) => ["done", "skipped"].includes(jobById.get(d)?.status));
+}
+
+// Generate a simple spherical 3D density map as a placeholder when no
+// reference.mrc exists (real experimental data like EMPIAR). This lets
+// maskcreate + postprocess produce real RELION output files.
+async function generatePlaceholderMap(mapPath: string, boxSize: number, angpix: number): Promise<void> {
+  const { execFile } = await import("child_process");
+  const { promisify } = await import("util");
+  const exec = promisify(execFile);
+  const script = `
+import sys, numpy as np, mrcfile
+box = ${boxSize}
+angpix = ${angpix}
+z = np.zeros((box, box, box), dtype=np.float32)
+c = box // 2
+r = box // 4
+xx, yy, zz = np.meshgrid(np.arange(box), np.arange(box), np.arange(box), indexing='ij')
+d2 = (xx - c)**2 + (yy - c)**2 + (zz - c)**2
+z = np.exp(-d2 / (2 * r * r)).astype(np.float32)
+z /= z.max()
+with mrcfile.new(sys.argv[1], overwrite=True) as m:
+    m.set_data(z)
+    m.voxel_size = (angpix, angpix, angpix)
+print(f"wrote placeholder map {box}^3 at {angpix} A/px")
+`;
+  try {
+    await exec("python3", ["-c", script, mapPath]);
+  } catch (e) {
+    // ignore — the maskcreate task will fail gracefully
+  }
+}
+
+// Helper to send an info message to the chat from within buildRunnerInputs
+async function on_line_info(projectId: string, content: string): Promise<void> {
+  await db.message.create({
+    data: {
+      projectId,
+      role: "tool",
+      content,
+      meta: JSON.stringify({ kind: "info" }),
+    },
+  });
 }
 
 // ---- 3. makeDecision -------------------------------------------------------

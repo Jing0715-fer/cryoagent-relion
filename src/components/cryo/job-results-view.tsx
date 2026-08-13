@@ -13,6 +13,7 @@ import { AngularHeatmap } from "./viz/angular-heatmap";
 import { ClassAveragesGallery } from "./viz/class-averages";
 import { ClassEssHistogram } from "./viz/class-ess-histogram";
 import { MicrographGrid } from "./viz/micrograph-grid";
+import { DefocusDistribution } from "./viz/defocus-distribution";
 import { SliceViewer } from "./viz/slice-viewer";
 import { VolumeRenderer } from "./viz/volume-renderer";
 
@@ -53,7 +54,11 @@ export function JobResultsView({ projectId, job, onBack, onRetry }: Props) {
 
   const hasViz =
     job.status === "done" &&
-    (job.taskType === "class2d" ||
+    (job.taskType === "import" ||
+     job.taskType === "motioncorr" ||
+     job.taskType === "ctffind" ||
+     job.taskType === "autopick" ||
+     job.taskType === "class2d" ||
      job.taskType === "class3d" ||
      job.taskType === "refine3d" ||
      job.taskType === "postprocess" ||
@@ -249,7 +254,7 @@ function JobVisualizations({ projectId, job }: { projectId: string; job: Job }) 
   if (!hasViz) return null;
   return (
     <>
-      <Section title={`${t?.name} visualizations`} icon="BarChart3">
+      <Section title={t?.name + " visualizations"} icon="BarChart3">
         <div className="space-y-4">
           {/* import / motioncorr: micrograph thumbnail grid */}
           {(job.taskType === "import" || job.taskType === "motioncorr") && (
@@ -259,12 +264,18 @@ function JobVisualizations({ projectId, job }: { projectId: string; job: Job }) 
             </div>
           )}
 
-          {/* ctffind: micrograph grid + CTF fit quality */}
+          {/* ctffind: micrograph grid + defocus distribution plot */}
           {job.taskType === "ctffind" && (
-            <div>
-              <div className="text-[11px] text-muted-foreground mb-2">Micrographs with CTF fits (click to enlarge)</div>
-              <MicrographGrid projectId={projectId} jobId={job.id} jobType={job.taskType} />
-            </div>
+            <>
+              <div>
+                <div className="text-[11px] text-muted-foreground mb-2">Micrographs with CTF fits (click to enlarge)</div>
+                <MicrographGrid projectId={projectId} jobId={job.id} jobType={job.taskType} />
+              </div>
+              <div className="border-t border-border/30 pt-3">
+                <div className="text-[11px] text-muted-foreground mb-2">Defocus distribution</div>
+                <DefocusDistribution projectId={projectId} jobId={job.id} />
+              </div>
+            </>
           )}
 
           {/* autopick: micrograph grid with picked particles overlay */}

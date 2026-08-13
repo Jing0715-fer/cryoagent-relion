@@ -398,3 +398,31 @@ returned as a Buffer directly, bypassing the string conversion entirely.
   all completed successfully.
 - Class2D job page: 5 class-average images (92x92, loaded=true), 2 canvases
   (FSC + angular heatmap), 10 images total, zero page errors.
+
+## Phase 10: New visualizations + workflow timeline + QA
+
+### QA results
+- Class2D images: ✅ all loading (92x92, loaded=true)
+- PostProcess page: ✅ 3 canvases (FSC + Guinier + 3D volume), 0 errors
+- MaskCreate page: ✅ 1 canvas (3D volume) + 1 img (slice), 0 errors
+- Import page: ✅ micrograph grid shows "No micrograph files found" (expected — import has star files, not .mrc)
+- CTFFind page: ✅ defocus distribution canvas + micrograph grid
+- No page errors on any job page
+- Console still shows stale prompts.ts parse error (non-blocking — the file is server-side only)
+
+### New features added
+1. **Defocus distribution plot** (ctffind job page) — CryoSPARC-style histogram
+   of defocus values from micrographs_ctf.star. Canvas-rendered with gradient
+   bars, axis labels in μm, and stats annotation (n, mean).
+2. **Workflow timeline** — CryoSPARC-style horizontal bar chart showing each
+   job's duration, status color, and key metric. Clicking a bar navigates to
+   the job results page. Shown below the workflow DAG.
+3. **Fixed hasViz check** — import, motioncorr, ctffind, and autopick were
+   missing from the hasViz list, so their visualizations weren't rendering.
+   Now all job types with visualizations are included.
+
+### Verified
+- Full pipeline (import→postprocess) on synthetic D4: all 8 jobs done, all
+  visualization pages render correctly.
+- Timeline shows all 8 jobs with durations, status colors, and metrics.
+- Defocus distribution shows 12 micrographs with backfilled defocus values.

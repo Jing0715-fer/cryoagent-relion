@@ -6,6 +6,7 @@ import { ProjectSidebar } from "@/components/cryo/project-sidebar";
 import { ChatPanel } from "@/components/cryo/chat-panel";
 import { WorkflowDag } from "@/components/cryo/workflow-dag";
 import { JobResultsView } from "@/components/cryo/job-results-view";
+import { WorkflowTimeline } from "@/components/cryo/workflow-timeline";
 import { NewProjectDialog } from "@/components/cryo/new-project-dialog";
 import { Icon } from "@/components/cryo/icon";
 import { Project, Message, Workflow, Job, Decision } from "@/lib/types";
@@ -298,13 +299,22 @@ export default function Home() {
                   </div>
                 )}
               </div>
-              <div className="flex-1 min-h-0">
+              <div className="flex-1 min-h-0 overflow-hidden">
                 <WorkflowDag
                   jobs={jobs}
                   selectedJobId={selectedJobId}
                   onSelectJob={(id) => { setSelectedJobId(id); setViewJobId(id); }}
                 />
               </div>
+              {jobs.length > 0 && (
+                <div className="shrink-0 max-h-[240px] overflow-y-auto cryo-scroll border-t border-border/60 p-2">
+                  <WorkflowTimeline
+                    jobs={jobs}
+                    onSelectJob={(id) => { setSelectedJobId(id); setViewJobId(id); }}
+                    selectedJobId={selectedJobId}
+                  />
+                </div>
+              )}
             </div>
           )}
         </section>

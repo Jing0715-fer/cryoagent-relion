@@ -120,6 +120,25 @@ export function JobResultsView({ projectId, job, onBack, onRetry }: Props) {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 p-3">
           {/* left: parameters + outputs + logs */}
           <div className="space-y-3">
+            {/* picker method badge (for autopick jobs) */}
+            {job.taskType === "autopick" && job.outputSummary?.method && (
+              <div className="rounded-lg border border-orange-500/30 bg-orange-500/5 p-3 flex items-center gap-3">
+                <div className="h-8 w-8 rounded-md bg-orange-500/20 grid place-items-center">
+                  <Icon name="Target" className="h-4 w-4 text-orange-400" />
+                </div>
+                <div>
+                  <div className="text-[12px] font-medium">
+                    Picking method: <span className="text-orange-400 capitalize">{String(job.outputSummary.method)}</span>
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">
+                    {job.outputSummary.method === "topaz" && "Topaz deep-learning picker (pretrained resnet16)"}
+                    {job.outputSummary.method === "log" && "RELION Laplacian-of-Gaussian blob detection"}
+                    {job.outputSummary.method === "known" && "Known coordinates (fallback)"}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* parameters */}
             <Section title="Parameters" icon="SlidersHorizontal">
               <dl className="grid grid-cols-1 gap-x-3">

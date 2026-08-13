@@ -177,12 +177,15 @@ export function WorkflowDag({ jobs, selectedJobId, onSelectJob }: Props) {
                   {j.status === "running" && (
                     <span className="font-mono text-emerald-400">{j.progress}%</span>
                   )}
-                  {j.status === "done" && j.outputSummary.n_particles != null && (
+                  {j.status === "done" && j.outputSummary.method != null && (
+                    <span className="font-mono text-orange-400 capitalize">{String(j.outputSummary.method)}</span>
+                  )}
+                  {j.status === "done" && j.outputSummary.n_particles != null && j.outputSummary.method == null && (
                     <span className="font-mono text-emerald-400">
                       {Number(j.outputSummary.n_particles).toLocaleString()} prt
                     </span>
                   )}
-                  {j.status === "done" && j.outputSummary.n_micrographs != null && j.outputSummary.resolution_A == null && (
+                  {j.status === "done" && j.outputSummary.n_micrographs != null && j.outputSummary.resolution_A == null && j.outputSummary.method == null && (
                     <span className="font-mono text-emerald-400">
                       {Number(j.outputSummary.n_micrographs).toLocaleString()} mic
                     </span>

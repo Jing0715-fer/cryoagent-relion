@@ -99,28 +99,62 @@ def run_cmd(cmd, cwd, env, on_line):
 # Per-task run functions
 # ---------------------------------------------------------------------------
 def task_import(p, inputs, out, on_line, env):
-    # `inputs` provides the source data path; copy the dataset's movies dir into project
+    # `inputs` provides the source data path; detect whether it's movies (.mrcs)
+    # or single-frame micrographs (.mrc) and import accordingly.
     src = p.get("source_dataset") or os.path.join(PROJECT_ROOT, "data", "projects", "test_d4")
     pd = project_dir(p["projectId"])
     os.makedirs(os.path.join(pd, "relion_run", out["jobId"]), exist_ok=True)
-    # symlink Movies into the relion project root if not present
+    # symlink the Movies or Micrographs dir into the relion project root
     movies_link = os.path.join(pd, "relion_run", "Movies")
-    if not os.path.exists(movies_link):
-        os.symlink(os.path.join(src, "Movies"), movies_link)
-    # write the import movies.star
-    star_path = os.path.join(pd, "relion_run", out["jobId"], "movies.star")
-    movies = sorted(glob.glob(os.path.join(movies_link, "*.mrcs")))
+    micro_link = os.path.join(pd, "relion_run", "Micrographs")
+    src_movies = os.path.join(src, "Movies")
+    src_micro = os.path.join(src, "Micrographs")
+    # detect single-frame micrographs (.mrc) vs movies (.mrcs)
+    is_single_frame = False
+    if os.path.isdir(src_micro):
+        # explicit Micrographs dir
+        if not os.path.exists(micro_link):
+            os.symlink(src_micro, micro_link)
+        data_dir = micro_link
+        pattern = "*.mrc"
+        is_single_frame = True
+    else:
+        # Movies dir — check if it contains .mrc (single-frame) or .mrcs (movies)
+        if not os.path.exists(movies_link):
+            os.symlink(src_movies, movies_link)
+        data_dir = movies_link
+        mrcs_files = sorted(glob.glob(os.path.join(data_dir, "*.mrcs")))
+        mrc_files = sorted(glob.glob(os.path.join(data_dir, "*.mrc")))
+        if mrcs_files:
+            pattern = "*.mrcs"
+            is_single_frame = False
+        elif mrc_files:
+            pattern = "*.mrc"
+            is_single_frame = True
+        else:
+            pattern = "*.mrc*"
+    files = sorted(glob.glob(os.path.join(data_dir, pattern)))
+    star_path = os.path.join(pd, "relion_run", out["jobId"], "movies.star" if not is_single_frame else "micrographs.star")
     with open(star_path, "w") as f:
-        f.write("# version 30001\n\ndata_optics\n\nloop_\n")
-        f.write("_rlnOpticsGroupName #1\n_rlnOpticsGroup #2\n_rlnMicrographOriginalPixelSize #3\n")
-        f.write("_rlnVoltage #4\n_rlnSphericalAberration #5\n_rlnAmplitudeContrast #6\n")
-        f.write(f"opticsGroup1 1 {p.get('angpix',4.0)} {p.get('kV',300)} {p.get('Cs',2.7)} {p.get('Q0',0.1)}\n\n")
-        f.write("data_movies\n\nloop_\n_rlnMicrographMovieName #1\n_rlnOpticsGroup #2\n")
-        for m in movies:
-            f.write(f"Movies/{os.path.basename(m)} 1\n")
-    on_line("success", f"Imported {len(movies)} movies -> {star_path}")
-    return star_path, {"n_movies": len(movies), "pixel_size": p.get("angpix", 4.0),
-                       "voltage_kV": p.get("kV", 300)}
+        f.write("\n# version 30001\n\ndata_optics\n\nloop_\n")
+        f.write("_rlnOpticsGroup #1 \n_rlnOpticsGroupName #2 \n_rlnOpticsGroupNumber #3 \n")
+        f.write("_rlnMicrographPixelSize #4 \n_rlnVoltage #5 \n_rlnSphericalAberration #6 \n")
+        f.write("_rlnAmplitudeContrast #7 \n")
+        f.write(f"1 opticsGroup1 1 {p.get('angpix',1.77)} {p.get('kV',300)} {p.get('Cs',2.7)} {p.get('Q0',0.1)} \n \n")
+        if is_single_frame:
+            f.write("\ndata_micrographs\n\nloop_\n_rlnMicrographName #1 \n_rlnOpticsGroup #2 \n")
+            for m in files:
+                f.write(f"Micrographs/{os.path.basename(m)} 1 \n")
+            on_line("info", f"Detected {len(files)} single-frame micrographs (.mrc) — skipping motion correction")
+        else:
+            f.write("\ndata_movies\n\nloop_\n_rlnMicrographMovieName #1 \n_rlnOpticsGroup #2 \n")
+            for m in files:
+                f.write(f"Movies/{os.path.basename(m)} 1 \n")
+    on_line("success", f"Imported {len(files)} {'micrographs' if is_single_frame else 'movies'} -> {star_path}")
+    summary = {"n_movies" if not is_single_frame else "n_micrographs": len(files),
+               "pixel_size": p.get("angpix", 1.77), "voltage_kV": p.get("kV", 300),
+               "single_frame": is_single_frame}
+    return star_path, summary
 
 def task_motioncorr(p, inputs, out, on_line, env):
     # CPU stand-in: align frames per movie

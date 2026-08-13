@@ -928,6 +928,26 @@ async function createSingleJob(
   const params: Record<string, string | number | boolean> = {};
   for (const p of task.parameters) params[p.key] = p.default;
   for (const [k, v] of Object.entries(job.parameters || {})) params[k] = v;
+  // Inherit critical optics parameters (angpix, kV, Cs, Q0) from the import
+  // job if the LLM didn't specify them — every downstream task needs the
+  // correct pixel size / voltage to work.
+  if (job.task !== "import" && inputJobIds.length > 0) {
+    // walk back to find the import job
+    const allJobs = await db.job.findMany({ where: { workflowId } });
+    const importJob = allJobs.find((j) => j.taskType === "import");
+    if (importJob) {
+      const importParams = JSON.parse(importJob.parameters) as Record<string, string | number | boolean>;
+      for (const key of ["angpix", "kV", "Cs", "Q0"]) {
+        if (importParams[key] !== undefined && params[key] !== undefined) {
+          // only override if the LLM left the default (didn't explicitly set it)
+          const taskDefault = task.parameters.find((p) => p.key === key)?.default;
+          if (params[key] === taskDefault) {
+            params[key] = importParams[key];
+          }
+        }
+      }
+    }
+  }
   const created = await db.job.create({
     data: {
       workflowId,

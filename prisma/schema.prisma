@@ -1,0 +1,106 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A cryo-EM processing project (one dataset / session)
+model Project {
+  id            String   @id @default(cuid())
+  name          String
+  description   String   @default("")
+  // dataset metadata (microscope, pixel size, voltage, etc.)
+  datasetMeta   String   @default("{}")
+  // path to the source dataset (movies dir) the runner will import from
+  sourceDataset String   @default("")
+  // executor mode: "real" (relion-runner) or "simulated"
+  executorMode  String   @default("real")
+  status        String   @default("idle") // idle | planning | running | paused | done | error
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  messages    Message[]
+  workflows   Workflow[]
+  decisions   Decision[]
+}
+
+// Chat messages between user and agent
+model Message {
+  id        String   @id @default(cuid())
+  projectId String
+  role      String // user | assistant | system | tool
+  content   String
+  meta      String   @default("{}") // structured payload (decisions, job refs, etc.)
+  createdAt DateTime @default(now())
+
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+// A workflow = a DAG of RELION jobs for one project
+model Workflow {
+  id        String   @id @default(cuid())
+  projectId String
+  name      String
+  status    String   @default("draft") // draft | running | paused | done | error
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  jobs      Job[]
+}
+
+// A single RELION job instance
+model Job {
+  id            String   @id @default(cuid())
+  workflowId    String
+  taskType      String // import | motioncorr | ctffind | ... (relion task key)
+  alias         String   @default("")
+  status        String   @default("queued") // queued | running | done | failed | skipped
+  progress      Int      @default(0) // 0..100
+  parameters    String   @default("{}") // JSON of input params
+  inputJobIds   String   @default("[]") // JSON array of upstream job ids
+  outputSummary String   @default("{}") // JSON: particles, resolution, classes, etc.
+  duration      Int      @default(0) // simulated seconds
+  // path to the primary output (e.g. a star file or map) produced by the runner
+  primaryOutput String   @default("")
+  // JSON array of all output files {path, size} produced by the runner
+  outputFiles   String   @default("[]")
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  workflow      Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  logs          JobLog[]
+}
+
+// Log lines emitted while a job executes
+model JobLog {
+  id        String   @id @default(cuid())
+  jobId     String
+  level     String   @default("info") // info | warn | error | success
+  line      String
+  ts        DateTime @default(now())
+
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+}
+
+// Records of autonomous decisions the agent made (for transparency/audit)
+model Decision {
+  id        String   @id @default(cuid())
+  projectId String
+  jobId     String?
+  kind      String // plan | parameter | select | branch | retry | finalize
+  reason    String
+  action    String
+  meta      String   @default("{}")
+  createdAt DateTime @default(now())
+
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}

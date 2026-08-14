@@ -108,6 +108,12 @@ def main():
         if cy - half < 0 or cy + half > mic.shape[0] or cx - half < 0 or cx + half > mic.shape[1]:
             continue
         box_img = mic[cy-half:cy+half, cx-half:cx+half].astype(np.float32)
+        # Invert contrast so protein is white (high values) and background
+        # is dark (low values) — cryo-EM micrographs have dark protein on
+        # bright background, RELION expects the opposite.
+        box_img = -box_img
+        # Normalize: subtract mean and divide by stddev so background ~ 0
+        box_img = (box_img - box_img.mean()) / max(box_img.std(), 1e-6)
         # rescale if needed
         if args.final_box != args.box:
             # simple cropping/scaling via numpy

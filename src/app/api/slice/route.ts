@@ -76,10 +76,15 @@ elif arr.ndim == 2:
     img = arr
 else:
     img = arr[0]
-mn = float(np.percentile(img, 2))
-mx = float(np.percentile(img, 98))
+# Normalize: for class averages (2D images), the protein should be white
+# (high values) and background black (low values). Use percentile-based
+# normalization that preserves the sign of values.
+mn = float(np.percentile(img, 1))
+mx = float(np.percentile(img, 99))
 if mx <= mn: mx = mn + 1
-img = np.clip((img - mn) / (mx - mn), 0, 1)
+# For class averages, values can be negative (solvent-subtracted).
+# Map to 0..1 with protein (positive) as bright, background as dark.
+img_norm = np.clip((img - mn) / (mx - mn), 0, 1)
 def viridis_lut(t):
     stops = [(68,1,84),(59,82,139),(33,144,141),(94,201,98),(253,231,37)]
     n = len(stops)-1
@@ -87,11 +92,11 @@ def viridis_lut(t):
     f = t*n - i
     a, b = stops[i], stops[i+1]
     return (a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f)
-h, w = img.shape
+h, w = img_norm.shape
 rgb = np.zeros((h, w, 3), dtype=np.uint8)
 for c in range(3):
     lut = np.array([viridis_lut(i/255)[c] for i in range(256)], dtype=np.uint8)
-    rgb[:,:,c] = lut[(img*255).astype(np.uint8)]
+    rgb[:,:,c] = lut[(img_norm*255).astype(np.uint8)]
 s = min(h, w, 256)
 y0 = max(0, (h - s)//2)
 x0 = max(0, (w - s)//2)

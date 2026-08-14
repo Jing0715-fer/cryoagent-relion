@@ -636,12 +636,13 @@ def task_class2d(p, inputs, out, on_line, env):
     if diameter < 10:
         diameter = int(angpix_cls * box * 0.5)
     out_root = os.path.join(jd, "run")
-    on_line("info", f"class2d: capped to K={nr_classes}, iter={n_iter} for CPU")
+    on_line("info", f"class2d: K={nr_classes}, iter={n_iter}, diameter={diameter}Å, box={box}px, angpix={angpix_cls}")
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,
            "--iter", str(n_iter), "--K", str(nr_classes),
            "--particle_diameter", str(diameter),
            "--flatten_solvent", "--zero_mask", "--dont_combine_weights_via_disc",
-           "--pool", str(p.get("nr_pool", 3)), "--pad", "1", "--oversampling", "1"]
+           "--pool", str(p.get("nr_pool", 3)), "--pad", "1", "--oversampling", "1",
+           "--do_ctf_correction"]
     rc = run_cmd(cmd, jd, env, on_line)
     if rc != 0:
         raise RuntimeError("class2d refine failed")

@@ -10,31 +10,52 @@ import numpy as np
 import mrcfile
 
 def parse_coords(coords_star):
-    """Return [(micrograph_path, x, y, defocus, angle_rot), ...]."""
+    """Return [(micrograph_path, x, y, defocus, angle_rot, angle_tilt, angle_psi), ...].
+    Parses the column headers to find the correct column indices for each field,
+    rather than hard-coding positions (which breaks when the star file has
+    different column orders)."""
     coords = []
     current_mic = None
+    col_idx = {}  # map column name -> 0-based index
     with open(coords_star) as f:
         in_particles = False
         for line in f:
             s = line.strip()
-            if s.startswith("data_particles"):
-                in_particles = True
+            if s.startswith("data_"):
+                in_particles = s.startswith("data_particles")
                 continue
             if s.startswith("data_") and in_particles:
                 break
             if not in_particles:
                 continue
+            # Parse column headers like "_rlnCoordinateX #1"
+            if s.startswith("_rln"):
+                m = s.replace("#", "").split()
+                if len(m) >= 2:
+                    try:
+                        col_idx[m[0]] = int(m[-1]) - 1  # 0-based
+                    except ValueError:
+                        pass
+                continue
             parts = s.split()
             if not parts or parts[0] in ("loop_", "#", "") or parts[0].startswith("_"):
                 continue
             try:
-                x = float(parts[0]); y = float(parts[1])
-                mic = parts[3] if len(parts) > 3 else current_mic
+                x_col = col_idx.get("_rlnCoordinateX", 0)
+                y_col = col_idx.get("_rlnCoordinateY", 1)
+                mic_col = col_idx.get("_rlnMicrographName", 2)
+                defocus_col = col_idx.get("_rlnDefocusU", -1)
+                rot_col = col_idx.get("_rlnAngleRot", -1)
+                tilt_col = col_idx.get("_rlnAngleTilt", -1)
+                psi_col = col_idx.get("_rlnAnglePsi", -1)
+                x = float(parts[x_col]) if x_col < len(parts) else 0
+                y = float(parts[y_col]) if y_col < len(parts) else 0
+                mic = parts[mic_col] if mic_col < len(parts) else current_mic
                 current_mic = mic
-                defocus = float(parts[5]) if len(parts) > 5 else 10000
-                angle_rot = float(parts[8]) if len(parts) > 8 else 0
-                angle_tilt = float(parts[9]) if len(parts) > 9 else 0
-                angle_psi = float(parts[10]) if len(parts) > 10 else 0
+                defocus = float(parts[defocus_col]) if defocus_col >= 0 and defocus_col < len(parts) else 10000
+                angle_rot = float(parts[rot_col]) if rot_col >= 0 and rot_col < len(parts) else 0
+                angle_tilt = float(parts[tilt_col]) if tilt_col >= 0 and tilt_col < len(parts) else 0
+                angle_psi = float(parts[psi_col]) if psi_col >= 0 and psi_col < len(parts) else 0
                 coords.append((mic, x, y, defocus, angle_rot, angle_tilt, angle_psi))
             except (ValueError, IndexError):
                 continue

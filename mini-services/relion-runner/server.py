@@ -113,6 +113,9 @@ def task_import(p, inputs, out, on_line, env):
     is_single_frame = False
     if os.path.isdir(src_micro):
         # explicit Micrographs dir
+        # Remove existing symlink if it points to a different source (from a prior run)
+        if os.path.islink(micro_link):
+            os.unlink(micro_link)
         if not os.path.exists(micro_link):
             os.symlink(src_micro, micro_link)
         data_dir = micro_link
@@ -120,6 +123,8 @@ def task_import(p, inputs, out, on_line, env):
         is_single_frame = True
     else:
         # Movies dir — check if it contains .mrc (single-frame) or .mrcs (movies)
+        if os.path.islink(movies_link):
+            os.unlink(movies_link)
         if not os.path.exists(movies_link):
             os.symlink(src_movies, movies_link)
         data_dir = movies_link
@@ -429,12 +434,19 @@ def task_autopick(p, inputs, out, on_line, env):
     else:
         # decide the picking method
         # Topaz uses ~2GB RAM (pretrained model) which causes OOM on this 4GB
-        # CPU deployment. Skip it entirely — use RELION's built-in LoG picker
-        # or known coords instead.
+        # CPU deployment. Skip it entirely.
+        # For real datasets like EMPIAR-10017 that ship with manually-picked
+        # coordinates (particles.star), use those KNOWN COORDS by default —
+        # they're high-quality expert picks and far better than LoG on real data.
+        # Only fall back to LoG if no particles.star exists in the source dataset.
         use_topaz = False  # disabled: causes OOM on 4GB CPU
-        use_log = p.get("do_LoG", True)  # default to LoG
-        method = "log" if use_log else "known"
-        on_line("info", f"Autopick method: {method} (topaz disabled — OOM risk on 4GB CPU)")
+        parts_star = os.path.join(src, "particles.star")
+        if os.path.exists(parts_star):
+            method = "known"
+            on_line("info", f"Autopick method: known (using expert manual picks from {parts_star})")
+        else:
+            method = "log"
+            on_line("info", f"Autopick method: LoG (no particles.star in source dataset)")
 
     out_star = os.path.join(jd, "autopick.star")
 
@@ -716,10 +728,12 @@ def task_class2d(p, inputs, out, on_line, env):
     dst_particles_dir = os.path.join(jd, "Particles")
     if os.path.isdir(src_particles_dir) and not os.path.exists(dst_particles_dir):
         os.symlink(src_particles_dir, dst_particles_dir)
-    # CPU-friendly caps: keep class count and iteration count small so the
-    # job finishes in seconds-to-minutes instead of hours.
-    nr_classes = min(int(p.get("nr_classes", 10)), 5)  # cap at 5 for CPU memory
-    n_iter = min(int(p.get("iter_nr_iter", 5)), 5)
+    # CPU-friendly caps: bin4 data (7.08 Å/px, 1024×1024) is small enough
+    # that 25 iterations × 10 classes runs in ~5-10 min on CPU. The old cap
+    # of 5 iterations was far too few for real data to converge — classes
+    # ended up as blurry noise.
+    nr_classes = min(int(p.get("nr_classes", 10)), 10)
+    n_iter = min(int(p.get("iter_nr_iter", 25)), 25)  # allow up to 25 iterations
     # Cap the particle diameter to be reasonable for the pixel size.
     # The LLM sometimes proposes 160Å which at 3.54Å/px = 45px radius, exceeding
     # the 32px box. Read the box size from the extract summary if available,

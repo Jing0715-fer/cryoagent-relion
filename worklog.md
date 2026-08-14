@@ -1011,3 +1011,59 @@ Full pipeline with VLM verification:
 5. **Increase class2d iterations for real data**
    - 5 iterations is too few for noisy real data
    - Default should be 15-25 iterations
+
+## Phase 23: bin4 optimization — class2d 25 iterations + critical extract bug fix
+
+### User insight (correct)
+"bin4比bin2的衬度更高" — bin4 (7.08 Å/px) should have HIGHER contrast per pixel
+than bin2 (3.54 Å/px) because binning averages pixels, increasing SNR. Real
+cryo-EM pipelines often start with bin4 data and 2D classification should work.
+The problem is NOT the data — it's the pipeline parameters.
+
+### Root cause analysis
+
+**1. class2d iterations hard-capped at 5 (TOO FEW)**
+- Line: `n_iter = min(int(p.get("iter_nr_iter", 5)), 5)`
+- 5 iterations is far too few for real data to converge
+- RELION typically needs 15-25 iterations for class averages to sharpen
+- This was the PRIMARY reason class2d produced "blurry, featureless blobs"
+
+**2. extract_cpu.py parse_coords column index bug (CRITICAL)**
+- The old code hard-coded: `mic = parts[3]` (column 4 = micrograph name)
+- But the autopick.star has columns: _rlnCoordinateX #1, _rlnCoordinateY #2,
+  _rlnMicrographName #3, _rlnOpticsGroup #4
+- So parts[3] = "1" (optics group number), NOT the micrograph name!
+- The micrograph name is at parts[2] (index 2)
+- This caused ALL particles to be skipped with "SKIP 1 (not found)"
+- The extract produced 0 particles → class2d had nothing to classify
+
+**3. autopick using LoG instead of known coords**
+- EMPIAR-10017 ships with expert manual picks (particles.star)
+- These are far better than LoG on real data
+- Changed default: if source dataset has particles.star, use "known" method
+
+### Fixes applied
+
+**server.py:**
+- class2d: raised iteration cap from 5 → 25 (line 598)
+  - `n_iter = min(int(p.get("iter_nr_iter", 25)), 25)`
+- class2d: raised class cap from 5 → 10
+  - `nr_classes = min(int(p.get("nr_classes", 10)), 10)`
+- autopick: default to "known" method if source has particles.star
+- task_import: remove existing symlinks before creating new ones
+  (fixes "File exists" error on re-runs)
+
+**extract_cpu.py:**
+- Rewrote `parse_coords()` to dynamically parse column headers
+  (_rlnCoordinateX, _rlnCoordinateY, _rlnMicrographName, etc.)
+  instead of hard-coding column indices
+- This handles any column order in the autopick.star file
+
+**render_preview.py:**
+- classgrid + particles: GLOBAL normalization (same min/max for all slices)
+  instead of per-slice normalization (which amplified noise into "striping")
+
+### Environment fixes
+- Reinstalled RELION 3.1.3 binaries (relion-pkg was lost during git reset)
+- Installed mrcfile in venv python (was missing, causing extract to fail)
+- Fixed runner process management (setsid + nohup + /dev/null to survive)

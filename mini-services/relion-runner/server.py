@@ -31,10 +31,32 @@ from urllib.parse import urlparse, parse_qs
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(ROOT, "..", ".."))
-RELION_PKG = os.path.join(PROJECT_ROOT, "relion-pkg")
-RELION_BIN = os.path.join(RELION_PKG, "usr", "bin")
-RELION_LIB = os.path.join(RELION_PKG, "usr", "lib", "x86_64-linux-gnu")
-CTFFIND = os.path.join(RELION_BIN, "ctffind")
+
+# Auto-detect RELION installation: prefer RELION 5.0 (relion5-pkg) if installed,
+# fall back to RELION 3.1 (relion-pkg).
+RELION5_PKG = os.path.join(PROJECT_ROOT, "relion5-pkg")
+RELION3_PKG = os.path.join(PROJECT_ROOT, "relion-pkg")
+RELION5_BIN = os.path.join(RELION5_PKG, "bin")
+RELION3_BIN = os.path.join(RELION3_PKG, "usr", "bin")
+
+if os.path.exists(os.path.join(RELION5_BIN, "relion_refine")):
+    RELION_PKG = RELION5_PKG
+    RELION_BIN = RELION5_BIN
+    RELION_LIB = os.path.join(RELION5_PKG, "lib")
+    RELION_VERSION = "5.0"
+elif os.path.exists(os.path.join(RELION3_BIN, "relion_refine")):
+    RELION_PKG = RELION3_PKG
+    RELION_BIN = RELION3_BIN
+    RELION_LIB = os.path.join(RELION3_PKG, "usr", "lib", "x86_64-linux-gnu")
+    RELION_VERSION = "3.1"
+else:
+    # Neither installed — use relion3 path (will fail with helpful error)
+    RELION_PKG = RELION3_PKG
+    RELION_BIN = RELION3_BIN
+    RELION_LIB = os.path.join(RELION3_PKG, "usr", "lib", "x86_64-linux-gnu")
+    RELION_VERSION = "none"
+
+CTFFIND = os.path.join(RELION_BIN, "ctffind") if os.path.exists(os.path.join(RELION_BIN, "ctffind")) else os.path.join(RELION3_BIN, "ctffind")
 MOTIONCORR_CPU = os.path.join(ROOT, "motioncorr_cpu.py")
 EXTRACT_CPU = os.path.join(ROOT, "extract_cpu.py")
 DATA_ROOT = os.path.join(PROJECT_ROOT, "data", "projects")
@@ -1150,6 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"[relion-runner] starting on port {PORT}", flush=True)
+    print(f"[relion-runner] RELION version: {RELION_VERSION}", flush=True)
     print(f"[relion-runner] RELION_BIN={RELION_BIN}", flush=True)
     print(f"[relion-runner] CTFFIND={CTFFIND}", flush=True)
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

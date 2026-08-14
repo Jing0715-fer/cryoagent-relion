@@ -1067,3 +1067,63 @@ The problem is NOT the data — it's the pipeline parameters.
 - Reinstalled RELION 3.1.3 binaries (relion-pkg was lost during git reset)
 - Installed mrcfile in venv python (was missing, causing extract to fail)
 - Fixed runner process management (setsid + nohup + /dev/null to survive)
+
+## Phase 24: RELION 5.0 install UI + full manual job parameter editor
+
+### User request
+- 把安装 RELION 也整合到 UI 中，一键安装脚本
+- 改成用最新的 RELION 5.0
+- 改成可以手动创建 job，所有可调参数和 RELION 中一致手动可改
+- 完成后进行测试并 push 到 GitHub
+
+### Changes
+
+**1. RELION 5.0 one-click installer**
+- New script: `scripts/install-relion5.sh`
+  - Downloads RELION 5.0.1 source from GitHub
+  - Builds from source with cmake (CPU-only, no CUDA, no MPI)
+  - Installs to `relion5-pkg/` (separate from relion-pkg/)
+  - Auto-installs cmake via pip if missing
+  - Takes ~5-10 minutes to build
+- New API route: `/api/install-relion`
+  - GET: checks if RELION 5.0 is installed (returns version)
+  - POST: starts the build in background (non-blocking, polls GET for status)
+- UI: "install 5.0" button in project sidebar
+  - Shows install status (not installed → building → installed)
+  - Polls every 15s during installation
+  - Shows version badge when complete
+
+**2. Runner auto-detects RELION version**
+- `server.py` now auto-detects installed RELION:
+  - Prefers `relion5-pkg/` (RELION 5.0) if present
+  - Falls back to `relion-pkg/` (RELION 3.1)
+  - Logs version on startup: `[relion-runner] RELION version: 3.1` or `5.0`
+- This allows gradual migration: existing 3.1 continues working, 5.0 used when installed
+
+**3. Full manual job parameter editor (AddJobDialog)**
+- Completely rewrote `add-job-dialog.tsx`:
+  - Shows ALL parameters for the selected task (from `RELION_TASKS` definitions)
+  - Parameters grouped by their `group` field (I/O, Motion, CTF, Classify, etc.)
+  - Each parameter has proper input type:
+    - bool → dropdown (true/false)
+    - int/float → number input
+    - string/path → text input
+    - select → dropdown with options
+  - "Show advanced" toggle to reveal advanced parameters (★ marked)
+  - Parameter values initialized with defaults, fully editable
+  - Tooltip on each parameter label shows help text
+  - Values converted to proper types (int/float/bool/string) on submit
+- This matches the RELION GUI experience — all parameters are manually adjustable
+
+### Files changed
+- `scripts/install-relion5.sh` — new install script
+- `src/app/api/install-relion/route.ts` — new API route
+- `src/components/cryo/project-sidebar.tsx` — added RELION install button + status
+- `src/components/cryo/add-job-dialog.tsx` — full rewrite with all parameters
+- `mini-services/relion-runner/server.py` — auto-detect RELION version
+
+### Verified
+- UI shows "install 5.0" button in sidebar ✅
+- Install API returns correct status ✅
+- Runner logs detected RELION version ✅
+- Lint passes ✅

@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Project, Decision } from "@/lib/types";
 import { Icon } from "./icon";
 import { cn } from "@/lib/utils";
@@ -24,13 +25,103 @@ const STATUS_COLOR: Record<string, string> = {
 };
 
 export function ProjectSidebar({ projects, selectedId, onSelect, onNew, decisions }: Props) {
+  const [relionStatus, setRelionStatus] = useState<{ installed: boolean; version: string; installing: boolean }>({
+    installed: false,
+    version: "",
+    installing: false,
+  });
+
+  // Check RELION installation status on mount
+  useEffect(() => {
+    let cancelled = false;
+    async function checkStatus() {
+      try {
+        const res = await fetch("/api/install-relion");
+        const d = await res.json();
+        if (!cancelled) {
+          setRelionStatus(prev => ({ ...prev, installed: d.installed, version: d.version }));
+        }
+      } catch {}
+    }
+    checkStatus();
+    // Poll every 10s if installing
+    const interval = setInterval(() => {
+      if (relionStatus.installing) checkStatus();
+    }, 10000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [relionStatus.installing]);
+
+  async function installRelion() {
+    setRelionStatus(prev => ({ ...prev, installing: true }));
+    try {
+      const res = await fetch("/api/install-relion", { method: "POST" });
+      const d = await res.json();
+      if (d.ok) {
+        // Poll for completion
+        const poll = setInterval(async () => {
+          try {
+            const check = await fetch("/api/install-relion");
+            const status = await check.json();
+            if (status.installed) {
+              clearInterval(poll);
+              setRelionStatus({ installed: true, version: status.version, installing: false });
+            }
+          } catch {}
+        }, 15000); // check every 15s
+        // Stop polling after 15 min
+        setTimeout(() => clearInterval(poll), 900000);
+      }
+    } catch (e) {
+      setRelionStatus(prev => ({ ...prev, installing: false }));
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
-      <div className="p-3 border-b border-border/60">
+      <div className="p-3 border-b border-border/60 space-y-2">
         <Button onClick={onNew} className="w-full gap-2" size="sm">
           <Icon name="Plus" className="h-4 w-4" />
           New project
         </Button>
+        {/* RELION installation status */}
+        <div className={cn(
+          "rounded-md border px-2.5 py-2 text-[10px]",
+          relionStatus.installed
+            ? "border-emerald-500/30 bg-emerald-500/5"
+            : relionStatus.installing
+            ? "border-amber-500/30 bg-amber-500/5"
+            : "border-border/50 bg-muted/30"
+        )}>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              <Icon name="Package" className="h-3 w-3 shrink-0" />
+              <span className="font-medium text-muted-foreground">RELION</span>
+            </div>
+            {relionStatus.installed ? (
+              <span className="text-emerald-300 font-mono text-[9px]">
+                {relionStatus.version.includes("5.") ? "5.0 ✓" : "3.1 ✓"}
+              </span>
+            ) : relionStatus.installing ? (
+              <span className="text-amber-300 flex items-center gap-1 text-[9px]">
+                <Icon name="Loader2" className="h-2.5 w-2.5 animate-spin" />
+                building...
+              </span>
+            ) : (
+              <button
+                onClick={installRelion}
+                className="text-sky-300 hover:text-sky-200 font-medium text-[9px] flex items-center gap-0.5"
+              >
+                <Icon name="Download" className="h-2.5 w-2.5" />
+                install 5.0
+              </button>
+            )}
+          </div>
+          {relionStatus.installing && (
+            <div className="text-[8px] text-muted-foreground mt-1">
+              Building from source (~5-10 min). Check relion5-install.log
+            </div>
+          )}
+        </div>
       </div>
 
       {/* projects */}

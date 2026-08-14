@@ -16,8 +16,9 @@ const execFileAsync = promisify(execFile);
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const maxMicrographs = Math.min(Number(body.maxMicrographs) || 5, 20);
+  const binFactor = body.binFactor === 2 ? 2 : 4; // default bin4, allow bin2
 
-  const dstDir = path.resolve(process.cwd(), "data", "projects", "empiar10017_bin4");
+  const dstDir = path.resolve(process.cwd(), "data", "projects", binFactor === 2 ? "empiar10017_bin2" : "empiar10017_bin4");
   const microDir = path.join(dstDir, "Micrographs");
 
   // If data already exists, return immediately
@@ -66,10 +67,10 @@ export async function POST(req: NextRequest) {
         throw new Error(`Download failed: ${mrcUrl}`);
       }
 
-      // Bin by 4x using Python + mrcfile
+      // Bin by BINx using Python + mrcfile
       const binScript = `
 import sys, numpy as np, mrcfile
-BIN = 4
+BIN = ${binFactor}
 ANGPIX = 1.77 * BIN
 with mrcfile.open(sys.argv[1], permissive=True) as m:
     data = np.asarray(m.data, dtype=np.float32)
@@ -117,8 +118,8 @@ import os, sys, glob
 DST = sys.argv[1]
 COORDS_DIR = os.path.join(DST, "coords")
 STAR_PATH = os.path.join(DST, "particles.star")
-SCALE = 0.25
-ANGPIX = 7.08
+SCALE = 1.0 / ${binFactor}
+ANGPIX = 1.77 * ${binFactor}
 coord_files = sorted(glob.glob(os.path.join(COORDS_DIR, "*.coord")))
 all_coords = []
 for cf in coord_files:

@@ -169,24 +169,24 @@ export function NewProjectDialog({ open, onOpenChange, onCreate }: Props) {
                   setDownloading(true);
                   setDownloadProgress("Checking existing data...");
                   try {
-                    setDownloadProgress("Downloading EMPIAR-10017 micrographs (bin4)...");
+                    setDownloadProgress("Downloading EMPIAR-10017 micrographs (bin2, 3.54 Å/px)...");
                     const res = await fetch("/api/download-empiar", {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ maxMicrographs: 5 }),
+                      body: JSON.stringify({ maxMicrographs: 5, binFactor: 2 }),
                     });
                     const d = await res.json();
                     if (d.ok) {
                       setDownloadProgress(`✅ ${d.message}`);
                       // Auto-fill the form with the downloaded data path + params
                       setSourcePath(d.path);
-                      setAngpix("7.08");
+                      setAngpix("3.54");
                       setKV("300");
                       setParticleDiameter("130");
                       setSymmetry("C1");
                       setBinFactor("1"); // data is already pre-binned
-                      setName("EMPIAR-10017 β-gal (auto-loaded)");
-                      setDescription(`Auto-downloaded EMPIAR-10017 bin4 data: ${d.nMicrographs} micrographs, 1024×1024 @ 7.08 Å/px`);
+                      setName("EMPIAR-10017 β-gal (bin2 auto-loaded)");
+                      setDescription(`Auto-downloaded EMPIAR-10017 bin2 data: ${d.nMicrographs} micrographs, 2048×2048 @ 3.54 Å/px — better particle signal than bin4`);
                       setPathError(null);
                       setTplIdx(1);
                     } else {
@@ -202,14 +202,14 @@ export function NewProjectDialog({ open, onOpenChange, onCreate }: Props) {
                 className="shrink-0 gap-1.5 border-sky-500/40 text-sky-300 hover:bg-sky-500/10"
               >
                 <Icon name={downloading ? "Loader2" : "Download"} className={cn("h-3.5 w-3.5", downloading && "animate-spin")} />
-                {downloading ? "Downloading..." : "Download"}
+                {downloading ? "Downloading..." : "Download bin2"}
               </Button>
             </div>
             {downloadProgress && (
               <div className="text-[10px] text-muted-foreground mt-1.5 font-mono">{downloadProgress}</div>
             )}
             <div className="text-[9px] text-muted-foreground mt-1">
-              Downloads 5 micrographs from EMPIAR-10017 (β-galactosidase), pre-binned to 1024×1024 @ 7.08 Å/px. Ready for the full pipeline test.
+              Downloads 5 micrographs from EMPIAR-10017 (β-galactosidase), pre-binned to 2048×2048 @ 3.54 Å/px. Bin2 gives better particle signal than bin4 for clearer 2D classification.
             </div>
           </div>
 

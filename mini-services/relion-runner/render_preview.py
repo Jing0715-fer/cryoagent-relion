@@ -137,7 +137,10 @@ def render_picking(micrograph_path, coords_star, output_path):
 
 
 def render_classgrid(stack_path, output_path, max_items=10):
-    """Render a grid of class averages from a .mrcs particle stack."""
+    """Render a grid of class averages from a .mrcs particle stack.
+    Uses GLOBAL normalization (same min/max for all slices) so that
+    brightness is consistent across cells. Per-slice normalization amplifies
+    noise into visible 'striping' artifacts."""
     if not os.path.exists(stack_path):
         print(f"[render] stack not found: {stack_path}", file=sys.stderr)
         return False
@@ -149,17 +152,21 @@ def render_classgrid(stack_path, output_path, max_items=10):
     n = min(data.shape[0], max_items)
     cols = min(5, n)
     rows = (n + cols - 1) // cols
-    # Each cell: normalize the slice, downsample to 128x128, pad with black border
+    # GLOBAL normalization across ALL slices
+    all_data = data[:n]
+    mn = float(np.percentile(all_data, 2))
+    mx = float(np.percentile(all_data, 98))
+    if mx <= mn:
+        mx = mn + 1
+    all_norm = np.clip((all_data - mn) / (mx - mn), 0, 1)
     cell = 128
     border = 2
     grid_w = cols * (cell + border) + border
     grid_h = rows * (cell + border) + border
     grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
     for i in range(n):
-        sl = data[i]
-        sl_u8 = normalize_to_uint8(sl)
-        # downsample to cell x cell
-        pil = Image.fromarray(sl_u8)
+        sl_norm = all_norm[i]
+        pil = Image.fromarray((sl_norm * 255).astype(np.uint8))
         pil = pil.resize((cell, cell), Image.BILINEAR)
         sl_ds = np.asarray(pil)
         r = i // cols
@@ -167,8 +174,8 @@ def render_classgrid(stack_path, output_path, max_items=10):
         y0 = border + r * (cell + border)
         x0 = border + c * (cell + border)
         grid[y0:y0 + cell, x0:x0 + cell] = sl_ds
-    Image.fromarray(grid).save(output_path, format="PNG")
-    print(f"[render] class grid: {n} classes in {rows}x{cols} -> {output_path}")
+    Image.fromarray(grid, mode='L').save(output_path, format="PNG")
+    print(f"[render] class grid: {n} classes in {rows}x{cols} (global norm) -> {output_path}")
     return True
 
 

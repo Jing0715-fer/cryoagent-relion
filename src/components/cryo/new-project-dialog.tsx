@@ -59,6 +59,8 @@ export function NewProjectDialog({ open, onOpenChange, onCreate }: Props) {
   const [binFactor, setBinFactor] = useState<string>("0"); // 0=auto,1=1x,2=2x,4=4x
   const [pathError, setPathError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<string>("");
 
   function pickTemplate(i: number) {
     setTplIdx(i);
@@ -149,6 +151,65 @@ export function NewProjectDialog({ open, onOpenChange, onCreate }: Props) {
                   {t.label}
                 </button>
               ))}
+            </div>
+          </div>
+
+          {/* Load Example Data button */}
+          <div className="rounded-md border border-sky-500/30 bg-sky-500/5 p-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <Icon name="Download" className="h-3.5 w-3.5 text-sky-400" />
+                <span className="text-[11px] font-medium text-sky-300">Quick Start: Load Example Data</span>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={downloading}
+                onClick={async () => {
+                  setDownloading(true);
+                  setDownloadProgress("Checking existing data...");
+                  try {
+                    setDownloadProgress("Downloading EMPIAR-10017 micrographs (bin4)...");
+                    const res = await fetch("/api/download-empiar", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ maxMicrographs: 5 }),
+                    });
+                    const d = await res.json();
+                    if (d.ok) {
+                      setDownloadProgress(`✅ ${d.message}`);
+                      // Auto-fill the form with the downloaded data path + params
+                      setSourcePath(d.path);
+                      setAngpix("7.08");
+                      setKV("300");
+                      setParticleDiameter("130");
+                      setSymmetry("C1");
+                      setBinFactor("1"); // data is already pre-binned
+                      setName("EMPIAR-10017 β-gal (auto-loaded)");
+                      setDescription(`Auto-downloaded EMPIAR-10017 bin4 data: ${d.nMicrographs} micrographs, 1024×1024 @ 7.08 Å/px`);
+                      setPathError(null);
+                      setTplIdx(1);
+                    } else {
+                      setDownloadProgress(`❌ Download failed: ${d.message || "unknown error"}`);
+                    }
+                  } catch (e: any) {
+                    setDownloadProgress(`❌ Error: ${e?.message || "unknown"}`);
+                  } finally {
+                    setDownloading(false);
+                    setTimeout(() => setDownloadProgress(""), 8000);
+                  }
+                }}
+                className="shrink-0 gap-1.5 border-sky-500/40 text-sky-300 hover:bg-sky-500/10"
+              >
+                <Icon name={downloading ? "Loader2" : "Download"} className={cn("h-3.5 w-3.5", downloading && "animate-spin")} />
+                {downloading ? "Downloading..." : "Download"}
+              </Button>
+            </div>
+            {downloadProgress && (
+              <div className="text-[10px] text-muted-foreground mt-1.5 font-mono">{downloadProgress}</div>
+            )}
+            <div className="text-[9px] text-muted-foreground mt-1">
+              Downloads 5 micrographs from EMPIAR-10017 (β-galactosidase), pre-binned to 1024×1024 @ 7.08 Å/px. Ready for the full pipeline test.
             </div>
           </div>
 

@@ -924,3 +924,90 @@ The 4GB RAM sandbox can't run dev server + runner + RELION + VLM simultaneously
 without OOM. The Topaz disable helps, but heavy class2d runs can still trigger OOM.
 Testing is best done with smaller datasets or via the browser (which spreads the
 load over time via polling).
+
+## Phase 22: Load Example Data button + pipeline test analysis
+
+### User request
+- 页面没有加载成功
+- UI 中加一个加载示例数据的按钮，可以从 EMPIAR 下载 10017 数据用于测试
+- 进行完整流程测试，根据测试结果提出改进意见
+
+### Changes
+
+**1. Page loading fix**
+- Root cause: dev server kept dying from OOM (4GB RAM sandbox) + IPv6/IPv4
+  connectivity issue between Node.js fetch and Python runner
+- Fixed in Phase 21: changed `localhost` → `127.0.0.1` for IPv4-only runner
+- Verified: page loads successfully, shows full 3-panel UI
+
+**2. "Load Example Data" button (NewProjectDialog)**
+- New API route `/api/download-empiar`:
+  - Downloads 5 micrographs from EMPIAR-10017 FTP server
+  - Pre-bins by 4x (4096→1024, 1.77→7.08 Å/px)
+  - Downloads .coord files and generates particles.star with scaled coords
+  - Returns cached response if data already exists
+- UI: sky-blue "Quick Start" panel with Download button
+  - Shows progress messages during download
+  - Auto-fills form with correct path + params after download
+  - Ready for one-click project creation
+
+**3. Pipeline test results (bin4 EMPIAR-10017)**
+
+Full pipeline with VLM verification:
+| Task | VLM Score | Result | Key Issues |
+|------|-----------|--------|------------|
+| import | — | ✅ done | 20 micrographs, 21 output files |
+| ctffind | 🟢 8/10 | ✅ pass | CTF resolution 6 Å — acceptable |
+| autopick | 🔴 3-4/10 | ❌ fail (3 retries) | "Massive false positives, circles on noise" |
+| extract | 🔴 1-2/10 | ❌ fail (3 retries) | "Severe vertical striping, no protein density" |
+| class2d | 🔴 3-4/10 | ❌ fail | "Blurry, featureless blobs" |
+| initialmodel | — | ❌ failed | Cannot proceed from bad class2d |
+
+### Root cause analysis
+
+**Why autopick fails:**
+- The "known coords" fallback copies ALL 2541 coords from source particles.star
+- Many coords are near micrograph edges where there's no actual particle
+- VLM correctly identifies this as "false positives on empty background"
+- Retry fix (Phase 21) forces LoG picker but it also produces poor results
+  at 7.08 Å/px (particles only ~18px diameter — too small for LoG to detect)
+
+**Why extract fails:**
+- Raw extracted data is actually valid (mean=0, std=1, no extreme striping)
+- But when rendered to PNG, each particle box is normalized independently,
+  amplifying noise patterns into visible "striping"
+- At 7.08 Å/px, particles are ~25px in a 64px box (39% fill) — too much
+  background noise dominates the signal
+- The extract_cpu.py inverts contrast + normalizes, but the VLM sees
+  the rendered preview which has inconsistent normalization between boxes
+
+**Why class2d fails:**
+- Downstream consequence of bad extraction — garbage in, garbage out
+- With noisy particle boxes, the class averages can't resolve features
+- 5 iterations is also insufficient for convergence at this SNR
+
+### Improvement proposals
+
+1. **Use bin2 (3.54 Å/px) instead of bin4 for the example data**
+   - Particles would be ~50px diameter (vs 25px at bin4)
+   - More signal per box, better SNR for classification
+   - Box size 64px would be appropriate
+   - Trade-off: 4x more memory/CPU for processing
+
+2. **Smaller box size for bin4 (32px instead of 64px)**
+   - Particle fills 78% of box (vs 39% with 64px)
+   - Less background noise per box
+   - Quick fix, no data change needed
+
+3. **Fix extract rendering consistency**
+   - Normalize ALL particle boxes to the SAME global min/max
+   - Not per-box independent normalization
+   - This would reduce the "striping" artifacts the VLM sees
+
+4. **Filter known coords near micrograph edges**
+   - Remove coords within box_size/2 of the micrograph boundary
+   - Prevents edge artifacts in extracted boxes
+
+5. **Increase class2d iterations for real data**
+   - 5 iterations is too few for noisy real data
+   - Default should be 15-25 iterations

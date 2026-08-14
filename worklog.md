@@ -1147,3 +1147,79 @@ The problem is NOT the data — it's the pipeline parameters.
 - Complete the MPI stub (add remaining missing functions)
 - Test full RELION 5.0 build
 - Test manual job creation with all parameters via browser
+
+## Phase 25: MPI stub completion + bin4 full pipeline test
+
+### User request
+- 继续迭代补充 MPI stub 中缺失的函数
+- 进行真实数据的全流程测试
+- 根据测试结果提出下一步开发建议
+- commit 并 push 到 GitHub
+
+### MPI Stub Completion
+
+Verified ALL MPI function calls in RELION 5.0 source code:
+```bash
+grep -roh 'MPI_[A-Za-z_]*(' src/ | sort -u
+```
+
+Result: 29 unique MPI functions used. All 29 are now defined in our MPI stub
+(`mini-services/relion-runner/mpi-stub/mpi.h`). The last missing function
+(`MPI_Comm_split_type`) has been added.
+
+RELION 5.0 build reached **42%** (201/472 .o files compiled, 0 compilation
+errors). The build keeps getting killed by the 4GB sandbox memory limit during
+compilation of large files (e.g. `ml_optimiser.cpp` = 10718 lines).
+
+### Full Pipeline Test Results (bin4 EMPIAR-10017)
+
+Data: 5 micrographs (1024×1024 @ 7.08 Å/px), 2917 known particle coordinates.
+
+| Task | Status | Summary | VLM Score |
+|------|--------|---------|-----------|
+| import | ✅ done | 5 micrographs, single-frame, 7.08 Å/px | — |
+| ctffind | ✅ done | 5 micrographs, avg defocus 11000Å, res 6Å | 🟢 8/10 PASS |
+| autopick | ✅ done | 2918 particles (known coords method) | — |
+| extract | ✅ done | 2902 particles, box=64px, 7.08 Å/px | — |
+| class2d | 🔄 running | 25 iterations (upgraded from 5) | pending |
+
+**Key fix verified**: The `extract_cpu.py` `parse_coords()` bug (hard-coded column
+index → dynamic header parsing) is confirmed fixed. Extract successfully produced
+2902 particles from the autopick coordinates.
+
+**Key fix verified**: `mrcfile` installed in venv python — extract_cpu.py no longer
+fails with `ModuleNotFoundError`.
+
+**Key fix verified**: class2d iteration cap raised from 5 → 25. The relion_refine
+command now uses `--iter 25` instead of `--iter 5`, giving real data enough
+iterations to converge.
+
+### Next Development Recommendations
+
+1. **Complete RELION 5.0 build**
+   - All MPI stub functions are now in place (0 compilation errors)
+   - Build reaches 42% before OOM kills the process
+   - Need: run `make -j1` with `-O0` on a machine with ≥8GB RAM
+   - Or: use swap space (`fallocate -l 4G /swapfile && mkswap /swapfile && swapon /swapfile`)
+
+2. **Wait for class2d convergence**
+   - With 25 iterations, class2d should produce much clearer class averages
+   - VLM verification should give a higher score than the previous 4/10
+   - If score < 7, the retry loop will adjust parameters (more iterations, different tau_fudge)
+
+3. **RELION 5.0 command syntax adaptation**
+   - RELION 5.0 has different command-line syntax vs 3.1
+   - Key changes: `relion_refine` → `relion_refine` (same), but star file format updated
+   - The runner's `task_*` functions need to detect RELION version and adapt commands
+   - Priority: after RELION 5.0 build completes, test each task function
+
+4. **VLM rendering fix**
+   - Picking overlay and particle grid rendering sometimes fail ("render failed — skipping")
+   - Root cause: `findFirstMicrograph()` can't find .mrc files in import outputFiles
+   - Fix: search ALL jobs' outputFiles, not just the current job's
+   - Priority: medium (verification fails open, doesn't block pipeline)
+
+5. **Memory management**
+   - 4GB sandbox causes frequent OOM when running dev server + runner + RELION simultaneously
+   - Recommendation: kill dev server during RELION 5.0 compilation
+   - Or: use a lighter dev server (production build instead of `next dev`)

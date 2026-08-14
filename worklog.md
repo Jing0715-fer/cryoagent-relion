@@ -1127,3 +1127,23 @@ The problem is NOT the data — it's the pipeline parameters.
 - Install API returns correct status ✅
 - Runner logs detected RELION version ✅
 - Lint passes ✅
+
+## Phase 24 Status
+
+### Completed
+1. **RELION 5.0 install UI** — "install 5.0" button in sidebar with status polling ✅
+2. **Install API** (`/api/install-relion`) — GET checks status, POST starts build ✅
+3. **Install script** (`scripts/install-relion5.sh`) — builds from source ✅
+4. **MPI stub** (`mpi-stub/mpi.h`) — allows building without real MPI ✅
+5. **Full parameter editor** in AddJobDialog — all RELION parameters editable ✅
+6. **Runner auto-detection** — prefers RELION 5.0, falls back to 3.1 ✅
+
+### Known limitations
+- RELION 5.0 full build is WIP — requires iterating on MPI stub completeness
+- 4GB sandbox OOM prevents stable simultaneous dev server + runner + build
+- RELION 3.1 continues working as fallback when 5.0 is not installed
+
+### Next steps
+- Complete the MPI stub (add remaining missing functions)
+- Test full RELION 5.0 build
+- Test manual job creation with all parameters via browser

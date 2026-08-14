@@ -30,7 +30,7 @@ export interface RunnerJobRequest {
 // since we're in the same network namespace. But to honor the gateway contract
 // we still use the relative path with XTransformPort so it works regardless of
 // how the app is exposed.
-export async function runRunnerJob(req: RunnerJobRequest, timeoutMs = 600000): Promise<RunnerResult> {
+export async function runRunnerJob(req: RunnerJobRequest, timeoutMs = 1800000): Promise<RunnerResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {

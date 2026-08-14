@@ -263,7 +263,14 @@ async function runnerReachable(): Promise<boolean> {
 // Also walks the full dependency DAG so we can find required upstream stars
 // (e.g. extract needs both autopick_star AND motioncorr_star even if the LLM
 // only listed autopick as a direct dep).
-async function buildRunnerInputs(job: any, allJobs: any[]): Promise<Record<string, string>> {
+//
+// Side-effect: also returns the import job's `bin_factor` (if any) via the
+// returned object's `.binFactor` field so the engine can inject it as a
+// parameter into downstream tasks (autopick needs it to scale known coords).
+async function buildRunnerInputs(
+  job: any,
+  allJobs: any[],
+): Promise<{ inputs: Record<string, string>; binFactor: number; importPixelSize: number; importOriginalPixelSize: number }> {
   const inputs: Record<string, string> = {};
   const byId = new Map(allJobs.map((j) => [j.id, j]));
 
@@ -359,7 +366,22 @@ async function buildRunnerInputs(job: any, allJobs: any[]): Promise<Record<strin
     inputs[key] = abs;
   }
 
-  return inputs;
+  // Determine the import job's bin_factor + pixel sizes so downstream tasks
+  // (autopick, extract) can scale coordinates appropriately when known coords
+  // from the source dataset are in the ORIGINAL (unbinned) frame.
+  let binFactor = 1;
+  let importPixelSize = 0;
+  let importOriginalPixelSize = 0;
+  const importJob = allJobs.find((j) => j.taskType === "import" && j.status === "done");
+  if (importJob) {
+    try {
+      const s = JSON.parse(importJob.outputSummary || "{}");
+      binFactor = Number(s.bin_factor || s.downsample_factor || 1) || 1;
+      importPixelSize = Number(s.pixel_size || 0) || 0;
+      importOriginalPixelSize = Number(s.original_pixel_size || 0) || 0;
+    } catch {}
+  }
+  return { inputs, binFactor, importPixelSize, importOriginalPixelSize };
 }
 
 export async function runTick(projectId: string): Promise<TickResult | null> {
@@ -441,11 +463,26 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
 
       // call the runner
       const { runRunnerJob } = await import("@/lib/runner-client");
-      const inputs = await buildRunnerInputs(
+      const { inputs, binFactor, importPixelSize, importOriginalPixelSize } = await buildRunnerInputs(
         { ...next, inputJobIds: next.inputJobIds, workflow: { projectId } },
         allJobs.map((j) => ({ ...j, workflow: { projectId } })),
       );
       const params = JSON.parse(next.parameters);
+      // Inject import-derived optics context so the runner can scale known
+      // coords by the bin factor and use the right effective angpix.
+      if (next.taskType !== "import") {
+        if (binFactor > 1) params.bin_factor = binFactor;
+        if (importPixelSize > 0) params.import_angpix = importPixelSize;
+        if (importOriginalPixelSize > 0) params.import_original_angpix = importOriginalPixelSize;
+        // For tasks that don't define their own angpix param (extract, autopick,
+        // etc.), inject the import's effective angpix so the runner doesn't fall
+        // back to a stale default (e.g. 4.0). For tasks that DO define angpix
+        // (postprocess, maskcreate), the value was already inherited by
+        // createSingleJob and the LLM may have overridden it — don't clobber.
+        if (!("angpix" in params) && importPixelSize > 0) {
+          params.angpix = importPixelSize;
+        }
+      }
       const result = await runRunnerJob({
         projectId,
         jobId: next.id,
@@ -527,11 +564,11 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
     const hasQueued = refreshed.some((j) => j.status === "queued");
     const hasRunning = refreshed.some((j) => j.status === "running");
     const triggerIds = [...finishedNow, ...skippedNow];
+    const terminal = refreshed.filter((j) => ["done", "skipped", "failed"].includes(j.status));
     // Fallback: if the workflow is idle (no queued/running) but we haven't
     // triggered planNextJob this tick, check if the last terminal job needs
     // a next-step decision (e.g. it was skipped/completed in a prior tick).
     if (triggerIds.length === 0 && !hasQueued && !hasRunning && refreshed.length > 0) {
-      const terminal = refreshed.filter((j) => ["done", "skipped", "failed"].includes(j.status));
       if (terminal.length > 0) {
         const lastTerminal = terminal[terminal.length - 1];
         // only trigger if this job was completed very recently (within 5s)
@@ -1017,6 +1054,21 @@ async function createSingleJob(
   const params: Record<string, string | number | boolean> = {};
   for (const p of task.parameters) params[p.key] = p.default;
   for (const [k, v] of Object.entries(job.parameters || {})) params[k] = v;
+  // For the IMPORT job, copy the user-selected bin_factor from the project's
+  // datasetMeta (set via the NewProjectDialog "Micrograph binning" dropdown).
+  // The LLM doesn't know about bin_factor — the UI choice is authoritative.
+  if (job.task === "import") {
+    const project = await db.project.findUnique({ where: { id: projectId } });
+    if (project?.datasetMeta) {
+      try {
+        const meta = JSON.parse(project.datasetMeta) as Record<string, unknown>;
+        const bf = Number(meta.bin_factor);
+        if (Number.isFinite(bf) && (bf === 0 || bf === 1 || bf === 2 || bf === 4)) {
+          params["bin_factor"] = bf;
+        }
+      } catch {}
+    }
+  }
   // Inherit critical optics parameters (angpix, kV, Cs, Q0) from the import
   // job if the LLM didn't specify them — every downstream task needs the
   // correct pixel size / voltage to work.

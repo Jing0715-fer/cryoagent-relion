@@ -629,3 +629,123 @@ returned as a Buffer directly, bypassing the string conversion entirely.
 
 ALL 8 jobs completed successfully. The 3D tasks (initialmodel, class3d, refine3d)
 are no longer skipped — they run on CPU with reduced iterations.
+
+## Phase 19: bin4 EMPIAR pipeline + import micrograph preview fix
+
+### User request
+- 用 bin4 数据尝试跑通 2D 分类
+- 真实数据的 import 又看不到导入照片的图片了
+- 结果 push 到 GitHub
+
+### Issues diagnosed
+1. **Import micrograph preview not showing**: The MicrographGrid component filters
+   the import job's `outputFiles` for `.mrc` files, but the import job only writes
+   a `.star` file to its own job directory. The actual `.mrc` micrographs live
+   in the project-level `Micrographs/` symlink dir — not in the job dir — so
+   they were never registered in the import job's outputFiles.
+
+2. **class2d failing on EMPIAR bin2 data**: The class2d job ran 5 iterations
+   successfully (run_it000..run_it005) but the runner request was aborted by the
+   10-min client timeout, leaving the job in "running" state with 0 logs.
+
+3. **class2d LLM-proposed params too aggressive**: The LLM proposed nr_classes=50
+   and iter_nr_iter=25, which would take ~30 min on CPU even after the runner's
+   5-class/5-iter cap.
+
+4. **Autopick coords not scaled when import was binned**: The source
+   `particles.star` has coords in the ORIGINAL (4096px) frame. When import bins
+   the micrographs (bin4 → 1024px), the coords must be scaled by 1/4.
+
+5. **No way to control binning factor from the UI**: The import task auto-binned
+   by 2x if max_dim > 2048, but the user couldn't choose bin4 explicitly.
+
+6. **`terminal` undefined in runTick return**: An existing bug where `terminal`
+   was scoped inside an `if` block but referenced in the return statement. Only
+   surfaced when the workflow reached a terminal state via the idle-tick fallback.
+
+7. **Extract job angpix defaulting to 4.0 instead of inheriting 7.08**: The
+   extract task definition has no `angpix` parameter, so the engine never
+   inherited it from the import job's effective pixel size.
+
+### Changes made
+
+**mini-services/relion-runner/server.py**:
+- `task_import`: Replaced hard-coded 2x auto-binning with a configurable
+  `bin_factor` parameter (0=auto, 1=none, 2=force 2x, 4=force 4x). Supports
+  binning by 4x (4096→1024).
+- `task_import`: Stashes the list of imported micrograph relative paths in
+  `summary._micrograph_rel_paths` so the engine can register them as outputs
+  of the import job (makes them visible in the UI's MicrographGrid).
+- `run_job`: Pops `_micrograph_rel_paths` from the summary and adds each
+  path to `outfiles` (the job's outputFiles list).
+- Added `_scale_known_coords()` helper that copies a particles.star but
+  multiplies `_rlnCoordinateX` / `_rlnCoordinateY` by a scale factor.
+- `task_autopick`: When falling back to known coords, scales the coords by
+  `1/bin_factor` (read from parameters) to match the binned micrographs.
+
+**src/lib/agent/engine.ts**:
+- `buildRunnerInputs` now returns `{inputs, binFactor, importPixelSize,
+  importOriginalPixelSize}` — extracts the bin factor + pixel sizes from the
+  import job's output summary.
+- `runTick` injects `bin_factor`, `import_angpix`, `import_original_angpix`
+  into the parameters sent to the runner for non-import jobs. Also injects
+  `angpix` (from import summary) for tasks that don't define their own.
+- `createSingleJob`: For import jobs, copies `bin_factor` from the project's
+  `datasetMeta` (set via the NewProjectDialog dropdown).
+- Fixed the `terminal` undefined bug — moved the `terminal` declaration out
+  of the `if (triggerIds.length === 0 ...)` block so it's in scope for the
+  return statement.
+
+**src/lib/relion/tasks.ts**:
+- Import task: added `bin_factor` parameter (default 0 = auto).
+- Class2D task: lowered `nr_classes` default 50→10, `iter_nr_iter` 25→5,
+  `do_fast_subsets` false→true. These are much more CPU-friendly defaults
+  that the LLM will pick up.
+
+**src/lib/runner-client.ts**:
+- Increased default `runRunnerJob` timeout 600000ms (10min) → 1800000ms (30min)
+  so a slow class2d on CPU doesn't time out mid-run.
+
+**src/components/cryo/new-project-dialog.tsx**:
+- Added a "Micrograph binning" 4-button selector (Auto / 1× / 2× / 4×) in
+  the Acquisition parameters section.
+- Stores `bin_factor` in `datasetMeta` when creating a project.
+
+**data-gen/bin4_empiar.py**:
+- New script that pre-bins the EMPIAR-10017 micrographs by 4x (4096→1024,
+  angpix 1.77→7.08) and scales the source particles.star coords by 1/4.
+- Produces a self-contained `data/projects/empiar10017_bin4/` dataset.
+
+### bin4 EMPIAR-10017 test result
+Created project "EMPIAR-10017 bin4 2D-class" with bin_factor=1 (data already
+pre-binned to bin4 via the script). The full pipeline ran end-to-end:
+
+| Job       | Status | Summary                                                    |
+|-----------|--------|------------------------------------------------------------|
+| import    | done   | 20 micrographs, 7.08 Å/px, single_frame, 21 outputFiles    |
+| motioncorr| skipped (single-frame data, no motion correction needed)                            |
+| autopick  | done   | 2541 particles (known coords, no scaling needed)           |
+| extract   | done   | 2526 particles, box=64px, 2 outputFiles                    |
+| class2d   | done   | 5 classes, 6 iterations (run_it000..run_it005), 30 files   |
+
+The class2d ran 5 iterations successfully. The runner request was lost when
+the dev process exited (HTTP socket closed mid-response), so the job was
+recovered from the existing output files via `scripts/recover-class2d.ts`.
+
+### Verified via agent-browser
+- NewProjectDialog shows the new bin_factor dropdown (Auto/1×/2×/4×).
+- Import job page: 20 micrograph thumbnail previews (all Falcon_2012_*.mrc).
+- Class2D job page: 3 canvases (iteration progress, ESS histogram, angular
+  heatmap) + 5 class average images.
+- 0 page errors.
+
+### Files added
+- `data-gen/bin4_empiar.py` — pre-bin EMPIAR data to bin4
+- `scripts/run-bin4-empiar.ts` — create + run a bin4 EMPIAR project
+- `scripts/tick-engine.ts` — re-tick an existing project's engine
+- `scripts/recover-class2d.ts` — recover a class2d job from existing files
+- `screenshot-bin4-import.png`, `screenshot-bin4-class2d.png` — verification shots
+
+### Next steps
+- Push to GitHub.
+- Schedule recurring webDevReview cron.

@@ -56,6 +56,7 @@ export function NewProjectDialog({ open, onOpenChange, onCreate }: Props) {
   const [kV, setKV] = useState(String(TEMPLATES[1].meta.kV));
   const [particleDiameter, setParticleDiameter] = useState(String(TEMPLATES[1].meta.particle_diameter));
   const [symmetry, setSymmetry] = useState(String(TEMPLATES[1].meta.symmetry));
+  const [binFactor, setBinFactor] = useState<string>("0"); // 0=auto,1=1x,2=2x,4=4x
   const [pathError, setPathError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
 
@@ -108,6 +109,7 @@ export function NewProjectDialog({ open, onOpenChange, onCreate }: Props) {
         Q0: 0.1,
         particle_diameter: parseFloat(particleDiameter) || 120,
         symmetry: symmetry || "C1",
+        bin_factor: parseInt(binFactor, 10) || 0,
       },
       sourceDataset: sourcePath.trim(),
       executorMode: "real",
@@ -227,6 +229,36 @@ export function NewProjectDialog({ open, onOpenChange, onCreate }: Props) {
               <div>
                 <Label className="text-[10px] text-muted-foreground">Symmetry</Label>
                 <Input value={symmetry} onChange={(e) => setSymmetry(e.target.value)} className="h-7 text-[12px] font-mono" placeholder="C1, D4, O…" />
+              </div>
+              <div className="col-span-2">
+                <Label className="text-[10px] text-muted-foreground flex items-center gap-1.5">
+                  <Icon name="Layers" className="h-3 w-3" />
+                  Micrograph binning (CPU speedup)
+                </Label>
+                <div className="grid grid-cols-4 gap-1.5 mt-1">
+                  {[
+                    { v: "0", label: "Auto", hint: "2x if >2048px" },
+                    { v: "1", label: "1×", hint: "No binning" },
+                    { v: "2", label: "2×", hint: "Half size" },
+                    { v: "4", label: "4×", hint: "Quarter size" },
+                  ].map((opt) => (
+                    <button
+                      key={opt.v}
+                      type="button"
+                      onClick={() => setBinFactor(opt.v)}
+                      className={cn(
+                        "px-2 py-1.5 rounded-md border text-[11px] transition-colors text-center",
+                        binFactor === opt.v
+                          ? "border-emerald-500/60 bg-emerald-500/10 text-foreground"
+                          : "border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/60",
+                      )}
+                      title={opt.hint}
+                    >
+                      <div className="font-semibold">{opt.label}</div>
+                      <div className="text-[9px] text-muted-foreground mt-0.5">{opt.hint}</div>
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
           </div>

@@ -134,42 +134,58 @@ def task_import(p, inputs, out, on_line, env):
         else:
             pattern = "*.mrc*"
     files = sorted(glob.glob(os.path.join(data_dir, pattern)))
-    # Auto-downsample large micrographs (>2048px) for CPU feasibility.
-    # 4096x4096 EMPIAR micrographs need too much memory for ctffind/Topaz on CPU.
-    # We downsample by factor 2 (binning) and adjust the pixel size accordingly.
+    # Decide binning factor:
+    #   bin_factor = 0 -> auto (bin by 2 if max_dim > 2048, else no binning)
+    #   bin_factor = 1 -> no binning
+    #   bin_factor = 2 -> force 2x binning
+    #   bin_factor = 4 -> force 4x binning (e.g. 4096 -> 1024 for fast CPU class2d)
+    bin_factor_req = int(p.get("bin_factor", 0) or 0)
     angpix_orig = float(p.get("angpix", 1.77))
     angpix_eff = angpix_orig
     downsample_factor = 1
-    if files and is_single_frame:
+    if files:
         try:
             import mrcfile as _mrc
             with _mrc.open(files[0], permissive=True) as _m:
                 _shape = _m.data.shape
             max_dim = max(_shape[-2], _shape[-1]) if len(_shape) >= 2 else 0
-            if max_dim > 2048:
-                downsample_factor = 2
+            # resolve effective bin factor
+            if bin_factor_req in (2, 4):
+                downsample_factor = bin_factor_req
+            elif bin_factor_req == 1:
+                downsample_factor = 1
+            else:  # auto
+                downsample_factor = 2 if max_dim > 2048 else 1
+            # only bin single-frame micrographs (movie frames need motioncorr first)
+            if downsample_factor > 1 and is_single_frame and max_dim > 0:
                 angpix_eff = angpix_orig * downsample_factor
-                on_line("info", f"Large micrographs ({max_dim}px) -- downsampling by {downsample_factor}x to {max_dim//downsample_factor}px, angpix {angpix_orig} -> {angpix_eff} A/px")
+                on_line("info", f"Binning by {downsample_factor}x: {max_dim}px -> {max_dim//downsample_factor}px, angpix {angpix_orig} -> {angpix_eff} A/px")
                 # Create downsampled copies in a Downsampled/ dir
                 ds_dir = os.path.join(pd, "relion_run", "Micrographs_downsampled")
                 os.makedirs(ds_dir, exist_ok=True)
                 import numpy as _np
+                bf = downsample_factor
                 for m in files:
                     basename = os.path.basename(m)
                     ds_path = os.path.join(ds_dir, basename)
-                    if not os.path.exists(ds_path):
-                        with _mrc.open(m, permissive=True) as _m2:
-                            _data = _np.asarray(_m2.data, dtype=_np.float32)
-                        # bin by factor 2
-                        if _data.ndim == 2:
-                            h, w = _data.shape
-                            _data = _data[:h//2*2, :w//2*2].reshape(h//2, 2, w//2, 2).mean(axis=(1, 3))
-                        elif _data.ndim == 3:
-                            d, h, w = _data.shape
-                            _data = _data[:, :h//2*2, :w//2*2].reshape(d, h//2, 2, w//2, 2).mean(axis=(2, 4))
-                        with _mrc.new(ds_path, overwrite=True) as _m3:
-                            _m3.set_data(_data.astype(_np.float32))
-                            _m3.voxel_size = (angpix_eff, angpix_eff, angpix_eff)
+                    if os.path.exists(ds_path):
+                        continue
+                    with _mrc.open(m, permissive=True) as _m2:
+                        _data = _np.asarray(_m2.data, dtype=_np.float32)
+                    # bin by factor bf (supports 2 and 4)
+                    if _data.ndim == 2:
+                        h, w = _data.shape
+                        h2 = h // bf * bf
+                        w2 = w // bf * bf
+                        _data = _data[:h2, :w2].reshape(h2 // bf, bf, w2 // bf, bf).mean(axis=(1, 3))
+                    elif _data.ndim == 3:
+                        d, h, w = _data.shape
+                        h2 = h // bf * bf
+                        w2 = w // bf * bf
+                        _data = _data[:, :h2, :w2].reshape(d, h2 // bf, bf, w2 // bf, bf).mean(axis=(2, 4))
+                    with _mrc.new(ds_path, overwrite=True) as _m3:
+                        _m3.set_data(_data.astype(_np.float32))
+                        _m3.voxel_size = (angpix_eff, angpix_eff, angpix_eff)
                 # Point the Micrographs symlink to the downsampled dir
                 if os.path.islink(micro_link):
                     os.unlink(micro_link)
@@ -200,7 +216,17 @@ def task_import(p, inputs, out, on_line, env):
                "single_frame": is_single_frame,
                "downsampled": downsample_factor > 1,
                "downsample_factor": downsample_factor,
+               "bin_factor": downsample_factor,
                "original_pixel_size": angpix_orig}
+    # Stash the list of imported micrograph RELATIVE paths (relative to the
+    # project dir) so the engine can register them in the job's outputFiles.
+    # This makes the micrographs visible in the UI's MicrographGrid for the
+    # import job (otherwise the grid sees only the .star file and shows nothing).
+    micro_rel_paths = []
+    rel_root = os.path.join("relion_run", "Micrographs" if is_single_frame else "Movies")
+    for m in files:
+        micro_rel_paths.append(os.path.join(rel_root, os.path.basename(m)))
+    summary["_micrograph_rel_paths"] = micro_rel_paths
     return star_path, summary
 
 def task_motioncorr(p, inputs, out, on_line, env):
@@ -336,6 +362,45 @@ def task_ctffind(p, inputs, out, on_line, env):
         avg_def = 11000
     return star_path, {"n_micrographs": n, "avg_defocus_A": round(avg_def, 1),
                        "avg_resolution_A": round(avg_res, 2)}
+
+def _scale_known_coords(src_star, dst_star, scale):
+    """Copy a particles.star but scale the _rlnCoordinateX / _rlnCoordinateY
+    values by `scale` (e.g. 0.25 for bin4). Needed when the source dataset's
+    particles.star has coords in the ORIGINAL (unbinned) micrograph frame but
+    the import job binned the micrographs."""
+    x_col = -1
+    y_col = -1
+    with open(src_star) as fin, open(dst_star, "w") as fout:
+        in_particles = False
+        for line in fin:
+            s = line.strip()
+            if s.startswith("data_"):
+                in_particles = s.startswith("data_particles")
+                fout.write(line)
+                continue
+            if not in_particles:
+                fout.write(line)
+                continue
+            if s.startswith("_rlnCoordinateX"):
+                x_col = int(s.split()[-1].lstrip("#")) - 1
+                fout.write(line)
+                continue
+            if s.startswith("_rlnCoordinateY"):
+                y_col = int(s.split()[-1].lstrip("#")) - 1
+                fout.write(line)
+                continue
+            parts = line.split()
+            if not parts or parts[0].startswith("_") or parts[0] in ("loop_", "#"):
+                fout.write(line)
+                continue
+            try:
+                if x_col >= 0 and x_col < len(parts):
+                    parts[x_col] = f"{float(parts[x_col]) * scale:.2f}"
+                if y_col >= 0 and y_col < len(parts):
+                    parts[y_col] = f"{float(parts[y_col]) * scale:.2f}"
+                fout.write(" ".join(parts) + "\n")
+            except (ValueError, IndexError):
+                fout.write(line)
 
 def task_autopick(p, inputs, out, on_line, env):
     """Particle picking. Supports multiple methods:
@@ -484,7 +549,15 @@ def task_autopick(p, inputs, out, on_line, env):
         parts_star = os.path.join(src, "particles.star")
         if not os.path.exists(parts_star):
             raise RuntimeError("No picking method succeeded and no particles.star available")
-        shutil.copy(parts_star, out_star)
+        # If import was binned (bin_factor > 1), the source particles.star's
+        # coords are in the ORIGINAL (unbinned) frame and need to be scaled by
+        # 1/bin_factor to match the binned micrographs.
+        bin_factor = float(p.get("bin_factor", 1) or 1)
+        if bin_factor > 1:
+            on_line("info", f"Scaling known coords by 1/{bin_factor} to match binned micrographs")
+            _scale_known_coords(parts_star, out_star, 1.0 / bin_factor)
+        else:
+            shutil.copy(parts_star, out_star)
         on_line("info", f"Using known coordinates from {parts_star}")
 
     # count particles
@@ -525,7 +598,11 @@ def task_autopick(p, inputs, out, on_line, env):
     if method == "known":
         parts_star = os.path.join(src, "particles.star")
         if os.path.exists(parts_star):
-            shutil.copy(parts_star, out_star)
+            bin_factor = float(p.get("bin_factor", 1) or 1)
+            if bin_factor > 1:
+                _scale_known_coords(parts_star, out_star, 1.0 / bin_factor)
+            else:
+                shutil.copy(parts_star, out_star)
             n = 0
             with open(out_star) as f:
                 for l in f:
@@ -921,6 +998,23 @@ def run_job(req):
                 primary, summary, _ = result
         else:
             primary, summary = result, {}
+        # For import jobs, the actual .mrc / .mrcs files are not in the job
+        # dir — they're in the project-level Movies/ or Micrographs/ dir (via
+        # symlink). The task stashed their relative paths in the summary so
+        # the UI can list them as outputs of the import job (otherwise the
+        # MicrographGrid component sees only the .star file and shows nothing).
+        extra_paths = summary.pop("_micrograph_rel_paths", None) if isinstance(summary, dict) else None
+        if extra_paths:
+            pd = project_dir(pid)
+            for rp in extra_paths:
+                fp = os.path.join(pd, rp)
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    continue
+                # avoid duplicates
+                if not any(o["path"] == rp for o in outfiles):
+                    outfiles.append({"path": rp, "size": sz})
         return {"ok": True, "logs": logs, "outputs": outfiles, "summary": summary,
                 "primaryOutput": os.path.relpath(primary, project_dir(pid))}
     except Exception as e:

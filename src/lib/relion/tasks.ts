@@ -82,6 +82,7 @@ export const RELION_TASKS: RelionTask[] = [
       { key: "Q0", label: "Amplitude contrast", type: "float", default: 0.1, group: "I/O", help: "Fraction of amplitude contrast." },
       { key: "beamtilt_x", label: "Beam tilt X (mrad)", type: "float", default: 0, group: "I/O", advanced: true, help: "Beam tilt along x for aberration correction." },
       { key: "beamtilt_y", label: "Beam tilt Y (mrad)", type: "float", default: 0, group: "I/O", advanced: true, help: "Beam tilt along y." },
+      { key: "bin_factor", label: "Binning factor", type: "int", default: 0, group: "Downsample", help: "0=auto (2x if micrograph >2048px), 1=none, 2=force 2x, 4=force 4x. Larger = smaller/faster but lower resolution." },
     ],
     decisionHints: {
       when: "Always the first task: needed before any processing when raw movies/micrographs are provided.",
@@ -303,10 +304,10 @@ export const RELION_TASKS: RelionTask[] = [
       { key: "class_assignments", label: "Particle to class map", kind: "star" },
     ],
     parameters: [
-      { key: "nr_classes", label: "Number of classes", type: "int", default: 50, group: "Classify", help: "Number of 2D references." },
+      { key: "nr_classes", label: "Number of classes", type: "int", default: 10, group: "Classify", help: "Number of 2D references." },
       { key: "tau_fudge", label: "Regularization T", type: "float", default: 2, group: "Classify", help: "T regularization factor." },
-      { key: "do_fast_subsets", label: "Fast subsets", type: "bool", default: false, group: "Classify", help: "Split into subsets for speed." },
-      { key: "iter_nr_iter", label: "Iterations", type: "int", default: 25, group: "Optimisation", help: "Number of EM iterations." },
+      { key: "do_fast_subsets", label: "Fast subsets", type: "bool", default: true, group: "Classify", help: "Split into subsets for speed." },
+      { key: "iter_nr_iter", label: "Iterations", type: "int", default: 5, group: "Optimisation", help: "Number of EM iterations." },
       { key: "particle_diameter", label: "Mask diameter (Å)", type: "int", default: 160, group: "Classify", help: "Circular mask diameter." },
       { key: "do_center", label: "Center classes", type: "bool", default: true, group: "Optimisation", help: "Re-center class averages." },
       { key: "do_ctf_correction", label: "CTF correction", type: "bool", default: true, group: "Classify", help: "Apply CTF during classification." },

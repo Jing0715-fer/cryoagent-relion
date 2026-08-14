@@ -557,11 +557,16 @@ def task_extract(p, inputs, out, on_line, env):
     # Cap the box to at most half the micrograph dimension (so particles near
     # the edge don't get skipped). We don't know the micrograph size yet, so
     # cap at 128 for safety (covers 256x256 synthetic + 4096x4048 real data).
-    box = max(32, min(llm_box, 128, auto_box * 2))
+    # Cap box at 64px for CPU memory safety (4GB RAM limit).
+    # At 3.54 A/px, 64px = 227 Å field of view — enough for most particles.
+    box = max(32, min(llm_box, 64, auto_box * 2))
     if llm_box != box:
         on_line("warn", f"extract: box adjusted from {llm_box} to {box} (auto={auto_box}, angpix={angpix}, diam={diameter})")
     # Rescale: keep same as box unless explicitly different
     rescale_raw = int(p.get("rescale", box)) if p.get("do_rescale", True) else box
+    # If the LLM proposed an absurdly small rescale (e.g. 1), use auto_box
+    if rescale_raw < 32:
+        rescale_raw = box
     rescale = max(32, min(rescale_raw, box))
     final_box = min(box, rescale)
     on_line("info", f"extract: box={box} final_box={final_box} angpix={angpix} diameter={diameter}Å")
@@ -594,7 +599,7 @@ def task_class2d(p, inputs, out, on_line, env):
         os.symlink(src_particles_dir, dst_particles_dir)
     # CPU-friendly caps: keep class count and iteration count small so the
     # job finishes in seconds-to-minutes instead of hours.
-    nr_classes = min(int(p.get("nr_classes", 10)), 10)
+    nr_classes = min(int(p.get("nr_classes", 10)), 5)  # cap at 5 for CPU memory
     n_iter = min(int(p.get("iter_nr_iter", 5)), 5)
     # Cap the particle diameter to be reasonable for the pixel size.
     # The LLM sometimes proposes 160Å which at 3.54Å/px = 45px radius, exceeding
@@ -660,16 +665,20 @@ def task_initialmodel(p, inputs, out, on_line, env):
     dst_particles_dir = os.path.join(jd, "Particles")
     if os.path.isdir(src_particles_dir) and not os.path.exists(dst_particles_dir):
         os.symlink(src_particles_dir, dst_particles_dir)
-    # CPU cap: denovo 3D ref is expensive; keep it short.
-    n_iter = 3
+    # CPU: use SGD-based initial model with limited iterations.
+    # For small datasets (< 5000 particles), this completes in minutes.
+    n_iter = 5
     nr_classes = 1
-    on_line("info", f"initialmodel: capped to iter={n_iter}, K={nr_classes} for CPU")
+    angpix_im = float(p.get("angpix", 4.0))
+    diameter = int(p.get("particle_diameter", 150))
+    on_line("info", f"initialmodel: iter={n_iter}, K={nr_classes}, diam={diameter}Å, angpix={angpix_im}")
     out_root = os.path.join(jd, "init")
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,
            "--iter", str(n_iter), "--K", str(nr_classes),
-           "--denovo_3dref", "--particle_diameter", str(p.get("particle_diameter", 150)),
+           "--denovo_3dref", "--particle_diameter", str(diameter),
            "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "C1")),
-           "--dont_combine_weights_via_disc", "--pool", "3", "--pad", "1"]
+           "--dont_combine_weights_via_disc", "--pool", "3", "--pad", "1",
+           "--oversampling", "1", "--healpix_order", "1"]
     rc = run_cmd(cmd, jd, env, on_line)
     if rc != 0:
         raise RuntimeError("initialmodel failed")
@@ -686,16 +695,20 @@ def task_class3d(p, inputs, out, on_line, env):
     dst_particles_dir = os.path.join(jd, "Particles")
     if os.path.isdir(src_particles_dir) and not os.path.exists(dst_particles_dir):
         os.symlink(src_particles_dir, dst_particles_dir)
-    n_iter = 3
+    n_iter = 5
     nr_classes = min(int(p.get("nr_classes", 3)), 3)
-    on_line("info", f"class3d: capped to iter={n_iter}, K={nr_classes} for CPU")
+    angpix_3d = float(p.get("angpix", 4.0))
+    diameter = int(p.get("particle_diameter", 150))
+    on_line("info", f"class3d: iter={n_iter}, K={nr_classes}, diam={diameter}Å, angpix={angpix_3d}")
     out_root = os.path.join(jd, "run3d")
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,
            "--iter", str(n_iter), "--K", str(nr_classes),
            "--ref", ref, "--ini_high", "30",
-           "--particle_diameter", str(p.get("particle_diameter", 150)),
+           "--particle_diameter", str(diameter),
            "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "C1")),
-           "--dont_combine_weights_via_disc", "--pool", "3", "--pad", "1"]
+           "--dont_combine_weights_via_disc", "--pool", "3", "--pad", "1",
+           "--oversampling", "1", "--healpix_order", "1",
+           "--do_ctf_correction"]
     rc = run_cmd(cmd, jd, env, on_line)
     if rc != 0:
         raise RuntimeError("class3d failed")
@@ -712,16 +725,20 @@ def task_refine3d(p, inputs, out, on_line, env):
     dst_particles_dir = os.path.join(jd, "Particles")
     if os.path.isdir(src_particles_dir) and not os.path.exists(dst_particles_dir):
         os.symlink(src_particles_dir, dst_particles_dir)
-    # CPU cap: auto-refine but limited iterations
-    on_line("info", "refine3d: capped to 3 iterations for CPU")
+    # Auto-refine on CPU with more iterations for better resolution.
+    # healpix_order=2 for finer angular sampling (needed for ~4Å).
+    angpix_r = float(p.get("angpix", 4.0))
+    diameter = int(p.get("particle_diameter", 150))
+    on_line("info", f"refine3d: auto-refine, diam={diameter}Å, angpix={angpix_r}, sym={p.get('symmetry', 'C1')}")
     out_root = os.path.join(jd, "refine")
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,
-           "--auto_refine", "--init_iter", "1", "--iter", "3",
-           "--ref", ref, "--ini_high", "20",
-           "--particle_diameter", str(p.get("particle_diameter", 150)),
+           "--auto_refine", "--init_iter", "1", "--iter", "25",
+           "--ref", ref, "--ini_high", "15",
+           "--particle_diameter", str(diameter),
            "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "C1")),
            "--dont_combine_weights_via_disc", "--pool", "3", "--pad", "1",
-           "--healpix_order", "1", "--oversampling", "1"]
+           "--healpix_order", "2", "--oversampling", "1",
+           "--do_ctf_correction"]
     rc = run_cmd(cmd, jd, env, on_line)
     if rc != 0:
         raise RuntimeError("refine3d failed")

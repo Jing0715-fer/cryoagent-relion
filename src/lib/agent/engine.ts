@@ -1109,13 +1109,12 @@ ${userGoal}
 Pipeline history so far:
 ${jobHistory || "(no jobs completed yet)"}
 
-NOTE: On this CPU-only deployment, the heavy 3D tasks (initialmodel, class3d, refine3d,
-multibody, polish, localres) are AUTOMATICALLY SKIPPED because they require a GPU. When they
-are skipped, the pipeline falls back to the dataset's reference.mrc as the 3D reference, so
-maskcreate and postprocess can still run. Do NOT re-run class2d or try 3D tasks again —
-proceed to maskcreate (using the reference map) and postprocess instead.
+NOTE: 3D tasks (initialmodel, class3d, refine3d) CAN run on this CPU deployment.
+They use reduced iterations but should produce real 3D maps. Proceed with the full
+pipeline: class2d -> initialmodel -> class3d -> refine3d -> maskcreate -> postprocess.
+Only multibody/polish/movierefine require a GPU and are auto-skipped.
 
-The just-completed/skipped job was: ${completedJob.taskType} (${completedJob.status})
+The just-completed job was: ${completedJob.taskType} (${completedJob.status})
 Its output summary: ${JSON.stringify(justOut)}
 
 Decide the SINGLE next RELION job to run (or declare done). If all feasible steps are done, declare done.`,

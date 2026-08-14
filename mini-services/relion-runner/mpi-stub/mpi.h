@@ -210,4 +210,12 @@ static inline int MPI_Cart_shift(MPI_Comm comm, int direction, int disp, int *ra
 static inline int MPI_Dims_create(int nnodes, int ndims, int *dims) { (void)nnodes; for (int i = 0; i < ndims; i++) dims[i] = 1; return 0; }
 static inline int MPI_Comm_create_group(MPI_Comm comm, MPI_Group group, int tag, MPI_Comm *newcomm) { (void)comm; (void)group; (void)tag; *newcomm = 0; return 0; }
 
+
+// MPI_Comm_split_type - needed by RELION 5.0
+static inline int MPI_Comm_split_type(MPI_Comm comm, int split_type, int key, MPI_Info info, MPI_Comm *newcomm) { (void)comm; (void)split_type; (void)key; (void)info; *newcomm = 0; return 0; }
+
+// MPI_COMM_TYPE_SHARED constant
+#define MPI_COMM_TYPE_SHARED 0
+#define MPI_COMM_SLAVES 0
+
 #endif // MPI_STUB_H

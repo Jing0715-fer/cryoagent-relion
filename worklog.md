@@ -859,3 +859,68 @@ ultimately can't overcome the fundamental resolution limit.
 ### GitHub push
 - Phase 19 pushed successfully using provided token
 - Phase 20 changes ready to push
+
+## Phase 21: Grayscale display + LoG retry fix + VLM param context
+
+### User request
+- 几次重试都没有看出参数有调整，效果也依然都很差
+- 需要根据VLM的识别结果给出颗粒大小等参数调整
+- 目前感觉是box太小了
+- 目前用的auto pick是relion内置的吗？
+- 2D分类也要根据颗粒大小来定box大小
+- 2D分类结果展示改成经典蛋白白背景黑
+
+### Changes
+
+**1. Class averages display: viridis → grayscale**
+- `/api/slice` route: replaced viridis LUT with plain grayscale (mode='L')
+- `/api/files` thumbnail: added center-vs-edge brightness detection to auto-invert
+  micrographs (protein=dark in raw mrc → invert to protein=white)
+- Both now use `Image.fromarray(img, mode='L')` for classic cryo-EM display
+
+**2. Autopick retry: force RELION LoG picker (not known coords)**
+- When `_retryCount > 0`, force `method="log"` and DON'T fall back to known coords
+- Previously: retry just copied the same source particles.star → identical result every time
+- Now: retry actually runs `relion_autopick --LoG` with the adjusted diameter/threshold
+- If LoG finds 0 particles on retry, writes empty autopick.star (VLM sees the failure)
+
+**3. Autopick: symlink Micrographs/ into job dir**
+- `relion_autopick` runs with cwd=job_dir but micrograph paths are relative to relion_run/
+- Added symlink of Micrographs/ and Movies/ into the job directory
+
+**4. Disable Topaz (OOM on 4GB CPU)**
+- Topaz pretrained model uses ~2.2GB RAM → causes global OOM kill
+- Disabled Topaz entirely: `use_topaz = False`
+- Default method is now LoG (RELION's built-in Laplacian-of-Gaussian picker)
+- This answers the user's question: yes, we now use RELION's built-in picker
+
+**5. Extract box_size cap raised: 64 → 128**
+- `box = max(32, min(llm_box, 128, max(auto_box * 2, 64)))`
+- Previously: capped at 64px → VLM-suggested larger boxes were ignored
+- Now: allows up to 128px boxes
+- Also changed auto_box multiplier from 1.5x to 2.0x particle diameter
+
+**6. VLM prompts improved with pixel size context**
+- Autopick prompt: shows particle_diameter in both Å and px, explains expected
+  particle size at current pixel size
+- Extract prompt: shows current box_size in both px and Å (field of view),
+  explains ideal box = 2x particle diameter
+- Class2D prompt: explicitly states protein=white/bg=black convention,
+  asks for specific iter/tau/classes suggestions
+- All prompts ask for SPECIFIC numeric suggestions (not vague advice)
+
+**7. Retry message shows old→new param diff**
+- New `formatParamDiff()` function shows only changed params with old→new values
+- e.g. `- particle_diameter: 130 → **150**`
+- Makes it immediately visible what changed between retries
+
+**8. IPv4 fix for runner connectivity**
+- Changed `localhost` → `127.0.0.1` in `runnerReachable()` and `runRunnerJob()`
+- Node.js fetch tries IPv6 (::1) first, but Python runner binds to 0.0.0.0 (IPv4 only)
+- This was causing the engine to silently fall back to the simulated executor
+
+### Sandbox memory constraints
+The 4GB RAM sandbox can't run dev server + runner + RELION + VLM simultaneously
+without OOM. The Topaz disable helps, but heavy class2d runs can still trigger OOM.
+Testing is best done with smaller datasets or via the browser (which spreads the
+load over time via polling).

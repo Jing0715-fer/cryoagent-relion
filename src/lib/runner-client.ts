@@ -37,7 +37,9 @@ export async function runRunnerJob(req: RunnerJobRequest, timeoutMs = 1800000): 
     // Server-side fetch needs an absolute URL. The runner is on localhost:3004
     // and the gateway forwards /run?XTransformPort=3004 to it, but to keep this
     // independent of the gateway we hit the runner port directly from the server.
-    const base = process.env.RUNNER_URL || "http://localhost:3004";
+    // Use 127.0.0.1 instead of localhost — Node.js fetch may try IPv6 (::1)
+    // first, but the Python runner binds to 0.0.0.0 (IPv4 only).
+    const base = process.env.RUNNER_URL || "http://127.0.0.1:3004";
     const res = await fetch(`${base}/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

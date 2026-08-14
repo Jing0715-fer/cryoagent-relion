@@ -77,16 +77,28 @@ elif arr.ndim == 4:
     img = arr[0, arr.shape[1]//2]
 else:
     img = arr.reshape(arr.shape[-2:])
+# Classic cryo-EM convention: protein = white, background = black.
+# Micrographs have protein as dark (low values); invert so protein is bright.
+# Class averages already have protein as high values; no inversion needed.
+# Detect: if the center (likely protein) is darker than the edges (background),
+# invert the contrast.
 mn, mx = float(np.percentile(img, 2)), float(np.percentile(img, 98))
 if mx <= mn: mx = mn + 1
 img = np.clip((img - mn) / (mx - mn), 0, 1)
+# Check if center is darker than edges — if so, invert (micrograph convention)
+h, w = img.shape
+cy, cx = h // 2, w // 2
+center_val = float(img[cy-h//8:cy+h//8, cx-w//8:cx+w//8].mean())
+edge_val = float(np.concatenate([img[:h//8].ravel(), img[-h//8:].ravel()]).mean())
+if center_val < edge_val:
+    img = 1.0 - img
 img = (img * 255).astype(np.uint8)
 h, w = img.shape
 s = min(h, w, 256)
 y0 = max(0, (h - s)//2); x0 = max(0, (w - s)//2)
 img = img[y0:y0+s, x0:x0+s]
 buf = io.BytesIO()
-Image.fromarray(img).save(buf, format='PNG')
+Image.fromarray(img, mode='L').save(buf, format='PNG')
 sys.stdout.buffer.write(buf.getvalue())
 `;
   return new Promise((resolve) => {

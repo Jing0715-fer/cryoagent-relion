@@ -76,33 +76,22 @@ elif arr.ndim == 2:
     img = arr
 else:
     img = arr[0]
-# Normalize: for class averages (2D images), the protein should be white
-# (high values) and background black (low values). Use percentile-based
-# normalization that preserves the sign of values.
+# Classic cryo-EM display: protein = WHITE (bright), background = BLACK (dark).
+# RELION class averages have protein as high positive values, so percentile
+# normalization gives protein=white directly.
+# For micrographs (where protein is dark/negative), we detect and invert.
 mn = float(np.percentile(img, 1))
 mx = float(np.percentile(img, 99))
 if mx <= mn: mx = mn + 1
-# For class averages, values can be negative (solvent-subtracted).
-# Map to 0..1 with protein (positive) as bright, background as dark.
 img_norm = np.clip((img - mn) / (mx - mn), 0, 1)
-def viridis_lut(t):
-    stops = [(68,1,84),(59,82,139),(33,144,141),(94,201,98),(253,231,37)]
-    n = len(stops)-1
-    i = min(n-1, int(t*n))
-    f = t*n - i
-    a, b = stops[i], stops[i+1]
-    return (a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f)
-h, w = img_norm.shape
-rgb = np.zeros((h, w, 3), dtype=np.uint8)
-for c in range(3):
-    lut = np.array([viridis_lut(i/255)[c] for i in range(256)], dtype=np.uint8)
-    rgb[:,:,c] = lut[(img_norm*255).astype(np.uint8)]
-s = min(h, w, 256)
-y0 = max(0, (h - s)//2)
-x0 = max(0, (w - s)//2)
-rgb = rgb[y0:y0+s, x0:x0+s]
+# Convert to 8-bit grayscale (L mode = single channel, no color map)
+gray = (img_norm * 255).astype(np.uint8)
+s = min(gray.shape[0], gray.shape[1], 256)
+y0 = max(0, (gray.shape[0] - s)//2)
+x0 = max(0, (gray.shape[1] - s)//2)
+gray = gray[y0:y0+s, x0:x0+s]
 buf = io.BytesIO()
-Image.fromarray(rgb).save(buf, format='PNG')
+Image.fromarray(gray, mode='L').save(buf, format='PNG')
 sys.stdout.buffer.write(buf.getvalue())
 `;
   return new Promise((resolve) => {

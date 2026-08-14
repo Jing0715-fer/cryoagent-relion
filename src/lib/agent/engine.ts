@@ -45,6 +45,31 @@ function parseJsonLoose(text: string): any | null {
   }
 }
 
+// Format a human-readable diff of parameter changes for the retry message.
+// Shows only the params that changed, with old → new values.
+function formatParamDiff(
+  oldParams: Record<string, any>,
+  newParams: Record<string, any>,
+): string {
+  const keys = new Set([...Object.keys(oldParams), ...Object.keys(newParams)]);
+  const interestingKeys = new Set([
+    "particle_diameter", "threshold", "do_topaz", "do_LoG",
+    "box_size", "extract_size", "rescale",
+    "nr_classes", "iter_nr_iter", "tau_fudge", "do_fast_subsets",
+    "angpix", "bin_factor",
+  ]);
+  const lines: string[] = [];
+  for (const k of keys) {
+    if (!interestingKeys.has(k)) continue;
+    const oldVal = oldParams[k];
+    const newVal = newParams[k];
+    if (oldVal !== newVal && newVal !== undefined) {
+      lines.push(`- \`${k}\`: ${oldVal ?? "(unset)"} → **${newVal}**`);
+    }
+  }
+  return lines.length > 0 ? lines.join("\n") : "(no parameter changes — retrying with same params)";
+}
+
 // Jobs that require an autonomous decision after they finish.
 const DECISION_POINTS: Record<string, string> = {
   class2d: "select",
@@ -250,7 +275,9 @@ export interface TickResult {
 
 async function runnerReachable(): Promise<boolean> {
   try {
-    const base = process.env.RUNNER_URL || "http://localhost:3004";
+    // Use 127.0.0.1 instead of localhost — Node.js fetch may try IPv6 (::1)
+    // first, but the Python runner binds to 0.0.0.0 (IPv4 only).
+    const base = process.env.RUNNER_URL || "http://127.0.0.1:3004";
     const r = await fetch(`${base}/healthz`, { signal: AbortSignal.timeout(1500) });
     return r.ok;
   } catch {
@@ -603,7 +630,12 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
                   data: {
                     projectId,
                     role: "assistant",
-                    content: `🔁 **Retrying ${next.taskType}** (attempt ${newRetryCount}/${MAX_RETRIES}) with adjusted parameters: ${JSON.stringify(verification.suggestedParams)} ${newRetryCount > 1 ? `+ retry strategy #${newRetryCount}` : ""}`,
+                    content: `🔁 **Retrying ${next.taskType}** (attempt ${newRetryCount}/${MAX_RETRIES})
+
+**Parameter changes (old → new):**
+${formatParamDiff(JSON.parse(next.parameters), finalParams)}
+
+${newRetryCount > 1 ? `+ retry strategy #${newRetryCount}` : ""}`,
                     meta: JSON.stringify({
                       jobId: retryJob.id,
                       taskType: next.taskType,

@@ -408,17 +408,33 @@ def task_autopick(p, inputs, out, on_line, env):
       - method="log": RELION's Laplacian-of-Gaussian picker (relion_autopick)
       - method="known": use known coords from the source dataset (fallback for test data)
     The method is chosen from parameters.do_topaz / do_LoG, defaulting to topaz.
+    On retry (_retryCount > 0), force LoG method and DON'T fall back to known
+    coords — otherwise the retry produces identical results and the VLM sees
+    the same bad picking every time.
     """
     mc_star = inputs.get("motioncorr_star") or inputs.get("ctf_star")
     jd = ensure_job_dir(p["projectId"], out["jobId"])
     src = p.get("source_dataset") or os.path.join(PROJECT_ROOT, "data", "projects", "test_d4")
     angpix = p.get("angpix", 1.77)
     diameter = int(p.get("particle_diameter", 130))
+    retry_count = int(p.get("_retryCount", 0) or 0)
 
-    # decide the picking method
-    use_topaz = p.get("do_topaz", True)
-    use_log = p.get("do_LoG", False)
-    method = "topaz" if use_topaz else ("log" if use_log else "known")
+    # On retry, force LoG picking (RELION's built-in picker). Don't use known
+    # coords — that would produce identical results and defeat the purpose of
+    # the retry. Also skip Topaz on retry (it doesn't work on real β-gal data).
+    if retry_count > 0:
+        on_line("info", f"=== AUTOPICK RETRY #{retry_count} === forcing RELION LoG picker (no known-coords fallback)")
+        on_line("info", f"  particle_diameter={diameter}Å ({diameter/float(angpix):.1f}px at {angpix}Å/px), threshold={p.get('threshold', 0.0)}")
+        method = "log"
+    else:
+        # decide the picking method
+        # Topaz uses ~2GB RAM (pretrained model) which causes OOM on this 4GB
+        # CPU deployment. Skip it entirely — use RELION's built-in LoG picker
+        # or known coords instead.
+        use_topaz = False  # disabled: causes OOM on 4GB CPU
+        use_log = p.get("do_LoG", True)  # default to LoG
+        method = "log" if use_log else "known"
+        on_line("info", f"Autopick method: {method} (topaz disabled — OOM risk on 4GB CPU)")
 
     out_star = os.path.join(jd, "autopick.star")
 
@@ -466,9 +482,17 @@ def task_autopick(p, inputs, out, on_line, env):
         # --- RELION Laplacian-of-Gaussian picker
         if not mc_star:
             raise RuntimeError("LoG picker needs a motioncorr/ctf star")
-        on_line("info", f"RELION LoG picking: diameter {diameter-20}-{diameter+20}Å, angpix={angpix}")
-        # relion_autopick needs the micrographs star (not movies)
-        # write a temp micrographs star if needed
+        on_line("info", f"RELION LoG picking: diameter {diameter-20}-{diameter+20}Å, angpix={angpix}, threshold={p.get('threshold', 0.0)}")
+        # relion_autopick runs with cwd=jd, but the micrographs star references
+        # paths like "Micrographs/foo.mrc" which are relative to the relion_run/
+        # directory. Symlink Micrographs/ and Movies/ into the job dir so relion
+        # can resolve them.
+        pd = project_dir(p["projectId"])
+        for link_name in ["Micrographs", "Movies"]:
+            src_link = os.path.join(pd, "relion_run", link_name)
+            dst_link = os.path.join(jd, link_name)
+            if os.path.exists(src_link) and not os.path.exists(dst_link):
+                os.symlink(src_link, dst_link)
         cmd = ["relion_autopick", "--i", mc_star, "--odir", jd + "/",
                "--particle_diameter", str(diameter),
                "--LoG", "--LoG_diam_min", str(max(10, diameter - 20)),
@@ -479,8 +503,13 @@ def task_autopick(p, inputs, out, on_line, env):
                "--gpu", ""]
         rc = run_cmd(cmd, jd, env, on_line)
         if rc != 0:
-            on_line("warn", "RELION LoG failed — falling back to known coords")
-            method = "known"
+            if retry_count > 0:
+                # On retry, DON'T fall back to known coords — report the failure
+                # so the VLM sees the actual LoG picking result (even if empty)
+                on_line("warn", f"RELION LoG failed on retry #{retry_count} — NOT falling back to known coords")
+            else:
+                on_line("warn", "RELION LoG failed — falling back to known coords")
+                method = "known"
 
     if method in ("topaz", "log"):
         # find the output star / coord files
@@ -562,6 +591,12 @@ def task_autopick(p, inputs, out, on_line, env):
 
     # count particles
     n = 0
+    # If out_star doesn't exist (LoG failed on retry and didn't produce output),
+    # write an empty autopick.star so downstream can handle 0 particles gracefully.
+    if not os.path.exists(out_star):
+        on_line("warn", f"autopick.star not found — writing empty star (0 particles)")
+        with open(out_star, "w") as f:
+            f.write("data_particles\n\nloop_\n_rlnCoordinateX #1\n_rlnCoordinateY #2\n_rlnMicrographName #3\n")
     with open(out_star) as f:
         for l in f:
             parts = l.split()
@@ -593,8 +628,14 @@ def task_autopick(p, inputs, out, on_line, env):
                                 n += 1
                     method = "log"
         if n == 0:
-            on_line("warn", "LoG also found 0 particles — falling back to known coords")
-            method = "known"
+            if retry_count > 0:
+                on_line("warn", f"LoG found 0 particles on retry #{retry_count} — NOT falling back to known coords (preserving the LoG result for VLM inspection)")
+                # Write an empty autopick.star so downstream can see 0 particles
+                with open(out_star, "w") as f:
+                    f.write("data_particles\n\nloop_\n_rlnCoordinateX #1\n_rlnCoordinateY #2\n_rlnMicrographName #3\n")
+            else:
+                on_line("warn", "LoG also found 0 particles — falling back to known coords")
+                method = "known"
     if method == "known":
         parts_star = os.path.join(src, "particles.star")
         if os.path.exists(parts_star):
@@ -625,20 +666,21 @@ def task_extract(p, inputs, out, on_line, env):
     angpix = float(p.get("angpix", 4.0))
     diameter = float(p.get("particle_diameter", 120))
     # Compute a reasonable box size from the particle diameter and pixel size.
-    # Box should be ~1.5x the particle diameter in pixels, rounded to a multiple of 2.
-    auto_box = int(diameter / angpix * 1.5)
+    # Box should be ~2x the particle diameter in pixels (so the particle fills
+    # ~50% of the box, leaving room for background/solvent).
+    auto_box = int(diameter / angpix * 2.0)
     auto_box = max(32, (auto_box + 1) & ~1)  # even, min 32
-    # The LLM may propose a larger box (correct for real data) — don't cap it
-    # below 32, but cap above to avoid memory issues on CPU.
-    llm_box = int(p.get("extract_size", auto_box))
-    # Cap the box to at most half the micrograph dimension (so particles near
-    # the edge don't get skipped). We don't know the micrograph size yet, so
-    # cap at 128 for safety (covers 256x256 synthetic + 4096x4048 real data).
-    # Cap box at 64px for CPU memory safety (4GB RAM limit).
-    # At 3.54 A/px, 64px = 227 Å field of view — enough for most particles.
-    box = max(32, min(llm_box, 64, auto_box * 2))
+    # The LLM / VLM may propose a specific box size — use it if reasonable.
+    llm_box = int(p.get("extract_size", p.get("box_size", auto_box)))
+    # Cap box at 128px for CPU memory safety (4GB RAM limit).
+    # At 7.08 A/px, 128px = 902 Å field of view — enough for most particles.
+    # At 3.54 A/px, 128px = 453 Å — still fine.
+    # auto_box * 2 ensures the box is at least 2x the auto-computed size.
+    box = max(32, min(llm_box, 128, max(auto_box * 2, 64)))
     if llm_box != box:
-        on_line("warn", f"extract: box adjusted from {llm_box} to {box} (auto={auto_box}, angpix={angpix}, diam={diameter})")
+        on_line("warn", f"extract: box adjusted from {llm_box} to {box} (auto={auto_box}, angpix={angpix}, diam={diameter}Å, diam_px={diameter/angpix:.1f})")
+    else:
+        on_line("info", f"extract: box={box} angpix={angpix} diameter={diameter}Å ({diameter/angpix:.1f}px) field_of_view={box*angpix:.0f}Å")
     # Rescale: keep same as box unless explicitly different
     rescale_raw = int(p.get("rescale", box)) if p.get("do_rescale", True) else box
     # If the LLM proposed an absurdly small rescale (e.g. 1), use auto_box

@@ -308,20 +308,29 @@ async function verifyAutopick(projectId: string, job: VerifiableJob): Promise<Ve
     return { passed: true, score: 7, reasoning: "Picking overlay render failed — skipping verification", issues: ["render-failed"], suggestedParams: {} };
   }
   const params = JSON.parse(job.parameters);
+  const angpix = Number(params.angpix) || Number(params.import_angpix) || 0;
   const prompt = `You are a cryo-EM data-processing expert verifying particle picking quality.
 
-This image shows a cryo-EM micrograph with GREEN CIRCLES drawn at the positions of auto-picked particles. The particles are protein molecules — in cryo-EM micrographs they appear as DARK SPOTS on a brighter background (or bright spots if contrast-inverted).
+This image shows a cryo-EM micrograph with GREEN CIRCLES drawn at the positions of auto-picked particles. The particles are protein molecules — in cryo-EM micrographs they appear as DARK SPOTS on a brighter background.
 
-Picking parameters used:
-- method: ${params.do_topaz ? "topaz (deep learning)" : params.do_LoG ? "LoG (Laplacian-of-Gaussian)" : "known coords"}
-- particle_diameter: ${params.particle_diameter} Å
+CURRENT PARAMETERS:
+- pixel size: ${angpix} Å/px
+- method: ${params.do_topaz ? "topaz (deep learning)" : params.do_LoG ? "LoG (RELION built-in Laplacian-of-Gaussian)" : "known coords (copied from source)"}
+- particle_diameter: ${params.particle_diameter} Å (= ${(Number(params.particle_diameter) / angpix).toFixed(1)} px at ${angpix} Å/px)
 - threshold: ${params.threshold ?? "n/a"}
 
+CONTEXT: At ${angpix} Å/px, a typical protein particle of 100-200 Å diameter spans ${((100 / angpix).toFixed(0))}-${((200 / angpix).toFixed(0))} px. The green circles should match the visible particle size — if circles are much larger or smaller than the dark spots, the diameter is wrong.
+
 Evaluate:
-1. Are the green circles placed on actual protein particles (visible dark/bright spots), or on empty background / noise?
-2. Is the picking density reasonable (not too sparse, not overcrowded)?
-3. Are obvious particles being missed (false negatives)?
-4. Are non-particle features being picked (false positives — e.g. ice contamination, edges)?
+1. Are the green circles placed on actual protein particles (visible dark spots), or on empty background/noise?
+2. Is the CIRCLE SIZE appropriate — do the circles match the size of visible particles? If particles look ~${((130 / angpix).toFixed(0))} px wide, is the diameter setting close to that?
+3. Is the picking density reasonable (not too sparse, not overcrowded)?
+4. Are obvious particles being missed (false negatives)?
+
+CRITICAL: If the picking is bad, suggest SPECIFIC parameter changes:
+- particle_diameter (in Å): measure the visible particle size in the image and suggest the right diameter
+- threshold: if too many false positives, increase; if too few picks, decrease
+- do_LoG: true to use RELION's built-in LoG picker, false to use Topaz
 
 Respond in EXACTLY this JSON format (no markdown):
 {
@@ -329,7 +338,7 @@ Respond in EXACTLY this JSON format (no markdown):
   "passed": <true if score>=7 else false>,
   "reasoning": "<2-3 sentence explanation>",
   "issues": ["<issue 1>", "<issue 2>"],
-  "suggested_params": {"particle_diameter": <int>, "threshold": <float>, "do_topaz": <bool>, "do_LoG": <bool>}
+  "suggested_params": {"particle_diameter": <int in Å, e.g. 130>, "threshold": <float 0-1>, "do_topaz": <bool>, "do_LoG": <bool>}
 }`;
   const result = await callVLM(prompt, [tmpPng]);
   try { fs.unlinkSync(tmpPng); } catch {}
@@ -349,19 +358,29 @@ async function verifyExtract(projectId: string, job: VerifiableJob): Promise<Ver
     return { passed: true, score: 7, reasoning: "Particle render failed — skipping", issues: ["render-failed"], suggestedParams: {} };
   }
   const params = JSON.parse(job.parameters);
+  const angpix = Number(params.angpix) || Number(params.import_angpix) || 0;
+  const currentBox = Number(params.box_size) || Number(params.extract_size) || 0;
   const prompt = `You are a cryo-EM expert verifying particle extraction quality.
 
-This image shows a GRID of the first 12 extracted particle boxes from a particles.mrcs stack. Each cell is a small box centered on a picked particle.
+This image shows a GRID of the first 12 extracted particle boxes from a particles.mrcs stack. Each cell is a small box centered on a picked particle. The display uses the classic cryo-EM convention: PROTEIN = WHITE (bright), BACKGROUND = BLACK (dark).
 
-Extraction parameters used:
-- box_size: ${params.box_size || params.extract_size} px
-- pixel size: ${params.angpix || "unknown"} Å/px
+CURRENT PARAMETERS:
+- box_size: ${currentBox} px (= ${(currentBox * angpix).toFixed(0)} Å field of view at ${angpix} Å/px)
+- pixel size: ${angpix} Å/px
+- particle_diameter: ${params.particle_diameter} Å (= ${(Number(params.particle_diameter) / angpix).toFixed(1)} px)
+
+CONTEXT: The box should be ~2x the particle diameter in pixels so the particle fills ~50% of the box. For a ${params.particle_diameter} Å particle at ${angpix} Å/px, the ideal box is ~${Math.round(Number(params.particle_diameter) / angpix * 2)} px.
 
 Evaluate:
-1. Do the boxes contain visible protein density (centered darker/brighter regions)?
+1. Do the boxes contain visible WHITE protein density (bright centered regions)?
 2. Are the particles centered in the boxes (not clipped at edges)?
-3. Is the box size appropriate (particle fills ~60-80% of the box, not too small/large)?
-4. Are there junk boxes (empty, ice contamination, or multiple particles)?
+3. Is the box size appropriate? If the particle fills <30% of the box, the box is TOO LARGE. If the particle is clipped at edges, the box is TOO SMALL.
+4. Are there junk boxes (empty/black, or ice contamination)?
+
+CRITICAL: If the box size is wrong, suggest a SPECIFIC new box_size:
+- If particle is clipped → increase box_size
+- If particle fills <30% of box → decrease box_size
+- Ideal: particle fills 40-60% of the box
 
 Respond in EXACTLY this JSON format:
 {
@@ -369,7 +388,7 @@ Respond in EXACTLY this JSON format:
   "passed": <true if score>=7>,
   "reasoning": "<explanation>",
   "issues": ["..."],
-  "suggested_params": {"box_size": <int>, "particle_diameter": <int>}
+  "suggested_params": {"box_size": <int in px, e.g. 96>, "particle_diameter": <int in Å, e.g. 130>}
 }`;
   const result = await callVLM(prompt, [tmpPng]);
   try { fs.unlinkSync(tmpPng); } catch {}
@@ -392,21 +411,29 @@ async function verifyClass2D(projectId: string, job: VerifiableJob): Promise<Ver
   }
   const prompt = `You are a cryo-EM expert verifying 2D classification quality.
 
-This image shows a GRID of 2D class averages produced by RELION relion_refine. Each cell is one class average (the average of all particles assigned to that class). For a good classification, the class averages should show:
+This image shows a GRID of 2D class averages produced by RELION relion_refine. Each cell is one class average (the average of all particles assigned to that class). The display uses the classic cryo-EM convention: PROTEIN = WHITE (bright), BACKGROUND = BLACK (dark).
+
+For a good classification, the class averages should show:
 - Clear, distinct views of the particle (different orientations)
 - Sharp features (not blurry blobs)
-- High signal-to-noise (the particle should be clearly visible against background)
+- High signal-to-noise (the particle should be clearly WHITE against BLACK background)
 
-Classification parameters used:
+CURRENT PARAMETERS:
 - nr_classes: ${nrClasses}
 - iterations: ${params.iter_nr_iter}
 - tau_fudge (regularization T): ${params.tau_fudge}
 
 Evaluate:
-1. Do the class averages show CLEAR particle views with distinguishable features?
-2. Are there junk classes (pure noise, blurred, or empty)?
+1. Do the class averages show CLEAR WHITE particle views with distinguishable features?
+2. Are there junk classes (pure noise, blurred, or empty/black)?
 3. Is the number of good classes reasonable (at least 2-3 clearly-resolved views)?
 4. Are the features sharp enough to suggest the particles are well-aligned?
+5. If ALL classes look like noise or blurry blobs, the problem is likely upstream (bad picking or bad box size) — note this in issues.
+
+If the classification is poor, suggest parameter changes:
+- iter_nr_iter: more iterations (5→10→15) for better convergence
+- tau_fudge: higher T (2→4) gives smoother/sharper classes; lower T gives more diverse classes
+- nr_classes: fewer classes (10→5) concentrates particles into better averages
 
 Respond in EXACTLY this JSON format:
 {

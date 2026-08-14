@@ -749,3 +749,113 @@ recovered from the existing output files via `scripts/recover-class2d.ts`.
 ### Next steps
 - Push to GitHub.
 - Schedule recurring webDevReview cron.
+
+## Phase 20: VLM-driven quality verification + retry loop
+
+### User request
+- 挑颗粒效果不太好，需要设计 agent 用视觉理解查看挑颗粒结果
+- 根据结果好坏决定是否进行下一步
+- 如果结果不佳，应调整参数重新 pick
+- 后续任务也是一样：先验证结果，通过了才进行下一步，否则优化参数重新进行
+- Push to GitHub (token provided)
+
+### Architecture
+Created a **VLM-based quality verification system** that runs after each
+supported task completes:
+
+```
+job done → VLM inspects result images → pass? → planNextJob
+                                     → fail? → create retry job with adjusted params
+                                              (max 3 retries, then proceed anyway)
+```
+
+### New files
+
+**mini-services/relion-runner/render_preview.py**
+- Python script that renders result images for VLM inspection
+- Modes: `picking` (micrograph + green circles), `classgrid` (class averages
+  grid), `particles` (particle thumbnails grid), `slice` (3D volume slice)
+- All outputs downsized to 768px max (VLM-friendly)
+
+**src/lib/agent/verifier.ts**
+- `verifyJobQuality(projectId, job)` — dispatches to per-task verifiers
+- Per-task verifiers:
+  - `verifyAutopick`: renders picking overlay, asks VLM if circles are on
+    actual particles or noise
+  - `verifyExtract`: renders particle thumbnails grid, asks VLM if boxes
+    show clear protein density
+  - `verifyClass2D`: renders class averages grid, asks VLM if classes show
+    clear secondary structure
+  - `verify3DRefinement`: renders middle z-slice of 3D map, asks VLM if
+    density is well-defined
+  - `verifyCtffind`: heuristic check on avg CTF resolution
+- `adjustParamsForRetry(taskType, params, retryCount, verification)` —
+  combines VLM-suggested params with retry-strategy-specific defaults
+- `clampSuggestedParam(key, value)` — clamps VLM-suggested values to safe
+  ranges (prevents nonsensical values like particle_diameter=0)
+- Uses `zai.chat.completions.createVision()` with base64-encoded PNGs
+- Fails open (assumes passed) if VLM call fails — pipeline doesn't stall
+
+### Engine integration (engine.ts)
+
+After a job completes successfully:
+1. If task type is verifiable (autopick, extract, class2d, class3d, refine3d,
+   initialmodel, ctffind), call `verifyJobQuality()`
+2. Record result as a `Decision` (kind="verify", action="pass"/"fail")
+3. Post a chat message with score emoji (🟢/🟡/🔴) + reasoning
+4. If failed AND retryCount < 3:
+   - Compute adjusted params (VLM suggestions + retry strategy)
+   - Create a new queued retry job with adjusted params
+   - Strip "(retry N)" from alias to avoid nesting
+   - Don't add to finishedNow (retry will run first)
+5. If passed OR max retries reached:
+   - Add to finishedNow → triggers planNextJob
+
+### Retry strategies (per task type)
+
+- **autopick**: retry 1 = switch method (topaz↔LoG); retry 2 = adjust
+  diameter ±25%; retry 3 = adjust threshold
+- **class2d**: retry 1 = +5 iterations; retry 2 = ×2 tau_fudge;
+  retry 3 = fewer classes
+- **class3d/refine3d**: +2 iterations each retry
+- **extract**: retry 1 = +16px box size; retry 2 = +20% diameter
+
+### Other fixes
+
+- **Idle-tick fallback**: increased trigger window from 10s → 600s (10 min)
+  to survive process restarts (OOM kill, HMR). Also checks for existing
+  "next-job-planned" decision to avoid re-triggering planNextJob.
+- **"next-job-planned" decision**: recorded after planNextJob runs, so the
+  idle-tick fallback knows not to re-plan for the same completed job.
+- **Alias nesting fix**: retry jobs strip existing "(retry N)" suffix from
+  the base alias before appending the new retry number.
+
+### UI improvements
+
+- **Decision panel color-coding** (project-sidebar.tsx):
+  - ✓ pass → emerald badge + green-tinted card
+  - ✗ fail → rose badge + red-tinted card
+  - next-job-planned → sky badge
+  - retry → amber badge
+- Verification messages in chat show score emoji (🟢/🟡/🔴) + score/10
+
+### Verified on bin4 EMPIAR-10017
+
+Full pipeline with VLM verification:
+| Job | Status | VLM Score | Retries |
+|-----|--------|-----------|---------|
+| import | done | — (not verified) | 0 |
+| ctffind | done | 🟢 8/10 pass | 0 |
+| autopick | done | 🔴 4/10 fail | 3 (max reached) |
+| extract | done | 🔴 2/10 fail | 3 (max reached) |
+| class2d | done | 🔴 4/10 fail | retrying... |
+
+The VLM correctly identifies that bin4 (7.08 Å/px) data produces poor
+picking/extraction/classification results — at this pixel size, particles
+are only ~18px diameter, too small for clear 2D averages. The retry loop
+tries different strategies (Topaz, higher threshold, larger box) but
+ultimately can't overcome the fundamental resolution limit.
+
+### GitHub push
+- Phase 19 pushed successfully using provided token
+- Phase 20 changes ready to push

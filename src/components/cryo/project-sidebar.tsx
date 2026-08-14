@@ -74,22 +74,44 @@ export function ProjectSidebar({ projects, selectedId, onSelect, onNew, decision
               The agent will record its decisions here as the pipeline runs.
             </div>
           ) : (
-            decisions.map((d) => (
-              <div key={d.id} className="rounded-md border border-border/50 bg-muted/20 px-2 py-1.5">
-                <div className="flex items-center gap-1.5 mb-0.5">
-                  <span className="text-[9px] uppercase tracking-wider px-1 py-0.5 rounded bg-amber-500/20 text-amber-300">
-                    {d.kind}
-                  </span>
-                  <span className="text-[10px] text-muted-foreground ml-auto">
-                    {new Date(d.createdAt).toLocaleTimeString("en-US", { hour12: false })}
-                  </span>
+            decisions.map((d) => {
+              const isVerify = d.kind === "verify";
+              const isPass = isVerify && d.action === "pass";
+              const isFail = isVerify && d.action === "fail";
+              const isRetry = d.kind === "retry" || (d.meta && typeof d.meta === "object" && (d.meta as any).kind === "job-retry");
+              const isNextJob = d.kind === "next-job-planned";
+              const badgeColor = isPass
+                ? "bg-emerald-500/20 text-emerald-300"
+                : isFail
+                ? "bg-rose-500/20 text-rose-300"
+                : isRetry
+                ? "bg-amber-500/20 text-amber-300"
+                : isNextJob
+                ? "bg-sky-500/20 text-sky-300"
+                : "bg-amber-500/20 text-amber-300";
+              return (
+                <div
+                  key={d.id}
+                  className={cn(
+                    "rounded-md border px-2 py-1.5",
+                    isFail ? "border-rose-500/30 bg-rose-500/5" : isPass ? "border-emerald-500/30 bg-emerald-500/5" : "border-border/50 bg-muted/20",
+                  )}
+                >
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span className={cn("text-[9px] uppercase tracking-wider px-1 py-0.5 rounded", badgeColor)}>
+                      {isPass ? "✓ pass" : isFail ? "✗ fail" : d.kind}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground ml-auto">
+                      {new Date(d.createdAt).toLocaleTimeString("en-US", { hour12: false })}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-foreground/90 leading-snug">{d.reason}</div>
+                  {d.action && !isVerify && (
+                    <div className="text-[10px] text-muted-foreground font-mono mt-0.5">→ {d.action}</div>
+                  )}
                 </div>
-                <div className="text-[11px] text-foreground/90 leading-snug">{d.reason}</div>
-                {d.action && (
-                  <div className="text-[10px] text-muted-foreground font-mono mt-0.5">→ {d.action}</div>
-                )}
-              </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>

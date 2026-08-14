@@ -521,7 +521,115 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
             meta: JSON.stringify({ jobId: next.id, taskType: next.taskType, kind: "job-done", real: true }),
           },
         });
-        finishedNow.push(next.id);
+
+        // ---- VLM quality verification + retry loop ----
+        // After a supported task completes, run the vision-based verifier to
+        // judge result quality. If it fails AND we haven't exceeded MAX_RETRIES,
+        // create a retry job with adjusted params instead of advancing.
+        const { verifyJobQuality, adjustParamsForRetry, getRetryCount, setRetryCount, MAX_RETRIES } = await import("@/lib/agent/verifier");
+        const verifiableTasks = new Set(["autopick", "extract", "class2d", "class3d", "refine3d", "initialmodel", "ctffind"]);
+        let verificationPassed = true;
+        if (verifiableTasks.has(next.taskType)) {
+          const jobForVerify = await db.job.findUnique({
+            where: { id: next.id },
+            select: { id: true, taskType: true, parameters: true, primaryOutput: true, outputFiles: true, alias: true },
+          });
+          if (jobForVerify) {
+            const verification = await verifyJobQuality(projectId, {
+              id: jobForVerify.id,
+              taskType: jobForVerify.taskType,
+              parameters: jobForVerify.parameters,
+              primaryOutput: jobForVerify.primaryOutput,
+              outputFiles: jobForVerify.outputFiles,
+              alias: jobForVerify.alias,
+            });
+            // record the verification as a Decision (kind="verify")
+            await db.decision.create({
+              data: {
+                projectId,
+                jobId: next.id,
+                kind: "verify",
+                reason: verification.reasoning,
+                action: verification.passed ? "pass" : "fail",
+                meta: JSON.stringify({
+                  score: verification.score,
+                  issues: verification.issues,
+                  suggestedParams: verification.suggestedParams,
+                  taskType: next.taskType,
+                }),
+              },
+            });
+            const scoreEmoji = verification.score >= 8 ? "🟢" : verification.score >= 6 ? "🟡" : "🔴";
+            await db.message.create({
+              data: {
+                projectId,
+                role: "assistant",
+                content: verification.passed
+                  ? `${scoreEmoji} **${next.taskType} verification passed** (score ${verification.score}/10): ${verification.reasoning}`
+                  : `${scoreEmoji} **${next.taskType} verification FAILED** (score ${verification.score}/10): ${verification.reasoning}${verification.issues.length ? `\n\nIssues: ${verification.issues.join("; ")}` : ""}`,
+                meta: JSON.stringify({
+                  jobId: next.id,
+                  taskType: next.taskType,
+                  kind: "job-verified",
+                  score: verification.score,
+                  passed: verification.passed,
+                  issues: verification.issues,
+                }),
+              },
+            });
+
+            if (!verification.passed) {
+              const currentParams = JSON.parse(next.parameters);
+              const currentRetry = getRetryCount(currentParams);
+              if (currentRetry < MAX_RETRIES) {
+                const newRetryCount = currentRetry + 1;
+                const adjusted = adjustParamsForRetry(next.taskType, currentParams, newRetryCount, verification);
+                const finalParams = setRetryCount(adjusted, newRetryCount);
+                // Strip any existing "(retry N)" suffix from the alias to
+                // avoid nesting like "foo (retry 1) (retry 2) (retry 3)".
+                const baseAlias = (next.alias || next.taskType).replace(/\s*\(retry \d+\)\s*$/g, "").trim();
+                // create a retry job depending on the same upstream jobs
+                const retryJob = await db.job.create({
+                  data: {
+                    workflowId: workflow.id,
+                    taskType: next.taskType,
+                    alias: `${baseAlias} (retry ${newRetryCount})`,
+                    status: "queued",
+                    parameters: JSON.stringify(finalParams),
+                    inputJobIds: next.inputJobIds,
+                  },
+                });
+                await db.message.create({
+                  data: {
+                    projectId,
+                    role: "assistant",
+                    content: `🔁 **Retrying ${next.taskType}** (attempt ${newRetryCount}/${MAX_RETRIES}) with adjusted parameters: ${JSON.stringify(verification.suggestedParams)} ${newRetryCount > 1 ? `+ retry strategy #${newRetryCount}` : ""}`,
+                    meta: JSON.stringify({
+                      jobId: retryJob.id,
+                      taskType: next.taskType,
+                      kind: "job-retry",
+                      retryOf: next.id,
+                      retryCount: newRetryCount,
+                    }),
+                  },
+                });
+                verificationPassed = false; // don't advance — let the retry run
+              } else {
+                await db.message.create({
+                  data: {
+                    projectId,
+                    role: "assistant",
+                    content: `⚠️ ${next.taskType} verification failed but max retries (${MAX_RETRIES}) reached — proceeding to next step with current results.`,
+                    meta: JSON.stringify({ jobId: next.id, kind: "verify-max-retries", taskType: next.taskType }),
+                  },
+                });
+              }
+            }
+          }
+        }
+        if (verificationPassed) {
+          finishedNow.push(next.id);
+        }
       } else {
         await db.job.update({
           where: { id: next.id },
@@ -571,12 +679,20 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
     if (triggerIds.length === 0 && !hasQueued && !hasRunning && refreshed.length > 0) {
       if (terminal.length > 0) {
         const lastTerminal = terminal[terminal.length - 1];
-        // only trigger if this job was completed very recently (within 5s)
-        // to avoid re-triggering on every idle tick
+        // trigger if this job was completed recently (within 10min) to allow
+        // for process restarts (OOM kill, HMR, etc.) without stalling the pipeline.
+        // Also check that no "verify" or "next-job-planned" decision already
+        // exists for this job to avoid re-triggering on every idle tick.
         if (lastTerminal.finishedAt) {
           const ageSec = (Date.now() - lastTerminal.finishedAt.getTime()) / 1000;
-          if (ageSec < 10) {
-            triggerIds.push(lastTerminal.id);
+          if (ageSec < 600) {
+            // Check if we already planned the next job for this terminal job
+            const existingDecision = await db.decision.findFirst({
+              where: { jobId: lastTerminal.id, kind: { in: ["next-job-planned", "verify"] } },
+            });
+            if (!existingDecision) {
+              triggerIds.push(lastTerminal.id);
+            }
           }
         }
       }
@@ -587,6 +703,18 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
       // plan next if the last job succeeded or was skipped (not failed)
       if (lastJob && (lastJob.status === "done" || lastJob.status === "skipped")) {
         const r = await planNextJob(projectId, lastId);
+        // Record that we planned the next step for this job so the idle-tick
+        // fallback doesn't re-trigger planNextJob on every subsequent tick.
+        await db.decision.create({
+          data: {
+            projectId,
+            jobId: lastId,
+            kind: "next-job-planned",
+            reason: `Planned next job after ${lastJob.taskType} (${lastJob.status})`,
+            action: r.created ? "created-next" : "done",
+            meta: JSON.stringify({ completedJobId: lastId, created: r.created, done: r.done }),
+          },
+        });
         if (r.done) {
           workflowStatus = "done";
         }

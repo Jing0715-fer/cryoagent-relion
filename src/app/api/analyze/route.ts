@@ -90,7 +90,13 @@ export async function GET(req: NextRequest) {
   if (!job) return NextResponse.json({ error: "job not found" }, { status: 404 });
 
   const projectRoot = path.resolve(process.cwd(), "data", "projects", projectId);
-  const jobDir = path.join(projectRoot, job.primaryOutput ? path.dirname(job.primaryOutput) : "");
+  // jobDir: the directory containing the job's output files.
+  // primaryOutput may be absolute or relative to projectRoot.
+  const jobDir = job.primaryOutput
+    ? (path.isAbsolute(job.primaryOutput)
+       ? path.dirname(job.primaryOutput)
+       : path.join(projectRoot, path.dirname(job.primaryOutput)))
+    : "";
   const outputFiles: { path: string }[] = job.outputFiles ? JSON.parse(job.outputFiles) : [];
 
   const result: AnalyzeResult = {

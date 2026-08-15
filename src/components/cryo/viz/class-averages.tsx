@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { Badge } from "@/components/ui/badge";
 import { GridSkeleton } from "./skeletons";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Icon } from "../icon";
 
 interface ModelClass {
   classNumber: number;
@@ -21,68 +23,130 @@ interface Props {
 // Class-averages gallery + per-class metrics table — CryoSPARC-style.
 // Renders the 2D class averages from the _classes.mrcs stack as a grid of
 // thumbnails, with a metrics table below (distribution, resolution, accuracy).
+//
+// Features:
+// - Iteration selector: view any completed iteration's class averages
+// - Live polling: auto-refreshes every 5s while class2d is running
 export function ClassAveragesGallery({ projectId, jobId }: Props) {
   const [classes, setClasses] = useState<ModelClass[]>([]);
   const [loading, setLoading] = useState(true);
   const [hasClassesMrcs, setHasClassesMrcs] = useState(false);
   const [nParticles, setNParticles] = useState(0);
   const [classesMrcsPath, setClassesMrcsPath] = useState<string | null>(null);
+  const [allClassesFiles, setAllClassesFiles] = useState<{ path: string; iter: number }[]>([]);
+  const [selectedIter, setSelectedIter] = useState<number | null>(null);
+  const [jobStatus, setJobStatus] = useState<string>("done");
 
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      try {
-        // Fetch analyze + job-files in parallel
-        const [analyzeRes, filesRes] = await Promise.all([
-          fetch(`/api/analyze?projectId=${projectId}&jobId=${jobId}`).then(r => r.json()),
-          fetch(`/api/job-files?projectId=${projectId}`).then(r => r.json()),
-        ]);
-        if (cancelled) return;
-        setClasses(analyzeRes.modelClasses || []);
-        setHasClassesMrcs(!!analyzeRes.hasClassesMrcs);
-        setNParticles(analyzeRes.nParticles || 0);
-        // Find the latest classes.mrcs path from the job-files response
-        const group = (filesRes.groups || []).find((g: any) => g.jobId === jobId);
-        if (group) {
-          const classesFiles = (group.files || []).filter((f: any) => /_classes\.mrcs$/.test(f.path));
-          if (classesFiles.length > 0) {
-            // Sort by iteration number and take the latest
-            classesFiles.sort((a: any, b: any) => {
-              const aNum = parseInt(a.path.match(/run_it(\d+)_/)?.[1] || "0");
-              const bNum = parseInt(b.path.match(/run_it(\d+)_/)?.[1] || "0");
-              return aNum - bNum;
-            });
-            setClassesMrcsPath(classesFiles[classesFiles.length - 1].path);
+  const load = useCallback(async () => {
+    try {
+      const [analyzeRes, filesRes] = await Promise.all([
+        fetch(`/api/analyze?projectId=${projectId}&jobId=${jobId}`).then(r => r.ok ? r.json() : null),
+        fetch(`/api/job-files?projectId=${projectId}`).then(r => r.ok ? r.json() : null),
+      ]);
+      if (!analyzeRes || !filesRes) return;
+
+      setClasses(analyzeRes.modelClasses || []);
+      setHasClassesMrcs(!!analyzeRes.hasClassesMrcs);
+      setNParticles(analyzeRes.nParticles || 0);
+
+      // Find ALL classes.mrcs files (one per iteration)
+      const group = (filesRes.groups || []).find((g: any) => g.jobId === jobId);
+      if (group) {
+        setJobStatus(group.status || "done");
+        const classesFiles = (group.files || [])
+          .filter((f: any) => /_classes\.mrcs$/.test(f.path))
+          .map((f: any) => ({
+            path: f.path,
+            iter: parseInt(f.path.match(/run_it(\d+)_/)?.[1] || "0"),
+          }))
+          .sort((a: any, b: any) => a.iter - b.iter);
+        setAllClassesFiles(classesFiles);
+
+        // Select the latest iteration (or keep user's selection)
+        if (classesFiles.length > 0) {
+          const latest = classesFiles[classesFiles.length - 1];
+          if (selectedIter === null || selectedIter === -1) {
+            setSelectedIter(latest.iter);
+            setClassesMrcsPath(latest.path);
+          } else {
+            const found = classesFiles.find((f: any) => f.iter === selectedIter);
+            if (found) setClassesMrcsPath(found.path);
+            else { setSelectedIter(latest.iter); setClassesMrcsPath(latest.path); }
           }
         }
-      } catch {
-        if (!cancelled) setClasses([]);
-      } finally {
-        if (!cancelled) setLoading(false);
       }
+    } catch {
+      // transient — retry on next poll
+    } finally {
+      setLoading(false);
     }
+  }, [projectId, jobId, selectedIter]);
+
+  useEffect(() => {
     load();
-    return () => { cancelled = true; };
-  }, [projectId, jobId]);
+    // Poll every 5s while job is running, otherwise poll once more then stop
+    const iv = setInterval(() => {
+      if (jobStatus === "running" || jobStatus === "queued") {
+        load();
+      }
+    }, 5000);
+    return () => clearInterval(iv);
+  }, [load, jobStatus]);
+
+  // Update classesMrcsPath when iteration changes
+  useEffect(() => {
+    if (selectedIter !== null && allClassesFiles.length > 0) {
+      const found = allClassesFiles.find(f => f.iter === selectedIter);
+      if (found) setClassesMrcsPath(found.path);
+    }
+  }, [selectedIter, allClassesFiles]);
 
   if (loading) return <GridSkeleton count={10} />;
-  if (!classes.length) return (
+  if (!classes.length && !allClassesFiles.length) return (
     <div className="text-xs text-muted-foreground p-4 text-center">
-      No class data — class2d did not produce a model.star.
+      No class data — class2d did not produce a model.star yet.
+      {jobStatus === "running" && <span className="text-emerald-400"> Running, waiting for first iteration...</span>}
     </div>
   );
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-between">
+      {/* Header: particle count + iteration selector */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="text-[11px] text-muted-foreground">
           {nParticles} particles · {classes.length} classes
         </div>
-        {hasClassesMrcs && (
-          <Badge variant="outline" className="text-[9px] border-emerald-500/40 text-emerald-300">
-            classes.mrcs present
-          </Badge>
-        )}
+        <div className="flex items-center gap-2">
+          {jobStatus === "running" && (
+            <Badge variant="outline" className="text-[9px] border-emerald-500/40 text-emerald-300 animate-pulse">
+              <Icon name="Loader2" className="h-2.5 w-2.5 mr-1 animate-spin" />
+              live
+            </Badge>
+          )}
+          {hasClassesMrcs && (
+            <Badge variant="outline" className="text-[9px] border-emerald-500/40 text-emerald-300">
+              classes.mrcs
+            </Badge>
+          )}
+          {allClassesFiles.length > 0 && (
+            <Select
+              value={String(selectedIter ?? -1)}
+              onValueChange={(v) => setSelectedIter(v === "-1" ? null : parseInt(v))}
+            >
+              <SelectTrigger className="h-7 w-[140px] text-[11px]">
+                <SelectValue placeholder="Iteration" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="-1" className="text-[11px]">Latest</SelectItem>
+                {allClassesFiles.map((f) => (
+                  <SelectItem key={f.iter} value={String(f.iter)} className="text-[11px]">
+                    Iteration {f.iter}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </div>
       </div>
 
       {/* class averages thumbnails grid */}

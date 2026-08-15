@@ -655,17 +655,54 @@ def task_autopick(p, inputs, out, on_line, env):
                    "--threshold", str(p.get("threshold", 0.0))]
             rc = run_cmd(cmd, jd, env, on_line)
             if rc == 0:
-                # find the autopick star that relion wrote
-                autopick_stars = sorted(glob.glob(os.path.join(jd, "autopick*.star")))
-                if autopick_stars:
-                    shutil.copy(autopick_stars[-1], out_star)
+                # relion_autopick writes per-micrograph star files in
+                # Micrographs/<name>_autopick.star, plus a summary autopick.star
+                # that may be empty. Merge all per-micrograph stars into out_star.
+                per_mic_stars = sorted(glob.glob(os.path.join(jd, "Micrographs", "*_autopick.star")))
+                if not per_mic_stars:
+                    per_mic_stars = sorted(glob.glob(os.path.join(jd, "**", "*_autopick.star"), recursive=True))
+                if per_mic_stars:
+                    # Merge all per-micrograph coords into one star
+                    with open(out_star, "w") as outf:
+                        outf.write("data_particles\n\nloop_\n")
+                        outf.write("_rlnCoordinateX #1\n_rlnCoordinateY #2\n_rlnMicrographName #3\n")
+                        for ps in per_mic_stars:
+                            mic_name = os.path.basename(ps).replace("_autopick.star", ".mrc")
+                            with open(ps) as f:
+                                in_data = False
+                                for l in f:
+                                    s = l.strip()
+                                    if s.startswith("data_"):
+                                        in_data = s.startswith("data_particles") or s.startswith("data_coords")
+                                        continue
+                                    if not in_data or s.startswith("#") or s.startswith("_") or s.startswith("loop"):
+                                        continue
+                                    parts = s.split()
+                                    if len(parts) >= 2:
+                                        try:
+                                            x, y = float(parts[0]), float(parts[1])
+                                            outf.write(f"{x:.1f} {y:.1f} Micrographs/{mic_name}\n")
+                                        except: pass
                     n = 0
                     with open(out_star) as f:
                         for l in f:
                             parts = l.split()
-                            if len(parts) >= 4 and parts[0].replace(".", "").isdigit():
+                            if len(parts) >= 3 and parts[0].replace(".", "").isdigit():
                                 n += 1
                     method = "log"
+                    on_line("info", f"LoG: merged {n} particles from {len(per_mic_stars)} micrograph star files")
+                else:
+                    # fallback: try the summary autopick.star
+                    autopick_stars = sorted(glob.glob(os.path.join(jd, "autopick*.star")))
+                    if autopick_stars:
+                        shutil.copy(autopick_stars[-1], out_star)
+                        n = 0
+                        with open(out_star) as f:
+                            for l in f:
+                                parts = l.split()
+                                if len(parts) >= 4 and parts[0].replace(".", "").isdigit():
+                                    n += 1
+                        method = "log"
         if n == 0:
             if retry_count > 0:
                 on_line("warn", f"LoG found 0 particles on retry #{retry_count}. Falling back to known coords so extract has particles to work with (empty coords would stall the pipeline).")

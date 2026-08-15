@@ -1,0 +1,675 @@
+     1→// RELION task registry — comprehensive knowledge base of all RELION GUI tasks.
+     2→// Reference: RELION 3.1 / 4.0 (https://github.com/3dem/relion)
+     3→//
+     4→// Each task definition includes:
+     5→//   - key: canonical RELION task identifier
+     6→//   - name, category, stage, icon
+     7→//   - description: human-readable summary
+     8→//   - inputs: upstream job types this task depends on
+     9→//   - outputs: what this task produces (for downstream tasks / agent decisions)
+    10→//   - parameters: structured list of relion-style parameters with defaults
+    11→//   - decisionHints: when the agent should run this and what decisions it makes
+    12→//   - typicalDuration: simulated seconds for the executor
+    13→//
+    14→// Categories: prep | picking | classify | refine | analyze | utility
+    15→
+    16→export type ParamType = "string" | "int" | "float" | "bool" | "select" | "path" | "range";
+    17→
+    18→export interface TaskParam {
+    19→  key: string;
+    20→  label: string;
+    21→  type: ParamType;
+    22→  default: string | number | boolean;
+    23→  options?: string[];
+    24→  help: string;
+    25→  group?: string;
+    26→  advanced?: boolean;
+    27→}
+    28→
+    29→export interface TaskOutput {
+    30→  key: string;
+    31→  label: string;
+    32→  kind: "movies" | "micrographs" | "particles" | "star" | "map" | "mask" | "halfmap" | "log" | "metadata";
+    33→  metrics?: string[];
+    34→}
+    35→
+    36→export interface RelionTask {
+    37→  key: string;
+    38→  name: string;
+    39→  short: string;
+    40→  category: "prep" | "picking" | "classify" | "refine" | "analyze" | "utility";
+    41→  stage: number;
+    42→  icon: string;
+    43→  color: string;
+    44→  description: string;
+    45→  inputs: { types: string[]; label: string; optional?: boolean }[];
+    46→  outputs: TaskOutput[];
+    47→  parameters: TaskParam[];
+    48→  decisionHints: {
+    49→    when: string;
+    50→    decides: string;
+    51→  };
+    52→  typicalDuration: number;
+    53→  relionBinary: string;
+    54→  docUrl: string;
+    55→}
+    56→
+    57→// ---------------------------------------------------------------------------
+    58→// All 18 RELION tasks
+    59→// ---------------------------------------------------------------------------
+    60→export const RELION_TASKS: RelionTask[] = [
+    61→  {
+    62→    key: "import",
+    63→    name: "Import",
+    64→    short: "Import",
+    65→    category: "prep",
+    66→    stage: 0,
+    67→    icon: "FolderInput",
+    68→    color: "text-sky-400",
+    69→    description:
+    70→      "Import movies, micrographs, particles or coordinates from disk into the RELION project. Creates the input star files that feed the downstream pipeline.",
+    71→    inputs: [],
+    72→    outputs: [
+    73→      { key: "movies", label: "Imported movies", kind: "movies", metrics: ["n_movies", "frame_count", "pixel_size"] },
+    74→    ],
+    75→    parameters: [
+    76→      { key: "do_movies", label: "Import movies?", type: "bool", default: true, group: "I/O", help: "Import movie stacks (.mrcs/.tiff) rather than single micrographs." },
+    77→      { key: "fn_in", label: "Input file pattern", type: "path", default: "Movies/*.tiff", group: "I/O", help: "Wildcard pattern or star file describing input images." },
+    78→      { key: "optics_group_name", label: "Optics group name", type: "string", default: "opticsGroup1", group: "I/O", help: "Name assigned to the optics group." },
+    79→      { key: "angpix", label: "Pixel size (Å)", type: "float", default: 0.885, group: "I/O", help: "Pixel size at the specimen level." },
+    80→      { key: "kV", label: "Voltage (kV)", type: "int", default: 300, group: "I/O", help: "Accelerating voltage." },
+    81→      { key: "Cs", label: "Cs (mm)", type: "float", default: 2.7, group: "I/O", help: "Spherical aberration of the microscope." },
+    82→      { key: "Q0", label: "Amplitude contrast", type: "float", default: 0.1, group: "I/O", help: "Fraction of amplitude contrast." },
+    83→      { key: "beamtilt_x", label: "Beam tilt X (mrad)", type: "float", default: 0, group: "I/O", advanced: true, help: "Beam tilt along x for aberration correction." },
+    84→      { key: "beamtilt_y", label: "Beam tilt Y (mrad)", type: "float", default: 0, group: "I/O", advanced: true, help: "Beam tilt along y." },
+    85→      { key: "bin_factor", label: "Binning factor", type: "int", default: 0, group: "Downsample", help: "0=auto (2x if micrograph >2048px), 1=none, 2=force 2x, 4=force 4x. Larger = smaller/faster but lower resolution." },
+    86→    ],
+    87→    decisionHints: {
+    88→      when: "Always the first task: needed before any processing when raw movies/micrographs are provided.",
+    89→      decides: "Optics group geometry (pixel size, voltage, Cs) — drives every downstream CTF and reconstruction step.",
+    90→    },
+    91→    typicalDuration: 8,
+    92→    relionBinary: "relion_import",
+    93→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Import.html",
+    94→  },
+    95→  {
+    96→    key: "motioncorr",
+    97→    name: "Motion Correction",
+    98→    short: "MotionCorr",
+    99→    category: "prep",
+   100→    stage: 1,
+   101→    icon: "Waves",
+   102→    color: "text-cyan-400",
+   103→    description:
+   104→      "Align movie frames to correct beam-induced and stage drift using MotionCor2. Produces dose-weighted, drift-corrected micrographs and per-particle trajectories.",
+   105→    inputs: [{ types: ["import"], label: "Movies" }],
+   106→    outputs: [
+   107→      { key: "corr_micrographs", label: "Corrected micrographs", kind: "micrographs", metrics: ["n_micrographs", "avg_drift"] },
+   108→      { key: "patches_log", label: "Patch-based trajectories", kind: "log" },
+   109→    ],
+   110→    parameters: [
+   111→      { key: "do_own_motioncor2", label: "Use internal motioncor2", type: "bool", default: true, group: "Motion", help: "Use RELION's built-in motioncor2." },
+   112→      { key: "bfactor", label: "B-factor", type: "int", default: 150, group: "Motion", help: "B-factor for MotionCor2 alignment." },
+   113→      { key: "patch_x", label: "Patches X", type: "int", default: 5, group: "Motion", help: "Number of patches along x." },
+   114→      { key: "patch_y", label: "Patches Y", type: "int", default: 5, group: "Motion", help: "Number of patches along y." },
+   115→      { key: "group_frames", label: "Group frames", type: "int", default: 1, group: "Motion", help: "Number of frames to group before alignment." },
+   116→      { key: "fn_motioncor2_exe", label: "MotionCor2 binary", type: "path", default: "", group: "Motion", advanced: true, help: "Optional external MotionCor2 executable." },
+   117→      { key: "dose_weighting", label: "Dose weighting", type: "bool", default: true, group: "Motion", help: "Apply dose weighting to frames." },
+   118→      { key: "dose_per_frame", label: "Dose per frame (e-/A2)", type: "float", default: 1.0, group: "Motion", help: "Dose per frame for weighting." },
+   119→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "Comma-separated GPU ids." },
+   120→    ],
+   121→    decisionHints: {
+   122→      when: "Runs right after Import for all movie data. Mandatory for dose weighting and drift compensation.",
+   123→      decides: "Patch grid (5x5 default) and dose-per-frame based on the acquisition dose. Higher drift movies may need finer patches.",
+   124→    },
+   125→    typicalDuration: 45,
+   126→    relionBinary: "relion_motioncorr",
+   127→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Motioncorrection.html",
+   128→  },
+   129→  {
+   130→    key: "ctffind",
+   131→    name: "CTF Estimation",
+   132→    short: "CTFFind",
+   133→    category: "prep",
+   134→    stage: 2,
+   135→    icon: "Aperture",
+   136→    color: "text-emerald-400",
+   137→    description:
+   138→      "Estimate the Contrast Transfer Function (CTF) on corrected micrographs using CTFFIND or Gctf. Reports defocus, astigmatism, phase shift and fit quality per micrograph.",
+   139→    inputs: [{ types: ["motioncorr"], label: "Corrected micrographs" }],
+   140→    outputs: [
+   141→      { key: "ctf_star", label: "Micrograph CTF star", kind: "star", metrics: ["n_micrographs", "avg_defocus", "avg_resolution", "astigmatism"] },
+   142→    ],
+   143→    parameters: [
+   144→      { key: "do_ctffind_extra", label: "Use Gctf", type: "bool", default: false, group: "CTF", help: "Use Gctf instead of CTFFIND." },
+   145→      { key: "box_size", label: "CTF box size (px)", type: "int", default: 512, group: "CTF", help: "Box size for power spectrum estimation." },
+   146→      { key: "min_res", label: "Min resolution (Å)", type: "float", default: 30, group: "CTF", help: "Lowest resolution to fit." },
+   147→      { key: "max_res", label: "Max resolution (Å)", type: "float", default: 5, group: "CTF", help: "Highest resolution to fit." },
+   148→      { key: "min_defocus", label: "Min defocus (Å)", type: "float", default: 5000, group: "CTF", help: "Lower defocus search bound." },
+   149→      { key: "max_defocus", label: "Max defocus (Å)", type: "float", default: 50000, group: "CTF", help: "Upper defocus search bound." },
+   150→      { key: "dstep", label: "Step size defocus (Å)", type: "float", default: 500, group: "CTF", help: "Defocus search step." },
+   151→      { key: "do_phaseshift", label: "Estimate phase shift", type: "bool", default: false, group: "CTF", help: "Search phase shift (useful for phase plates)." },
+   152→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "Comma-separated GPU ids (Gctf)." },
+   153→    ],
+   154→    decisionHints: {
+   155→      when: "Immediately after motion correction, before any particle picking.",
+   156→      decides: "Whether to estimate phase shift (phase-plate data), and which micrographs to discard based on max resolution fit (low-quality micrographs removed before picking).",
+   157→    },
+   158→    typicalDuration: 30,
+   159→    relionBinary: "relion_ctffind",
+   160→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Ctfestimation.html",
+   161→  },
+   162→  {
+   163→    key: "manualpick",
+   164→    name: "Manual Picking",
+   165→    short: "ManualPick",
+   166→    category: "picking",
+   167→    stage: 3,
+   168→    icon: "MousePointerClick",
+   169→    color: "text-amber-400",
+   170→    description:
+   171→      "Manually pick particles in the RELION GUI. Used to build a reference set for autopicking or to curate particle coordinates by eye.",
+   172→    inputs: [{ types: ["motioncorr"], label: "Corrected micrographs" }],
+   173→    outputs: [
+   174→      { key: "coords", label: "Particle coordinates", kind: "star", metrics: ["n_particles", "n_micrographs_picked"] },
+   175→    ],
+   176→    parameters: [
+   177→      { key: "diameter", label: "Particle diameter (Å)", type: "int", default: 160, group: "Picking", help: "Circle diameter drawn around particles." },
+   178→      { key: "black_point", label: "Black point", type: "float", default: 0, group: "Picking", advanced: true, help: "Display black point." },
+   179→      { key: "white_point", label: "White point", type: "float", default: 0, group: "Picking", advanced: true, help: "Display white point." },
+   180→      { key: "lowpass", label: "Lowpass filter (Å)", type: "float", default: 0, group: "Picking", advanced: true, help: "Lowpass filter for display." },
+   181→      { key: "do_lasso", label: "Lasso mode", type: "bool", default: false, group: "Picking", advanced: true, help: "Use lasso selection." },
+   182→    ],
+   183→    decisionHints: {
+   184→      when: "Used to bootstrap references for autopicking, or for small/low-contrast datasets where autopicking fails.",
+   185→      decides: "Particle diameter (drives autopick LoG diameter range and extraction box size).",
+   186→    },
+   187→    typicalDuration: 20,
+   188→    relionBinary: "relion_manualpick",
+   189→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Picking.html",
+   190→  },
+   191→  {
+   192→    key: "autopick",
+   193→    name: "Auto-Picking",
+   194→    short: "AutoPick",
+   195→    category: "picking",
+   196→    stage: 3,
+   197→    icon: "Target",
+   198→    color: "text-orange-400",
+   199→    description:
+   200→      "Automatically pick particles using Laplacian-of-Gaussian (LoG), references from 2D averages, or Topaz (deep learning). Generates particle coordinates across all micrographs.",
+   201→    inputs: [
+   202→      { types: ["motioncorr"], label: "Corrected micrographs" },
+   203→      { types: ["class2d"], label: "2D references", optional: true },
+   204→    ],
+   205→    outputs: [
+   206→      { key: "coords", label: "Particle coordinates", kind: "star", metrics: ["n_particles", "n_micrographs", "pick_density"] },
+   207→    ],
+   208→    parameters: [
+   209→      { key: "do_LoG", label: "Laplacian of Gaussian", type: "bool", default: false, group: "Picking", help: "Reference-free LoG picker (RELION built-in)." },
+   210→      { key: "do_topaz", label: "Use Topaz (deep learning)", type: "bool", default: true, group: "Picking", help: "Topaz pretrained resnet16 picker — best general-purpose method." },
+   211→      { key: "diameter_min", label: "LoG min diameter (Å)", type: "int", default: 140, group: "Picking", help: "Minimum diameter for LoG." },
+   212→      { key: "diameter_max", label: "LoG max diameter (Å)", type: "int", default: 180, group: "Picking", help: "Maximum diameter for LoG." },
+   213→      { key: "threshold", label: "Picking threshold", type: "float", default: 0.4, group: "Picking", help: "Particle score threshold." },
+   214→      { key: "min_distance", label: "Min inter-particle dist (Å)", type: "int", default: 0, group: "Picking", help: "Minimum distance between picks (0 = diameter)." },
+   215→      { key: "shrink", label: "Shrink factor", type: "float", default: 1, group: "Picking", advanced: true, help: "Downscale micrographs before picking." },
+   216→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "GPUs for Topaz/references." },
+   217→    ],
+   218→    decisionHints: {
+   219→      when: "After CTF estimation; default picker when no references exist. Reference-based picking used once good 2D classes are available.",
+   220→      decides: "Picker type (LoG/Topaz/reference), threshold, diameter range — tuning threshold trades recall vs precision. Low precision → re-run with higher threshold.",
+   221→    },
+   222→    typicalDuration: 40,
+   223→    relionBinary: "relion_autopick",
+   224→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Autopicking.html",
+   225→  },
+   226→  {
+   227→    key: "extract",
+   228→    name: "Extract Particles",
+   229→    short: "Extract",
+   230→    category: "picking",
+   231→    stage: 4,
+   232→    icon: "ScanSearch",
+   233→    color: "text-lime-400",
+   234→    description:
+   235→      "Extract particle boxes from motion-corrected micrographs at the picked coordinates. Optionally re-scales the box and phase-flips based on the CTF.",
+   236→    inputs: [
+   237→      { types: ["autopick", "manualpick"], label: "Coordinates" },
+   238→      { types: ["motioncorr"], label: "Micrographs" },
+   239→      { types: ["ctffind"], label: "CTF star", optional: true },
+   240→    ],
+   241→    outputs: [
+   242→      { key: "particles", label: "Extracted particles", kind: "particles", metrics: ["n_particles", "box_size", "pixel_size"] },
+   243→    ],
+   244→    parameters: [
+   245→      { key: "extract_size", label: "Extract box size (px)", type: "int", default: 256, group: "Extract", help: "Box size for extraction." },
+   246→      { key: "do_rescale", label: "Rescale particles", type: "bool", default: true, group: "Extract", help: "Rescale to a smaller box size." },
+   247→      { key: "rescale", label: "Rescale size (px)", type: "int", default: 128, group: "Extract", help: "Final box size after rescaling." },
+   248→      { key: "do_invert", label: "Invert contrast", type: "bool", default: true, group: "Extract", help: "Flip contrast so protein is white." },
+   249→      { key: "do_phase_flip", label: "Phase flip", type: "bool", default: false, group: "Extract", help: "Apply CTF phase flipping (legacy)." },
+   250→      { key: "set_dose_weighting", label: "Use dose-weighted", type: "bool", default: true, group: "Extract", help: "Read dose-weighted micrographs." },
+   251→      { key: "recenter_x", label: "Recenter X (px)", type: "int", default: 0, group: "Extract", help: "Shift box center along x." },
+   252→      { key: "recenter_y", label: "Recenter Y (px)", type: "int", default: 0, group: "Extract", help: "Shift box center along y." },
+   253→    ],
+   254→    decisionHints: {
+   255→      when: "After autopicking/manual picking. Must run before any 2D/3D classification.",
+   256→      decides: "Box size (driven by particle diameter and target resolution) and rescale size for compute efficiency.",
+   257→    },
+   258→    typicalDuration: 18,
+   259→    relionBinary: "relion_extract",
+   260→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Extraction.html",
+   261→  },
+   262→  {
+   263→    key: "select",
+   264→    name: "Particle Selection",
+   265→    short: "Select",
+   266→    category: "picking",
+   267→    stage: 4,
+   268→    icon: "Filter",
+   269→    color: "text-teal-400",
+   270→    description:
+   271→      "Filter particles based on statistics (autocorrelation, mean, sigma) or remove duplicates. Cleans up the particle set before classification.",
+   272→    inputs: [{ types: ["extract"], label: "Particles" }],
+   273→    outputs: [
+   274→      { key: "particles", label: "Selected particles", kind: "particles", metrics: ["n_particles", "n_removed"] },
+   275→    ],
+   276→    parameters: [
+   277→      { key: "do_select_on_stats", label: "Select on statistics", type: "bool", default: true, group: "Extract", help: "Filter by image statistics." },
+   278→      { key: "select_min_autoperc", label: "Min auto-pick percentile", type: "float", default: 0, group: "Extract", help: "Lowest percentile of autopick score to keep." },
+   279→      { key: "select_max_sigma", label: "Max sigma", type: "float", default: 3, group: "Extract", help: "Discard particles above this sigma." },
+   280→      { key: "do_remove_duplicates", label: "Remove duplicates", type: "bool", default: true, group: "Extract", help: "Remove particles closer than the minimum distance." },
+   281→      { key: "min_distance", label: "Min distance (Å)", type: "int", default: 100, group: "Extract", help: "Minimum allowed inter-particle distance." },
+   282→    ],
+   283→    decisionHints: {
+   284→      when: "After extraction and optionally after each classification to discard junk classes.",
+   285→      decides: "Sigma thresholds and duplicate removal distance — informed by visual inspection of 2D class averages.",
+   286→    },
+   287→    typicalDuration: 6,
+   288→    relionBinary: "relion_select",
+   289→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Select.html",
+   290→  },
+   291→  {
+   292→    key: "class2d",
+   293→    name: "2D Classification",
+   294→    short: "Class2D",
+   295→    category: "classify",
+   296→    stage: 5,
+   297→    icon: "Layers",
+   298→    color: "text-violet-400",
+   299→    description:
+   300→      "Run multi-reference 2D classification to sort particles into class averages. Used for cleaning and to generate references for autopicking and 3D classification.",
+   301→    inputs: [{ types: ["extract", "select"], label: "Particles" }],
+   302→    outputs: [
+   303→      { key: "class_averages", label: "2D class averages", kind: "star", metrics: ["n_classes", "best_class_resolution", "particles_in_good_classes"] },
+   304→      { key: "class_assignments", label: "Particle to class map", kind: "star" },
+   305→    ],
+   306→    parameters: [
+   307→      { key: "nr_classes", label: "Number of classes", type: "int", default: 10, group: "Classify", help: "Number of 2D references." },
+   308→      { key: "tau_fudge", label: "Regularization T", type: "float", default: 2, group: "Classify", help: "T regularization factor." },
+   309→      { key: "do_fast_subsets", label: "Fast subsets", type: "bool", default: true, group: "Classify", help: "Split into subsets for speed." },
+   310→      { key: "iter_nr_iter", label: "Iterations", type: "int", default: 25, group: "Optimisation", help: "Number of EM iterations." },
+   311→      { key: "particle_diameter", label: "Mask diameter (Å)", type: "int", default: 160, group: "Classify", help: "Circular mask diameter." },
+   312→      { key: "do_center", label: "Center classes", type: "bool", default: true, group: "Optimisation", help: "Re-center class averages." },
+   313→      { key: "do_ctf_correction", label: "CTF correction", type: "bool", default: true, group: "Classify", help: "Apply CTF during classification." },
+   314→      { key: "do_ignore_curls", label: "Skip curling", type: "bool", default: true, group: "Optimisation", advanced: true, help: "Skip high-curvature particles." },
+   315→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "GPUs to use." },
+   316→      { key: "nr_pool", label: "Pool size", type: "int", default: 3, group: "Compute", advanced: true, help: "Number of pooled particles per thread." },
+   317→    ],
+   318→    decisionHints: {
+   319→      when: "After extraction; central quality-gate task. Also re-run after selecting good classes to regenerate references.",
+   320→      decides: "Which classes to keep (good averages vs junk). The agent selects classes with clear secondary structure and high particle count, dropping edge/junk classes before 3D processing.",
+   321→    },
+   322→    typicalDuration: 60,
+   323→    relionBinary: "relion_refine",
+   324→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/2Dclassification.html",
+   325→  },
+   326→  {
+   327→    key: "initialmodel",
+   328→    name: "3D Initial Model",
+   329→    short: "InitModel",
+   330→    category: "classify",
+   331→    stage: 6,
+   332→    icon: "Box",
+   333→    color: "text-fuchsia-400",
+   334→    description:
+   335→      "Generate a de-novo 3D initial model from 2D class averages using SGD-based stochastic gradient descent. Produces a starting reference for 3D classification.",
+   336→    inputs: [{ types: ["class2d"], label: "Particles (selected 2D classes)" }],
+   337→    outputs: [
+   338→      { key: "init_map", label: "Initial 3D model", kind: "map", metrics: ["resolution_estimate", "symmetry"] },
+   339→    ],
+   340→    parameters: [
+   341→      { key: "nr_classes", label: "Number of models", type: "int", default: 3, group: "Classify", help: "Independent SGD models (pick best)." },
+   342→      { key: "symmetry", label: "Symmetry", type: "string", default: "C1", group: "Classify", help: "Point group symmetry." },
+   343→      { key: "particle_diameter", label: "Mask diameter (Å)", type: "int", default: 160, group: "Classify", help: "Spherical mask diameter." },
+   344→      { key: "do_flipping", label: "Random phase flipping", type: "bool", default: true, group: "Optimisation", help: "Random phase flipping to reduce model bias." },
+   345→      { key: "sgd_iter", label: "SGD iterations", type: "int", default: 50, group: "Optimisation", help: "Number of SGD iterations." },
+   346→      { key: "sgd_resol", label: "SGD resolution (Å)", type: "float", default: 15, group: "Sampling", help: "High-res limit during SGD." },
+   347→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "GPUs to use." },
+   348→    ],
+   349→    decisionHints: {
+   350→      when: "When no trusted reference exists — required before 3D classification / refinement.",
+   351→      decides: "Symmetry (C1 unless known), number of independent models, and which of the N models looks most consistent.",
+   352→    },
+   353→    typicalDuration: 50,
+   354→    relionBinary: "relion_refine",
+   355→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Initialmodel.html",
+   356→  },
+   357→  {
+   358→    key: "class3d",
+   359→    name: "3D Classification",
+   360→    short: "Class3D",
+   361→    category: "classify",
+   362→    stage: 6,
+   363→    icon: "Boxes",
+   364→    color: "text-purple-400",
+   365→    description:
+   366→      "Sort particles into 3D conformational/structural classes using multi-reference refinement. Identifies the dominant state(s) and removes heterogeneous / junk particles.",
+   367→    inputs: [
+   368→      { types: ["initialmodel", "class2d"], label: "Reference" },
+   369→      { types: ["class2d"], label: "Particles" },
+   370→    ],
+   371→    outputs: [
+   372→      { key: "classes", label: "3D class volumes", kind: "map", metrics: ["n_classes", "best_class_resolution", "particles_per_class"] },
+   373→      { key: "assignments", label: "Particle to class map", kind: "star" },
+   374→    ],
+   375→    parameters: [
+   376→      { key: "nr_classes", label: "Number of classes", type: "int", default: 4, group: "Classify", help: "Number of 3D classes." },
+   377→      { key: "tau_fudge", label: "Regularization T", type: "float", default: 4, group: "Classify", help: "T regularization (higher = sharper)." },
+   378→      { key: "symmetry", label: "Symmetry", type: "string", default: "C1", group: "Classify", help: "Point group symmetry." },
+   379→      { key: "particle_diameter", label: "Mask diameter (Å)", type: "int", default: 160, group: "Classify", help: "Spherical mask diameter." },
+   380→      { key: "do_ctf_correction", label: "CTF correction", type: "bool", default: true, group: "Classify", help: "CTF correction in refinement." },
+   381→      { key: "iter_nr_iter", label: "Iterations", type: "int", default: 25, group: "Optimisation", help: "EM iterations." },
+   382→      { key: "highres_limit", label: "High-res limit (Å)", type: "float", default: 8, group: "Sampling", help: "Limit frequencies to avoid overfitting." },
+   383→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "GPUs to use." },
+   384→    ],
+   385→    decisionHints: {
+   386→      when: "After initial model — separates conformations / states. Run again on a chosen class if heterogeneity persists.",
+   387→      decides: "Which class to take into refinement (best-resolved, most-populated, biologically correct). Re-runs with different class counts if no clean separation.",
+   388→    },
+   389→    typicalDuration: 70,
+   390→    relionBinary: "relion_refine",
+   391→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/3Dclassification.html",
+   392→  },
+   393→  {
+   394→    key: "refine3d",
+   395→    name: "3D Auto-Refine",
+   396→    short: "Refine3D",
+   397→    category: "refine",
+   398→    stage: 7,
+   399→    icon: "Focus",
+   400→    color: "text-rose-400",
+   401→    description:
+   402→      "Automated gold-standard 3D refinement. Iteratively refines orientations, translations and the density map until convergence, reaching the Nyquist-limited resolution.",
+   403→    inputs: [
+   404→      { types: ["initialmodel", "class3d"], label: "Reference" },
+   405→      { types: ["class2d", "select"], label: "Particles" },
+   406→    ],
+   407→    outputs: [
+   408→      { key: "halfmap", label: "Refined half-maps", kind: "halfmap", metrics: ["resolution", "map_size"] },
+   409→      { key: "map", label: "Refined density map", kind: "map", metrics: ["resolution"] },
+   410→      { key: "particles", label: "Refined particles", kind: "particles", metrics: ["n_particles", "orientations"] },
+   411→    ],
+   412→    parameters: [
+   413→      { key: "symmetry", label: "Symmetry", type: "string", default: "C1", group: "Refine", help: "Symmetry to impose." },
+   414→      { key: "particle_diameter", label: "Mask diameter (Å)", type: "int", default: 160, group: "Refine", help: "Spherical mask." },
+   415→      { key: "do_ctf_correction", label: "CTF correction", type: "bool", default: true, group: "Refine", help: "Full CTF correction." },
+   416→      { key: "do_ctf_intact_firstpeak", label: "Intact first peak", type: "bool", default: false, group: "Refine", advanced: true, help: "Keep first CTF peak intact." },
+   417→      { key: "highres_limit", label: "High-res limit (Å)", type: "float", default: 0, group: "Sampling", help: "Cap on high frequencies (0 = Nyquist)." },
+   418→      { key: "ini_highres", label: "Initial low-pass (Å)", type: "float", default: 30, group: "Sampling", help: "Low-pass filter on reference." },
+   419→      { key: "flatten_solvent", label: "Flatten solvent", type: "bool", default: true, group: "Refine", help: "Flatten solvent region." },
+   420→      { key: "do_zero_mask", label: "Zero-mask", type: "bool", default: true, group: "Refine", help: "Mask outside the sphere with zeros." },
+   421→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "GPUs to use." },
+   422→    ],
+   423→    decisionHints: {
+   424→      when: "Once a homogeneous 3D class is chosen — the core refinement step. Re-run with focus masks for local refinement.",
+   425→      decides: "Symmetry, initial low-pass, and whether to apply focus masks for sub-region refinement.",
+   426→    },
+   427→    typicalDuration: 90,
+   428→    relionBinary: "relion_refine",
+   429→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/3Dautorefine.html",
+   430→  },
+   431→  {
+   432→    key: "maskcreate",
+   433→    name: "Mask Creation",
+   434→    short: "MaskCreate",
+   435→    category: "utility",
+   436→    stage: 7,
+   437→    icon: "Hexagon",
+   438→    color: "text-stone-400",
+   439→    description:
+   440→      "Create a soft-edged 3D mask around the refined density. Used for post-processing, focused refinement and local-resolution estimation.",
+   441→    inputs: [{ types: ["refine3d", "class3d", "initialmodel"], label: "Map to mask" }],
+   442→    outputs: [
+   443→      { key: "mask", label: "Soft mask", kind: "mask", metrics: ["mask_volume", "soft_edge"] },
+   444→    ],
+   445→    parameters: [
+   446→      { key: "do_threshold", label: "Density threshold", type: "bool", default: true, group: "Mask", help: "Threshold the map to make a mask." },
+   447→      { key: "ini_threshold", label: "Threshold level", type: "float", default: 0.02, group: "Mask", help: "Initial threshold value." },
+   448→      { key: "extend_mask", label: "Extend by (px)", type: "int", default: 3, group: "Mask", help: "Grow the mask by N voxels." },
+   449→      { key: "soft_edge", label: "Soft edge (px)", type: "int", default: 3, group: "Mask", help: "Cosine soft-edge width." },
+   450→      { key: "lowpass_filter", label: "Lowpass (Å)", type: "float", default: 10, group: "Mask", help: "Lowpass the mask before thresholding." },
+   451→    ],
+   452→    decisionHints: {
+   453→      when: "After refine3d / class3d — masks are needed for postprocess, localres and focus refinement.",
+   454→      decides: "Threshold level (drives mask tightness), extension, soft edge. The agent aims for a tight mask excluding solvent without cutting the density.",
+   455→    },
+   456→    typicalDuration: 8,
+   457→    relionBinary: "relion_maskcreate",
+   458→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Maskcreation.html",
+   459→  },
+   460→  {
+   461→    key: "postprocess",
+   462→    name: "Post-Processing",
+   463→    short: "PostProcess",
+   464→    category: "analyze",
+   465→    stage: 8,
+   466→    icon: "Sparkles",
+   467→    color: "text-yellow-400",
+   468→    description:
+   469→      "Sharpen the refined map, apply the mask, estimate B-factor and compute the gold-standard FSC resolution. Produces the final deposited density map.",
+   470→    inputs: [
+   471→      { types: ["refine3d"], label: "Half-maps" },
+   472→      { types: ["maskcreate"], label: "Mask" },
+   473→    ],
+   474→    outputs: [
+   475→      { key: "post_map", label: "Sharpened map", kind: "map", metrics: ["resolution", "b_factor", "map_size"] },
+   476→    ],
+   477→    parameters: [
+   478→      { key: "fn_mask", label: "Mask", type: "path", default: "", group: "Postprocess", help: "Input mask star/map." },
+   479→      { key: "do_auto_b", label: "Estimate B-factor", type: "bool", default: true, group: "Postprocess", help: "Rosenthal-Henderson auto-B." },
+   480→      { key: "do_auto_mask", label: "Auto-loose mask", type: "bool", default: true, group: "Postprocess", help: "Loosen mask automatically if too tight." },
+   481→      { key: "fn_mtf", label: "MTF file", type: "path", default: "", group: "Postprocess", help: "Detector MTF file (optional)." },
+   482→      { key: "angpix", label: "Pixel size (Å)", type: "float", default: 1.0, group: "Postprocess", help: "Pixel size of the map." },
+   483→    ],
+   484→    decisionHints: {
+   485→      when: "Final step of every refinement — gives the reported resolution and the sharpened map. Re-run after each refine3d improvement.",
+   486→      decides: "Mask tightness, MTF application, and B-factor sharpening. The agent reports the global resolution in Å.",
+   487→    },
+   488→    typicalDuration: 10,
+   489→    relionBinary: "relion_postprocess",
+   490→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Post-processing.html",
+   491→  },
+   492→  {
+   493→    key: "localres",
+   494→    name: "Local Resolution",
+   495→    short: "LocalRes",
+   496→    category: "analyze",
+   497→    stage: 8,
+   498→    icon: "Grid3x3",
+   499→    color: "text-indigo-300",
+   500→    description:
+   501→      "Estimate local resolution using the ResMap or relion's own block-based FSC. Produces a resolution map highlighting flexible / well-ordered regions.",
+   502→    inputs: [
+   503→      { types: ["refine3d"], label: "Half-maps" },
+   504→      { types: ["maskcreate"], label: "Mask (optional)", optional: true },
+   505→    ],
+   506→    outputs: [
+   507→      { key: "locres_map", label: "Local-resolution map", kind: "map", metrics: ["min_res", "max_res", "median_res"] },
+   508→    ],
+   509→    parameters: [
+   510→      { key: "do_resmap", label: "Use ResMap", type: "bool", default: false, group: "Compute", help: "Use external ResMap." },
+   511→      { key: "resmap_resstep", label: "ResMap step (Å)", type: "float", default: 1, group: "Sampling", help: "Resolution step size." },
+   512→      { key: "angpix", label: "Pixel size (Å)", type: "float", default: 1.0, group: "Postprocess", help: "Pixel size." },
+   513→      { key: "min_res", label: "Min resolution (Å)", type: "float", default: 10, group: "Sampling", help: "Lowest resolution to evaluate." },
+   514→      { key: "max_res", label: "Max resolution (Å)", type: "float", default: 1.5, group: "Sampling", help: "Highest resolution to evaluate." },
+   515→    ],
+   516→    decisionHints: {
+   517→      when: "After a successful postprocess — to assess map heterogeneity before deposition or focused refinement.",
+   518→      decides: "Resolution range and step; the agent interprets the local-resolution spread to recommend focused refinement or multi-body.",
+   519→    },
+   520→    typicalDuration: 35,
+   521→    relionBinary: "relion_locres",
+   522→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Localres.html",
+   523→  },
+   524→  {
+   525→    key: "multibody",
+   526→    name: "Multi-Body Refinement",
+   527→    short: "MultiBody",
+   528→    category: "refine",
+   529→    stage: 9,
+   530→    icon: "Boxes",
+   531→    color: "text-pink-400",
+   532→    description:
+   533→      "Refine independent rigid bodies within the complex simultaneously. Useful for flexible multi-domain complexes; produces separate maps per body and PCA of body motion.",
+   534→    inputs: [
+   535→      { types: ["refine3d"], label: "Refined particles & map" },
+   536→      { types: ["maskcreate"], label: "Body masks" },
+   537→    ],
+   538→    outputs: [
+   539→      { key: "body_maps", label: "Per-body maps", kind: "map", metrics: ["n_bodies", "body_resolutions"] },
+   540→      { key: "pca", label: "Body-motion PCA", kind: "star" },
+   541→    ],
+   542→    parameters: [
+   543→      { key: "n_bodies", label: "Number of bodies", type: "int", default: 2, group: "Refine", help: "Number of rigid bodies." },
+   544→      { key: "do_sgd", label: "Use SGD", type: "bool", default: false, group: "Refine", advanced: true, help: "SGD in multi-body." },
+   545→      { key: "max_cc", label: "Max cross-correlation", type: "float", default: 1.0, group: "Optimisation", advanced: true, help: "Cross-correlation limit." },
+   546→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "GPUs to use." },
+   547→    ],
+   548→    decisionHints: {
+   549→      when: "When local resolution analysis reveals rigid domains with flexible linkers — separates them for better resolution.",
+   550→      decides: "Number of bodies and their masks — the agent proposes bodies based on the structure's domain decomposition.",
+   551→    },
+   552→    typicalDuration: 60,
+   553→    relionBinary: "relion_refine",
+   554→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Multi-body.html",
+   555→  },
+   556→  {
+   557→    key: "polish",
+   558→    name: "Bayesian Polishing",
+   559→    short: "Polish",
+   560→    category: "refine",
+   561→    stage: 7,
+   562→    icon: "Gem",
+   563→    color: "text-amber-300",
+   564→    description:
+   565→      "Re-align per-particle movie frames using Bayesian statistics. Produces a polished particle set that often improves resolution by 0.2-0.5 Å.",
+   566→    inputs: [
+   567→      { types: ["refine3d"], label: "Refined particles" },
+   568→      { types: ["motioncorr"], label: "Movies & optics" },
+   569→    ],
+   570→    outputs: [
+   571→      { key: "particles", label: "Polished particles", kind: "particles", metrics: ["n_particles", "resolution_gain"] },
+   572→    ],
+   573→    parameters: [
+   574→      { key: "do_optimize_params", label: "Optimize params", type: "bool", default: true, group: "Polish", help: "Train sigma values on a subset." },
+   575→      { key: "opt_perframe", label: "Per-frame weights", type: "bool", default: true, group: "Polish", help: "Optimize per-frame dose weight." },
+   576→      { key: "minres", label: "Min resolution (Å)", type: "float", default: 15, group: "Sampling", help: "Lowest resolution used." },
+   577→      { key: "maxres", label: "Max resolution (Å)", type: "float", default: 5, group: "Sampling", help: "Highest resolution used." },
+   578→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "GPUs to use." },
+   579→    ],
+   580→    decisionHints: {
+   581→      when: "After a first refine3d (>=4 Å). Requires the original movies. Re-run refine3d + postprocess on polished particles.",
+   582→      decides: "Whether to optimize parameters first (recommended), resolution range, then re-refine.",
+   583→    },
+   584→    typicalDuration: 55,
+   585→    relionBinary: "relion_motionrefine",
+   586→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Bayesianpolishing.html",
+   587→  },
+   588→  {
+   589→    key: "movierefine",
+   590→    name: "Movie Refinement",
+   591→    short: "MovieRefine",
+   592→    category: "refine",
+   593→    stage: 7,
+   594→    icon: "Film",
+   595→    color: "text-cyan-300",
+   596→    description:
+   597→      "Per-frame alignment of particles within movies (older Bayesian movie-refinement step). Largely superseded by Bayesian polishing; still used for specific cases.",
+   598→    inputs: [
+   599→      { types: ["refine3d"], label: "Refined particles" },
+   600→      { types: ["motioncorr"], label: "Movies" },
+   601→    ],
+   602→    outputs: [
+   603→      { key: "shiny_particles", label: "Shiny particles", kind: "particles", metrics: ["n_particles", "resolution_gain"] },
+   604→    ],
+   605→    parameters: [
+   606→      { key: "extract_size", label: "Movie box (px)", type: "int", default: 256, group: "Polish", help: "Box size for movie extraction." },
+   607→      { key: "minres", label: "Min resolution (Å)", type: "float", default: 15, group: "Sampling", help: "Lowest resolution used." },
+   608→      { key: "maxres", label: "Max resolution (Å)", type: "float", default: 5, group: "Sampling", help: "Highest resolution used." },
+   609→      { key: "run_in_parallel", label: "Run in parallel", type: "bool", default: true, group: "Compute", help: "Run frame alignment in parallel." },
+   610→      { key: "gpu_ids", label: "GPU ids", type: "string", default: "0", group: "Compute", help: "GPUs to use." },
+   611→    ],
+   612→    decisionHints: {
+   613→      when: "Rare; preferred over polish only when full-frame dose weighting is unavailable. The agent prefers Bayesian polishing.",
+   614→      decides: "Resolution range and box size; the agent generally defers to Bayesian polishing unless requested.",
+   615→    },
+   616→    typicalDuration: 45,
+   617→    relionBinary: "relion_movierefine",
+   618→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/Movierefine.html",
+   619→  },
+   620→  {
+   621→    key: "external",
+   622→    name: "External",
+   623→    short: "External",
+   624→    category: "utility",
+   625→    stage: 99,
+   626→    icon: "Terminal",
+   627→    color: "text-slate-400",
+   628→    description:
+   629→      "Run an arbitrary external command on the project star files (e.g. integrate Topaz, CryoSPARC export, or custom scripts).",
+   630→    inputs: [{ types: ["import", "motioncorr", "ctffind", "autopick", "extract", "select", "class2d", "class3d", "refine3d", "maskcreate", "postprocess", "localres", "multibody", "polish", "movierefine"], label: "Any job", optional: true }],
+   631→    outputs: [
+   632→      { key: "output", label: "External output", kind: "log", metrics: ["exit_code", "n_lines"] },
+   633→    ],
+   634→    parameters: [
+   635→      { key: "exe", label: "Command", type: "string", default: "echo", group: "Compute", help: "External command to run." },
+   636→      { key: "args", label: "Arguments", type: "string", default: "", group: "Compute", help: "Arguments passed to the command." },
+   637→      { key: "do_instar", label: "Pass input star", type: "bool", default: true, group: "Compute", help: "Pass the input star file as last arg." },
+   638→    ],
+   639→    decisionHints: {
+   640→      when: "When the agent needs a tool outside RELION (e.g. ChimeraX scripting, Topaz training, CryoSPARC import).",
+   641→      decides: "Command and arguments; the agent scripts the invocation and parses the output.",
+   642→    },
+   643→    typicalDuration: 5,
+   644→    relionBinary: "relion_external",
+   645→    docUrl: "https://relion.readthedocs.io/en/release-3.1/SPA_tutorial/External.html",
+   646→  },
+   647→];
+   648→
+   649→export const RELION_TASK_MAP: Record<string, RelionTask> = Object.fromEntries(
+   650→  RELION_TASKS.map((t) => [t.key, t]),
+   651→);
+   652→
+   653→export function getTask(key: string): RelionTask | undefined {
+   654→  return RELION_TASK_MAP[key];
+   655→}
+   656→
+   657→// Canonical single-particle analysis pipeline (the default the agent proposes)
+   658→export const CANONICAL_PIPELINE: { task: string; dependsOn: string[] }[] = [
+   659→  { task: "import", dependsOn: [] },
+   660→  { task: "motioncorr", dependsOn: ["import"] },
+   661→  { task: "ctffind", dependsOn: ["motioncorr"] },
+   662→  { task: "autopick", dependsOn: ["motioncorr", "ctffind"] },
+   663→  { task: "extract", dependsOn: ["autopick", "motioncorr", "ctffind"] },
+   664→  { task: "select", dependsOn: ["extract"] },
+   665→  { task: "class2d", dependsOn: ["select"] },
+   666→  { task: "initialmodel", dependsOn: ["class2d"] },
+   667→  { task: "class3d", dependsOn: ["initialmodel", "class2d"] },
+   668→  { task: "refine3d", dependsOn: ["class3d"] },
+   669→  { task: "maskcreate", dependsOn: ["refine3d"] },
+   670→  { task: "postprocess", dependsOn: ["refine3d", "maskcreate"] },
+   671→  { task: "localres", dependsOn: ["refine3d", "maskcreate"] },
+   672→  { task: "polish", dependsOn: ["refine3d", "motioncorr"] },
+   673→  { task: "multibody", dependsOn: ["refine3d", "maskcreate"] },
+   674→];
+   675→

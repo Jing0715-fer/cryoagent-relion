@@ -1,0 +1,948 @@
+     1→/**
+     2→ * LLM service: adapter registry with a waterfall-interceptable streaming call
+     3→ * API. Exports the `LlmRuntime` default, the abstract `LlmAdapter` for
+     4→ * provider backends, and `BlockAssembler` for chunk assembly.
+     5→ *
+     6→ * @module @deepseek-ai/dsh-llm
+     7→ */
+     8→
+     9→import { Context, Service } from '@deepseek-ai/cordis'
+    10→import type {
+    11→  GenerateOptions,
+    12→  LlmConfigurableProvider,
+    13→  LlmDiscoveredModel,
+    14→  LlmFailure,
+    15→  LlmModelContext,
+    16→  LlmModelDiscoveryRequest,
+    17→  LlmModelInfo,
+    18→  LlmResolvedModelInfo,
+    19→  LlmProviderInfo,
+    20→  ModelModality,
+    21→  StreamChunk,
+    22→} from './types.ts'
+    23→import { freezeMessage, type Message } from './message.ts'
+    24→import { resolveRetryPolicy } from './retry-policy.ts'
+    25→import type { ResolvedRetryPolicy } from './retry-policy.ts'
+    26→import type { ProviderRequestId } from './brand.ts'
+    27→import { callConfigEquals, deepFreeze } from './call-config.ts'
+    28→import type { LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts'
+    29→import { HarnessError, INVALID_CREDENTIAL_CODE } from './error.ts'
+    30→import { normalizeLlmFailure } from './adapter-failure.ts'
+    31→import { normalizeApiKey } from './api-key.ts'
+    32→
+    33→export * from './attribution.ts'
+    34→export * from './brand.ts'
+    35→export * from './never.ts'
+    36→export * from './error.ts'
+    37→export * from './api-key.ts'
+    38→export * from './types.ts'
+    39→export * from './content.ts'
+    40→export * from './message.ts'
+    41→export * from './retry-policy.ts'
+    42→export { BlockAssembler } from './assembler.ts'
+    43→export { callConfigEquals, deepFreeze, isAgentLoopRequest, markAgentLoopRequest } from './call-config.ts'
+    44→export type { LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts'
+    45→
+    46→declare module '@deepseek-ai/cordis' {
+    47→  interface Context {
+    48→    llm: LlmRuntime
+    49→  }
+    50→
+    51→  interface Events {
+    52→    /**
+    53→     * Waterfall around every streaming model call (retry, replay, routing).
+    54→     * Bound to the {@link LlmRuntime}; call `next()` to reach the resolved
+    55→     * adapter's stream, or yield your own chunks to short-circuit.
+    56→     * @param options - the full request. A LOOP-built request carries the
+    57→     *   process-local {@link markAgentLoopRequest} identity and arrives deep-frozen
+    58→     *   (mutation throws): its content is a pure function of the session log (the
+    59→     *   reconstructability Agent Note), so listeners read it, never rewrite it.
+    60→     *   Hand-built calls do not carry that marker; their messages already obey
+    61→     *   the immutable creation contract.
+    62→     * @mode waterfall
+    63→     */
+    64→    'llm/stream'(this: LlmRuntime, options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
+    65→
+    66→  }
+    67→}
+    68→
+    69→/** Structured provider facts and cause accepted by {@link LlmError}. */
+    70→export interface LlmErrorOptions extends ErrorOptions {
+    71→  /** Valid HTTP status observed at the provider boundary. */
+    72→  status?: number
+    73→  /** Positive finite provider-requested delay in milliseconds. */
+    74→  providerRetryAfterMs?: number
+    75→  /** Non-empty opaque provider request id. */
+    76→  requestId?: ProviderRequestId
+    77→}
+    78→
+    79→/**
+    80→ * Typed error for LLM-related failures. Extends {@link HarnessError}, so the
+    81→ * `code` string (e.g. `AUTH`, `RATE_LIMIT`, `NO_ADAPTER`) is shared taxonomy.
+    82→ */
+    83→export class LlmError extends HarnessError {
+    84→  /** Serializable facts retained beside this live Error. */
+    85→  readonly failure: LlmFailure
+    86→
+    87→  /**
+    88→   * @param message - non-empty human-readable failure summary.
+    89→   * @param code - non-empty stable provider-neutral machine code.
+    90→   * @param options - optional cause and validated serializable provider facts.
+    91→   */
+    92→  constructor(message: string, code: string, options?: LlmErrorOptions) {
+    93→    if (typeof message !== 'string' || message.length === 0) throw new Error('LlmError message must be a non-empty string')
+    94→    if (typeof code !== 'string' || code.length === 0) throw new Error('LlmError code must be a non-empty string')
+    95→    if (options?.status !== undefined
+    96→      && (!Number.isInteger(options.status) || options.status < 100 || options.status > 599)) {
+    97→      throw new Error('LlmError status must be an integer from 100 through 599')
+    98→    }
+    99→    if (options?.providerRetryAfterMs !== undefined
+   100→      && (!Number.isFinite(options.providerRetryAfterMs) || options.providerRetryAfterMs <= 0)) {
+   101→      throw new Error('LlmError providerRetryAfterMs must be a positive finite number')
+   102→    }
+   103→    if (options?.requestId !== undefined
+   104→      && (typeof options.requestId !== 'string' || options.requestId.length === 0)) {
+   105→      throw new Error('LlmError requestId must be a non-empty string')
+   106→    }
+   107→    super(message, code, options)
+   108→    this.name = 'LlmError'
+   109→    this.failure = Object.freeze({
+   110→      message,
+   111→      code,
+   112→      ...options?.status === undefined ? {} : { status: options.status },
+   113→      ...options?.providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs: options.providerRetryAfterMs },
+   114→      ...options?.requestId === undefined ? {} : { requestId: options.requestId },
+   115→    })
+   116→  }
+   117→}
+   118→
+   119→/**
+   120→ * Accept one supplied credential, or refuse it as unusable.
+   121→ *
+   122→ * A stored key arrives from the credentials seam, a `.env` line, or a shell
+   123→ * export, all of which pick up surrounding whitespace, so trimming is silent.
+   124→ * Anything else fails here rather than inside `fetch`, whose ByteString
+   125→ * refusal names a UTF-16 code point instead of the setting to change. The key
+   126→ * never enters the message: `ref` names where to fix it, and echoing any part
+   127→ * of a secret into a log or a UI is the failure this diagnosis avoids.
+   128→ *
+   129→ * Lives beside {@link LlmError} rather than in `./api-key.ts` so the predicate
+   130→ * module stays dependency-free; both adapters share this one diagnosis instead
+   131→ * of keeping near-identical local copies.
+   132→ * @param raw - the credential exactly as supplied.
+   133→ * @param pkg - the refusing package name, prefixed to the diagnostic.
+   134→ * @param ref - the credential reference the value resolved through.
+   135→ * @returns the trimmed, usable key.
+   136→ */
+   137→export function assertUsableApiKey(raw: string, pkg: string, ref: string): string {
+   138→  const checked = normalizeApiKey(raw)
+   139→  if (checked.ok) return checked.value
+   140→  // The Models page is named as the writer it usually is, not as the only one:
+   141→  // the same value can arrive from a hand-edited .env or a shell export in a
+   142→  // composition that mounts no credentials seam at all, where directing the
+   143→  // user to a page that deployment does not serve would be a dead end.
+   144→  throw new LlmError(
+   145→    checked.reason === 'empty'
+   146→      ? `${pkg}: the API key resolved from ${ref} is blank; set ${ref} to the raw key`
+   147→        + ' (the web Models page writes it) or export it in the launching environment'
+   148→      : `${pkg}: the API key resolved from ${ref} contains characters no HTTP header can carry;`
+   149→        + ` set ${ref} to the raw key alone (the web Models page writes it)`,
+   150→    INVALID_CREDENTIAL_CODE,
+   151→  )
+   152→}
+   153→
+   154→/** One model call whose config and adapter registration were resolved together. */
+   155→export interface PreparedLlmCall {
+   156→  /** Detached, deep-frozen config with any adapter-owned default materialized. */
+   157→  readonly config: LlmCallConfig
+   158→  /** Immutable retry policy captured with the adapter registration. */
+   159→  readonly retryPolicy: ResolvedRetryPolicy
+   160→  /** Detached context metadata resolved with the registration-bound call. */
+   161→  readonly context?: LlmModelContext
+   162→  /** Config fields materialized by the captured adapter rather than proposed by the caller. */
+   163→  readonly adapterDefaults: LlmCallConfigAdapterDefaults
+   164→  /**
+   165→   * Dispatch this call once through the registration captured during
+   166→   * preparation. The request's call-config fields must match {@link config};
+   167→   * reuse or mismatch fails with `INVALID_PREPARED_CALL`.
+   168→   * @param options - fully assembled request carrying the prepared config.
+   169→   * @returns the chunk stream, including the `llm/stream` waterfall.
+   170→   */
+   171→  stream(options: GenerateOptions): AsyncIterable<StreamChunk>
+   172→}
+   173→
+   174→/**
+   175→ * Provider-wire adapter for the harness message and stream vocabulary. Register implementations
+   176→ * with `ctx.llm.registerAdapter(providers, adapter)`. Every provider HTTP request must include
+   177→ * `attributionHeaders()`; prove the headers are added in the wire request or library header hook. The direct-fetch
+   178→ * DeepSeek and library-backed pi-ai adapters meet this contract through different internals.
+   179→ */
+   180→export abstract class LlmAdapter {
+   181→  /**
+   182→   * Describe one provider route owned by this adapter.
+   183→   * @param provider - a route passed to `registerAdapter()` for this instance.
+   184→   * @returns detached display metadata whose id must equal `provider`.
+   185→   */
+   186→  providerInfo(provider: string): LlmProviderInfo {
+   187→    return { id: provider, name: provider }
+   188→  }
+   189→
+   190→  /**
+   191→   * Return the provider-owned retry policy captured with this route.
+   192→   * @param _provider - a route passed to `registerAdapter()` for this instance.
+   193→   * @returns a resolved policy, or `undefined` to use the normal defaults.
+   194→   */
+   195→  providerRetryPolicy(_provider: string): ResolvedRetryPolicy | undefined {
+   196→    return undefined
+   197→  }
+   198→
+   199→  /**
+   200→   * List models this adapter can currently advertise for one owned provider.
+   201→   * The result is advisory: an adapter may accept unlisted model ids, and
+   202→   * consumers must not turn absence into request rejection.
+   203→   * @param _provider - one provider route owned by this adapter.
+   204→   * @returns discoverable models in adapter-preferred order.
+   205→   */
+   206→  listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+   207→    return Promise.resolve([])
+   208→  }
+   209→
+   210→  /**
+   211→   * Resolve all metadata available for one exact model. This query is
+   212→   * independent of the advisory catalog and does not validate request routing.
+   213→   * @param provider - one provider route owned by this adapter.
+   214→   * @param model - exact model id passed to {@link GenerateOptions.model}.
+   215→   * @param _signal - cancellation for this exact-model lookup; asynchronous
+   216→   *   implementations must settle promptly after it aborts.
+   217→   * @returns provider/model identity plus any context, call-default, and reasoning metadata.
+   218→   */
+   219→  resolveModel(
+   220→    provider: string,
+   221→    model: string,
+   222→    _signal?: AbortSignal,
+   223→  ): Promise<LlmResolvedModelInfo> {
+   224→    return Promise.resolve({ provider, id: model, name: model })
+   225→  }
+   226→
+   227→  /**
+   228→   * Stream one model call as raw chunks. The only required method.
+   229→   * @param options - the fully-assembled request; implementations must honor `options.signal`.
+   230→   * @returns the chunk stream, obeying the adapter contract documented on `StreamChunk`.
+   231→   */
+   232→  abstract stream(options: GenerateOptions): AsyncIterable<StreamChunk>
+   233→}
+   234→
+   235→/**
+   236→ * What {@link LlmRuntime.registerAdapter} returns: the disposer, plus an
+   237→ * atomic route replacement for the same adapter instance.
+   238→ */
+   239→export interface AdapterRegistrationHandle {
+   240→  /** Release every route this registration currently holds. */
+   241→  (): void
+   242→  /**
+   243→   * Replace this registration's routes with `providers`, keeping the same
+   244→   * adapter instance. The candidate set is validated in full first — a
+   245→   * conflict with another adapter, an invalid name, or bad provider metadata
+   246→   * throws and leaves the current routes untouched — and the swap itself is
+   247→   * one synchronous section, so no request can observe a gap. An empty array
+   248→   * is legal here (a settings section that emptied holds zero routes while
+   249→   * staying registered), unlike an empty initial registration.
+   250→   *
+   251→   * Throws `LlmError` with code `REGISTRATION_DISPOSED` once the registration
+   252→   * has been released: its routes are gone and its disposer has already run,
+   253→   * so anything registered afterwards would have no owner left to release it.
+   254→   * @param providers - the complete next route set for this registration.
+   255→   */
+   256→  replace(providers: string[]): void
+   257→}
+   258→
+   259→/**
+   260→ * A live configurable-provider registration, disposable and atomically
+   261→ * replaceable — the directory counterpart of {@link AdapterRegistrationHandle}.
+   262→ */
+   263→export interface DirectoryRegistrationHandle {
+   264→  /** Withdraw every entry this registration currently holds. */
+   265→  (): void
+   266→  /**
+   267→   * Replace this registration's entries with `entries`. The candidate set is
+   268→   * validated in full first — an entry another registration already declares,
+   269→   * a duplicate within the set, or invalid metadata throws and leaves the
+   270→   * current entries untouched — and the swap is one synchronous section, so no
+   271→   * reader observes a gap. An empty array is legal here, unlike an empty
+   272→   * initial registration.
+   273→   *
+   274→   * Throws `LlmError` with code `REGISTRATION_DISPOSED` once the registration
+   275→   * has been disposed.
+   276→   */
+   277→  replace(entries: readonly LlmConfigurableProvider[]): void
+   278→}
+   279→
+   280→/**
+   281→ * The abstract `llm` service: an adapter registry plus a streaming model-call
+   282→ * API, interceptable via the `llm/stream` waterfall.
+   283→ */
+   284→export class LlmRuntime extends Service {
+   285→  private adapters = new Map<string, AdapterRegistration>()
+   286→  private directory = new Map<string, LlmConfigurableProvider>()
+   287→  private discoveries = new Map<
+   288→    string,
+   289→    (request: LlmModelDiscoveryRequest) => Promise<readonly LlmDiscoveredModel[]>
+   290→  >()
+   291→
+   292→  constructor(ctx: Context) {
+   293→    super(ctx, 'llm')
+   294→  }
+   295→
+   296→  /** Notify topology observers without letting one broken listener veto the commit. */
+   297→  private emitAdaptersUpdated(): void {
+   298→    // Cordis emit uses Array.map: one synchronous throw starves later
+   299→    // listeners. Registry notifications are non-vetoing, so contain each
+   300→    // callback independently; INVARIANT-coded failures still surface.
+   301→    let invariantFailure: unknown
+   302→    for (const listener of this.ctx.events.dispatch('emit', ['llm/adapters-updated']) as Array<() => unknown>) {
+   303→      try {
+   304→        const returned = listener()
+   305→        if (returned != null && typeof (returned as PromiseLike<unknown>).then === 'function') {
+   306→          // An emit listener may still be an async function; its rejection
+   307→          // cannot reach the synchronous INVARIANT rethrow below, so it is
+   308→          // contained here instead of becoming an unhandled rejection.
+   309→          void Promise.resolve(returned as PromiseLike<unknown>).then(undefined, (error: unknown) => {
+   310→            this.warnAdaptersListenerFailure(error)
+   311→          })
+   312→        }
+   313→      } catch (error) {
+   314→        if ((error as { code?: unknown } | null)?.code === 'INVARIANT') {
+   315→          invariantFailure ??= error
+   316→          continue
+   317→        }
+   318→        this.warnAdaptersListenerFailure(error)
+   319→      }
+   320→    }
+   321→    if (invariantFailure !== undefined) throw invariantFailure as Error
+   322→  }
+   323→
+   324→  /** Contained-listener diagnostic shared by the sync and async failure paths. */
+   325→  private warnAdaptersListenerFailure(error: unknown): void {
+   326→    this.ctx.logger.warn('llm: an llm/adapters-updated listener failed')
+   327→    this.ctx.logger.warn(error)
+   328→  }
+   329→
+   330→  /**
+   331→   * Register an adapter for the given provider routes. Throws `LlmError` with code
+   332→   * `DUPLICATE_ADAPTER` if any provider already has an adapter (all-or-nothing).
+   333→   * Disposed with the fiber.
+   334→   * @param providers - every provider route this adapter should serve.
+   335→   * @param adapter - the adapter that streams calls for those providers.
+   336→   * @returns the disposer, carrying {@link AdapterRegistrationHandle.replace}.
+   337→   */
+   338→  registerAdapter(providers: string[], adapter: LlmAdapter): AdapterRegistrationHandle {
+   339→    // The routes this registration currently holds; `replace` rewrites it, and
+   340→    // the disposer releases whatever it holds at disposal time.
+   341→    const owned = new Set<string>()
+   342→    // The disposer has run: `owned` being empty cannot say so on its own,
+   343→    // because `replace([])` legally leaves a live registration holding none.
+   344→    let released = false
+   345→    const dispose = this.ctx.effect(function* (this: LlmRuntime) {
+   346→      if (providers.length === 0) throw new LlmError('an adapter must register at least one provider', 'INVALID_ADAPTER')
+   347→      this.commitRoutes(owned, this.prepareRoutes(providers, adapter, owned))
+   348→      yield () => {
+   349→        released = true
+   350→        for (const provider of owned) this.adapters.delete(provider)
+   351→        owned.clear()
+   352→        this.emitAdaptersUpdated()
+   353→      }
+   354→    }.bind(this), 'llm.registerAdapter()')
+   355→    // ctx.effect's disposer returns Promise<void>; our disposer API is
+   356→    // synchronous fire-and-forget — discard the (always-resolved) promise.
+   357→    const handle = (() => void dispose()) as AdapterRegistrationHandle
+   358→    handle.replace = (next: string[]): void => {
+   359→      // Registering here would leak: the effect's disposer already ran, so
+   360→      // nothing remains to release whatever this call would put in the map.
+   361→      if (released) {
+   362→        throw new LlmError('a disposed adapter registration cannot replace its routes', 'REGISTRATION_DISPOSED')
+   363→      }
+   364→      this.commitRoutes(owned, this.prepareRoutes(next, adapter, owned))
+   365→    }
+   366→    return handle
+   367→  }
+   368→
+   369→  /**
+   370→   * Validate one candidate route set for `adapter`, treating routes this
+   371→   * registration already holds as available. Nothing is mutated: a rejected
+   372→   * candidate leaves the registry exactly as it was.
+   373→   */
+   374→  private prepareRoutes(providers: string[], adapter: LlmAdapter, owned: ReadonlySet<string>): AdapterRegistration[] {
+   375→    const unique = new Set<string>()
+   376→    const registrations: AdapterRegistration[] = []
+   377→    for (const provider of providers) {
+   378→      if (provider.length === 0) throw new LlmError('adapter provider names must be non-empty', 'INVALID_ADAPTER')
+   379→      if (unique.has(provider) || (this.adapters.has(provider) && !owned.has(provider))) {
+   380→        throw new LlmError(`an adapter for provider "${provider}" is already registered`, 'DUPLICATE_ADAPTER')
+   381→      }
+   382→      const info = adapter.providerInfo(provider)
+   383→      if (typeof info.id !== 'string' || info.id !== provider || typeof info.name !== 'string' || info.name.length === 0) {
+   384→        throw new LlmError(`adapter metadata for provider "${provider}" must preserve its id and have a non-empty name`, 'INVALID_ADAPTER')
+   385→      }
+   386→      unique.add(provider)
+   387→      const retryPolicy = adapter.providerRetryPolicy(provider)
+   388→        ?? resolveRetryPolicy(undefined, `llm: provider "${provider}" retryPolicy`)
+   389→      registrations.push({
+   390→        adapter,
+   391→        provider: { id: info.id, name: info.name },
+   392→        retryPolicy,
+   393→      })
+   394→    }
+   395→    return registrations
+   396→  }
+   397→
+   398→  /**
+   399→   * Swap this registration's routes for the prepared ones in one synchronous
+   400→   * section, so no observer can see the registry between the release and the
+   401→   * re-registration. The route set's one mutation point is also where
+   402→   * `llm/adapters-updated` is published, so a `replace` announces itself
+   403→   * exactly like a first registration.
+   404→   */
+   405→  private commitRoutes(owned: Set<string>, registrations: readonly AdapterRegistration[]): void {
+   406→    for (const provider of owned) this.adapters.delete(provider)
+   407→    owned.clear()
+   408→    for (const registration of registrations) {
+   409→      this.adapters.set(registration.provider.id, registration)
+   410→      owned.add(registration.provider.id)
+   411→    }
+   412→    this.emitAdaptersUpdated()
+   413→  }
+   414→
+   415→  /**
+   416→   * Describe provider routes with a registered adapter.
+   417→   * @returns detached provider metadata in registration order.
+   418→   */
+   419→  listProviders(): LlmProviderInfo[] {
+   420→    return [...this.adapters.values()].map(({ provider }) => ({ ...provider }))
+   421→  }
+   422→
+   423→  /**
+   424→   * Declare provider routes an adapter plugin can activate through
+   425→   * configuration. Registration is all-or-nothing: an empty list, invalid
+   426→   * entry, or a provider already declared by any registration throws
+   427→   * `LlmError` without registering the rest. Disposed with the fiber.
+   428→   * @param entries - every configurable provider this plugin owns.
+   429→   * @returns a handle that withdraws all of them, and can atomically replace them.
+   430→   */
+   431→  registerConfigurableProviders(entries: readonly LlmConfigurableProvider[]): DirectoryRegistrationHandle {
+   432→    let held: LlmConfigurableProvider[] = []
+   433→    let disposed = false
+   434→    /**
+   435→     * Validate a candidate set in full against everything this registration
+   436→     * does not already hold, then publish it. Nothing is written until the
+   437→     * whole set passes, so a refused candidate leaves the current entries in
+   438→     * place — the property that makes `replace` a swap rather than a
+   439→     * delete-then-add that can strand the directory empty.
+   440→     */
+   441→    const commit = (candidates: readonly LlmConfigurableProvider[]): void => {
+   442→      const detached: LlmConfigurableProvider[] = []
+   443→      const own = new Set(held.map(entry => entry.provider))
+   444→      for (const entry of candidates) {
+   445→        if (entry.provider.length === 0 || entry.displayName.length === 0 || entry.settingsNs.length === 0) {
+   446→          throw new LlmError('configurable providers need a non-empty provider, displayName, and settingsNs', 'INVALID_DIRECTORY')
+   447→        }
+   448→        if (entry.settingsPath.some(segment => segment.length === 0)) {
+   449→          throw new LlmError(`configurable provider "${entry.provider}" has an empty settingsPath segment`, 'INVALID_DIRECTORY')
+   450→        }
+   451→        if ((this.directory.has(entry.provider) && !own.has(entry.provider))
+   452→          || detached.some(seen => seen.provider === entry.provider)) {
+   453→          throw new LlmError(`configurable provider "${entry.provider}" is already declared`, 'DUPLICATE_DIRECTORY')
+   454→        }
+   455→        detached.push({ ...entry, settingsPath: [...entry.settingsPath] })
+   456→      }
+   457→      for (const entry of held) this.directory.delete(entry.provider)
+   458→      for (const entry of detached) this.directory.set(entry.provider, entry)
+   459→      held = detached
+   460→      this.emitAdaptersUpdated()
+   461→    }
+   462→
+   463→    const dispose = this.ctx.effect(function* (this: LlmRuntime) {
+   464→      if (entries.length === 0) {
+   465→        throw new LlmError('a configurable-provider registration must declare at least one provider', 'INVALID_DIRECTORY')
+   466→      }
+   467→      commit(entries)
+   468→      yield () => {
+   469→        disposed = true
+   470→        for (const entry of held) this.directory.delete(entry.provider)
+   471→        held = []
+   472→        this.emitAdaptersUpdated()
+   473→      }
+   474→    }.bind(this), 'llm.registerConfigurableProviders()')
+   475→
+   476→    const handle = ((): void => void dispose()) as DirectoryRegistrationHandle
+   477→    handle.replace = (next: readonly LlmConfigurableProvider[]): void => {
+   478→      if (disposed) {
+   479→        throw new LlmError('this configurable-provider registration was disposed', 'REGISTRATION_DISPOSED')
+   480→      }
+   481→      commit(next)
+   482→    }
+   483→    return handle
+   484→  }
+   485→
+   486→  /**
+   487→   * List every declared configurable provider, registered or dormant.
+   488→   * @returns detached directory entries in declaration order.
+   489→   */
+   490→  listConfigurableProviders(): LlmConfigurableProvider[] {
+   491→    return [...this.directory.values()].map(entry => ({ ...entry, settingsPath: [...entry.settingsPath] }))
+   492→  }
+   493→
+   494→  /**
+   495→   * Offer to interrogate provider endpoints on behalf of the settings
+   496→   * namespace this plugin owns. The namespace is the key because that is what
+   497→   * a configuration surface already holds from the configurable-provider
+   498→   * directory, and because a provider being *added* has no route to name yet.
+   499→   * Disposed with the fiber.
+   500→   * @param settingsNs - the namespace whose profiles this discovery serves.
+   501→   * @param discover - interrogates one endpoint; must honor `request.signal`.
+   502→   * @returns the disposer that withdraws the offer.
+   503→   */
+   504→  registerModelDiscovery(
+   505→    settingsNs: string,
+   506→    discover: (request: LlmModelDiscoveryRequest) => Promise<readonly LlmDiscoveredModel[]>,
+   507→  ): () => void {
+   508→    const dispose = this.ctx.effect(function* (this: LlmRuntime) {
+   509→      if (settingsNs.length === 0) {
+   510→        throw new LlmError('model discovery needs a non-empty settings namespace', 'INVALID_DISCOVERY')
+   511→      }
+   512→      if (this.discoveries.has(settingsNs)) {
+   513→        throw new LlmError(`model discovery for "${settingsNs}" is already registered`, 'DUPLICATE_DISCOVERY')
+   514→      }
+   515→      this.discoveries.set(settingsNs, discover)
+   516→      yield () => {
+   517→        this.discoveries.delete(settingsNs)
+   518→      }
+   519→    }.bind(this), 'llm.registerModelDiscovery()')
+   520→    return () => void dispose()
+   521→  }
+   522→
+   523→  /**
+   524→   * Interrogate one provider endpoint for the models it advertises. The
+   525→   * request describes a draft, not a stored route, so nothing here reads or
+   526→   * writes settings or credentials — the caller owns both, and the reply is
+   527→   * candidate metadata a surface may offer for adoption.
+   528→   * @param settingsNs - namespace whose registered discovery serves this draft.
+   529→   * @param request - the endpoint, protocol, and one-shot credential to use.
+   530→   * @returns the advertised models, deduplicated in endpoint order.
+   531→   */
+   532→  async discoverModels(
+   533→    settingsNs: string,
+   534→    request: LlmModelDiscoveryRequest,
+   535→  ): Promise<LlmDiscoveredModel[]> {
+   536→    const discover = this.discoveries.get(settingsNs)
+   537→    if (discover === undefined) {
+   538→      throw new LlmError(`no model discovery is registered for "${settingsNs}"`, 'NO_DISCOVERY')
+   539→    }
+   540→    // One of the two identifies what to describe: a route the adapter knows, or
+   541→    // an endpoint to ask. Neither leaves nothing to answer about.
+   542→    if ((request.provider ?? '').length === 0 && (request.baseURL ?? '').length === 0) {
+   543→      throw new LlmError('model discovery needs a provider route or a baseURL', 'INVALID_DISCOVERY')
+   544→    }
+   545→    const discovered = await discover(request)
+   546→    const seen = new Set<string>()
+   547→    const models: LlmDiscoveredModel[] = []
+   548→    for (const model of discovered) {
+   549→      if (typeof model.id !== 'string' || model.id.length === 0 || seen.has(model.id)) continue
+   550→      seen.add(model.id)
+   551→      models.push({
+   552→        id: model.id,
+   553→        ...model.name === undefined ? {} : { name: model.name },
+   554→        ...model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow },
+   555→        ...model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens },
+   556→      })
+   557→    }
+   558→    return models
+   559→  }
+   560→
+   561→  /**
+   562→   * Resolve the retry policy captured when one provider route was registered.
+   563→   * @param provider - registered provider route to inspect.
+   564→   * @returns the provider-owned policy, with normal defaults already resolved.
+   565→   */
+   566→  providerRetryPolicy(provider: string): ResolvedRetryPolicy {
+   567→    return this.registration(provider).retryPolicy
+   568→  }
+   569→
+   570→  /** Detach typed adapter-owned modality metadata. */
+   571→  private detachedModalities(modalities: readonly ModelModality[] | undefined): ModelModality[] | undefined {
+   572→    return modalities === undefined ? undefined : [...modalities]
+   573→  }
+   574→
+   575→  /**
+   576→   * Discover models advertised by one registered provider. Catalog membership
+   577→   * is advisory and never changes routing or request validation.
+   578→   * @param provider - registered provider route to inspect.
+   579→   * @returns detached model metadata in adapter-preferred order.
+   580→   */
+   581→  async listModels(provider: string): Promise<LlmModelInfo[]> {
+   582→    const adapter = this.registration(provider).adapter
+   583→    const models = await adapter.listModels(provider)
+   584→    const seen = new Set<string>()
+   585→    return models.map((model) => {
+   586→      if (
+   587→        typeof model.provider !== 'string'
+   588→        || model.provider !== provider
+   589→        || typeof model.id !== 'string'
+   590→        || model.id.length === 0
+   591→        || typeof model.name !== 'string'
+   592→        || model.name.length === 0
+   593→        || (model.description !== undefined && typeof model.description !== 'string')
+   594→        || seen.has(model.id)
+   595→      ) {
+   596→        throw new LlmError(`adapter returned invalid or duplicate model metadata for provider "${provider}"`, 'INVALID_CATALOG')
+   597→      }
+   598→      seen.add(model.id)
+   599→      const inputModalities = this.detachedModalities(model.inputModalities)
+   600→      return {
+   601→        provider: model.provider,
+   602→        id: model.id,
+   603→        name: model.name,
+   604→        ...model.description === undefined ? {} : { description: model.description },
+   605→        ...inputModalities === undefined ? {} : { inputModalities },
+   606→      }
+   607→    })
+   608→  }
+   609→
+   610→  /**
+   611→   * Resolve and validate all metadata from the adapter that owns one exact
+   612→   * route. The result is detached from adapter-owned objects; catalog
+   613→   * membership remains advisory and does not control request routing.
+   614→   * @param provider - registered provider route to inspect.
+   615→   * @param model - exact model id passed to the adapter.
+   616→   * @param signal - optional cancellation for adapter-owned asynchronous lookup.
+   617→   * @returns exact model identity plus available context and reasoning metadata.
+   618→   */
+   619→  async resolveModelInfo(
+   620→    provider: string,
+   621→    model: string,
+   622→    signal?: AbortSignal,
+   623→  ): Promise<LlmResolvedModelInfo> {
+   624→    return this.resolveModelInfoFor(this.registration(provider), model, signal)
+   625→  }
+   626→
+   627→  private async resolveModelInfoFor(
+   628→    registration: AdapterRegistration,
+   629→    model: string,
+   630→    signal?: AbortSignal,
+   631→  ): Promise<LlmResolvedModelInfo> {
+   632→    const provider = registration.provider.id
+   633→    const resolved = await registration.adapter.resolveModel(provider, model, signal)
+   634→    if (
+   635→      typeof resolved.provider !== 'string'
+   636→      || resolved.provider !== provider
+   637→      || typeof resolved.id !== 'string'
+   638→      || resolved.id !== model
+   639→      || typeof resolved.name !== 'string'
+   640→      || resolved.name.length === 0
+   641→      || (resolved.description !== undefined && typeof resolved.description !== 'string')
+   642→    ) {
+   643→      throw new LlmError(
+   644→        `adapter returned invalid exact model metadata for provider "${provider}" model "${model}"`,
+   645→        'INVALID_MODEL_INFO',
+   646→      )
+   647→    }
+   648→    const context = resolved.context
+   649→    if (context !== undefined && (!Number.isInteger(context.contextWindow) || context.contextWindow <= 0)) {
+   650→      throw new LlmError(
+   651→        `adapter returned invalid context metadata for provider "${provider}" model "${model}"`,
+   652→        'INVALID_MODEL_CONTEXT',
+   653→      )
+   654→    }
+   655→    // Capability metadata rides through: an explicit modality omission is
+   656→    // negative capability downstream preflights act on (image admission).
+   657→    const inputModalities = this.detachedModalities(resolved.inputModalities)
+   658→    const defaultMaxTokens = resolved.defaultMaxTokens
+   659→    if (defaultMaxTokens !== undefined
+   660→      && (!Number.isSafeInteger(defaultMaxTokens) || defaultMaxTokens <= 0)) {
+   661→      throw new LlmError(
+   662→        `adapter returned invalid default maxTokens for provider "${provider}" model "${model}"`,
+   663→        'INVALID_MODEL_MAX_TOKENS',
+   664→      )
+   665→    }
+   666→    const info: LlmResolvedModelInfo = {
+   667→      provider,
+   668→      id: model,
+   669→      name: resolved.name,
+   670→      ...resolved.description === undefined ? {} : { description: resolved.description },
+   671→      ...inputModalities === undefined ? {} : { inputModalities },
+   672→      ...context === undefined ? {} : { context: { contextWindow: context.contextWindow } },
+   673→      ...defaultMaxTokens === undefined ? {} : { defaultMaxTokens },
+   674→    }
+   675→    const reasoning = resolved.reasoning
+   676→    if (reasoning === undefined) return info
+   677→    if (reasoning.efforts.length === 0) {
+   678→      throw new LlmError(
+   679→        `adapter returned invalid reasoning metadata for provider "${provider}" model "${model}"`,
+   680→        'INVALID_MODEL_REASONING',
+   681→      )
+   682→    }
+   683→    const seen = new Set<string>()
+   684→    const efforts = reasoning.efforts.map((effort) => {
+   685→      if (
+   686→        typeof effort.id !== 'string'
+   687→        || effort.id.length === 0
+   688→        || typeof effort.name !== 'string'
+   689→        || effort.name.length === 0
+   690→        || (effort.description !== undefined && typeof effort.description !== 'string')
+   691→        || seen.has(effort.id)
+   692→      ) {
+   693→        throw new LlmError(
+   694→          `adapter returned invalid or duplicate reasoning effort metadata for provider "${provider}" model "${model}"`,
+   695→          'INVALID_MODEL_REASONING',
+   696→        )
+   697→      }
+   698→      seen.add(effort.id)
+   699→      return {
+   700→        id: effort.id,
+   701→        name: effort.name,
+   702→        ...effort.description === undefined ? {} : { description: effort.description },
+   703→      }
+   704→    })
+   705→    if (reasoning.defaultEffort !== undefined && !seen.has(reasoning.defaultEffort)) {
+   706→      throw new LlmError(
+   707→        `adapter returned an unknown default reasoning effort for provider "${provider}" model "${model}"`,
+   708→        'INVALID_MODEL_REASONING',
+   709→      )
+   710→    }
+   711→    return {
+   712→      ...info,
+   713→      reasoning: {
+   714→        efforts,
+   715→        ...reasoning.defaultEffort === undefined ? {} : { defaultEffort: reasoning.defaultEffort },
+   716→      },
+   717→    }
+   718→  }
+   719→
+   720→  /**
+   721→   * Validate a conversation call config against its exact model capability and
+   722→   * materialize adapter-configured defaults. Unsupported explicit efforts
+   723→   * reject before provider I/O; no clamping or aliasing is performed. This
+   724→   * standalone query does not bind a later dispatch; use {@link prepareCall}
+   725→   * when logging and streaming must share one adapter registration.
+   726→   * @param config - provider/model route and optional request controls.
+   727→   * @param signal - optional cancellation for adapter-owned capability lookup.
+   728→   * @returns a detached config only when a default must be materialized.
+   729→   */
+   730→  async resolveCallConfig(config: LlmCallConfig, signal?: AbortSignal): Promise<LlmCallConfig> {
+   731→    return (await this.resolveCallFor(this.registration(config.provider), config, signal)).config
+   732→  }
+   733→
+   734→  private async resolveCallFor(
+   735→    registration: AdapterRegistration,
+   736→    config: LlmCallConfig,
+   737→    signal?: AbortSignal,
+   738→  ): Promise<{ config: LlmCallConfig; context?: LlmModelContext }> {
+   739→    const info = await this.resolveModelInfoFor(registration, config.model, signal)
+   740→    const defaulted = config.maxTokens === undefined && info.defaultMaxTokens !== undefined
+   741→      ? { ...config, maxTokens: info.defaultMaxTokens }
+   742→      : config
+   743→    const reasoning = info.reasoning
+   744→    const requested = defaulted.reasoningEffort
+   745→    let resolvedConfig = defaulted
+   746→    if (reasoning === undefined) {
+   747→      if (requested !== undefined) {
+   748→        throw new LlmError(
+   749→          `provider "${config.provider}" model "${config.model}" does not support reasoning effort "${requested}"`,
+   750→          'UNSUPPORTED_REASONING_EFFORT',
+   751→        )
+   752→      }
+   753→    } else {
+   754→      const effective = requested ?? reasoning.defaultEffort
+   755→      if (effective !== undefined) {
+   756→        if (!reasoning.efforts.some(effort => effort.id === effective)) {
+   757→          throw new LlmError(
+   758→            `provider "${config.provider}" model "${config.model}" does not support reasoning effort "${effective}"`,
+   759→            'UNSUPPORTED_REASONING_EFFORT',
+   760→          )
+   761→        }
+   762→        if (requested !== effective) resolvedConfig = { ...defaulted, reasoningEffort: effective }
+   763→      }
+   764→    }
+   765→    return {
+   766→      config: resolvedConfig,
+   767→      ...info.context === undefined ? {} : { context: info.context },
+   768→    }
+   769→  }
+   770→
+   771→  /**
+   772→   * Resolve one call under its current adapter registration. The returned
+   773→   * one-shot handle keeps that registration across header logging and dispatch,
+   774→   * so HMR cannot combine one adapter's capability result with another adapter.
+   775→   * @param config - provider/model route and optional request controls.
+   776→   * @param signal - optional cancellation for adapter-owned capability lookup.
+   777→   * @returns a prepared config and its registration-bound stream entry point.
+   778→   */
+   779→  async prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<PreparedLlmCall> {
+   780→    const registration = this.registration(config.provider)
+   781→    const resolved = await this.resolveCallFor(registration, config, signal)
+   782→    const resolvedConfig = deepFreeze(structuredClone(resolved.config))
+   783→    const context = resolved.context === undefined
+   784→      ? undefined
+   785→      : deepFreeze(structuredClone(resolved.context))
+   786→    const adapterDefaults = deepFreeze<LlmCallConfigAdapterDefaults>({
+   787→      ...config.reasoningEffort === undefined && resolvedConfig.reasoningEffort !== undefined
+   788→        ? { reasoningEffort: true }
+   789→        : {},
+   790→      ...config.maxTokens === undefined && resolvedConfig.maxTokens !== undefined
+   791→        ? { maxTokens: true }
+   792→        : {},
+   793→    })
+   794→    let dispatched = false
+   795→    return Object.freeze({
+   796→      config: resolvedConfig,
+   797→      retryPolicy: registration.retryPolicy,
+   798→      adapterDefaults,
+   799→      ...context === undefined ? {} : { context },
+   800→      stream: (options: GenerateOptions): AsyncIterable<StreamChunk> => {
+   801→        if (dispatched) {
+   802→          throw new LlmError('a prepared LLM call can only be dispatched once', 'INVALID_PREPARED_CALL')
+   803→        }
+   804→        if (!callConfigEquals(options, resolvedConfig)) {
+   805→          throw new LlmError(
+   806→            'prepared LLM call config changed before adapter dispatch',
+   807→            'INVALID_PREPARED_CALL',
+   808→          )
+   809→        }
+   810→        dispatched = true
+   811→        return this.streamWithRegistration(options, { registration, config: resolvedConfig })
+   812→      },
+   813→    })
+   814→  }
+   815→
+   816→  private registration(provider: string): AdapterRegistration {
+   817→    const registration = this.adapters.get(provider)
+   818→    if (!registration) throw new LlmError(`no adapter registered for provider "${provider}"`, 'NO_ADAPTER')
+   819→    return registration
+   820→  }
+   821→
+   822→  /** Remove replay state whose historical route is owned by another adapter. */
+   823→  private forAdapter(options: GenerateOptions, adapter: LlmAdapter): GenerateOptions {
+   824→    const messages: Message[] = options.messages.map((message) => {
+   825→      const source = message.source
+   826→      if (message.role !== 'assistant' || source.kind !== 'model' || source.replayState === undefined) return message
+   827→      if (this.adapters.get(source.provider)?.adapter === adapter) return message
+   828→      return freezeMessage({
+   829→        ...message,
+   830→        source: { kind: 'model', provider: source.provider, model: source.model },
+   831→      })
+   832→    })
+   833→    if (messages.every((message, index) => message === options.messages[index])) return options
+   834→    const filtered = { ...options, messages }
+   835→    return Object.isFrozen(options) ? deepFreeze(filtered) : filtered
+   836→  }
+   837→
+   838→  /**
+   839→   * Final adapter boundary. Adapter selection, dispatch, iterator construction,
+   840→   * and iteration failures become one terminal failure chunk. Middleware and
+   841→   * downstream consumer failures remain thrown plugin or consumer errors.
+   842→   */
+   843→  private async * adapterStream(
+   844→    options: GenerateOptions,
+   845→    prepared?: { registration: AdapterRegistration; config: LlmCallConfig },
+   846→  ): AsyncGenerator<StreamChunk> {
+   847→    let iterator: AsyncIterator<StreamChunk>
+   848→    try {
+   849→      const registration = prepared?.registration ?? this.registration(options.provider)
+   850→      const resolvedConfig = prepared === undefined
+   851→        ? (await this.resolveCallFor(registration, options, options.signal)).config
+   852→        : prepared.config
+   853→      if (prepared !== undefined && !callConfigEquals(options, resolvedConfig)) {
+   854→        throw new LlmError(
+   855→          'prepared LLM call config changed before adapter dispatch',
+   856→          'INVALID_PREPARED_CALL',
+   857→        )
+   858→      }
+   859→      const resolvedOptions = callConfigEquals(options, resolvedConfig)
+   860→        ? options
+   861→        : Object.isFrozen(options)
+   862→          ? deepFreeze({ ...options, ...resolvedConfig })
+   863→          : { ...options, ...resolvedConfig }
+   864→      const adapter = registration.adapter
+   865→      const stream = adapter.stream(this.forAdapter(resolvedOptions, adapter))
+   866→      iterator = stream[Symbol.asyncIterator]()
+   867→    } catch (error: unknown) {
+   868→      yield adapterFailureChunk(error, options.signal)
+   869→      return
+   870→    }
+   871→
+   872→    let completed = false
+   873→    try {
+   874→      while (true) {
+   875→        let item: { done: true } | { done: false; value: StreamChunk }
+   876→        try {
+   877→          const next = await iterator.next()
+   878→          item = next.done
+   879→            ? { done: true }
+   880→            : { done: false, value: next.value }
+   881→        } catch (error: unknown) {
+   882→          completed = true
+   883→          yield adapterFailureChunk(error, options.signal)
+   884→          return
+   885→        }
+   886→        if (item.done) {
+   887→          completed = true
+   888→          return
+   889→        }
+   890→        // End the adapter-owned try before yielding: consumer/middleware
+   891→        // failures resumed into this generator must remain thrown.
+   892→        yield item.value
+   893→      }
+   894→    } finally {
+   895→      if (!completed) {
+   896→        const close = iterator.return?.bind(iterator)
+   897→        if (close) await close()
+   898→      }
+   899→    }
+   900→  }
+   901→
+   902→  /**
+   903→   * Stream one model call as raw chunks (token-level deltas). Replay state is
+   904→   * retained only when the same adapter instance owns its historical provider
+   905→   * and the target provider. Final adapter selection remains fixed through
+   906→   * asynchronous exact-model resolution and dispatch. Adapter selection,
+   907→   * dispatch, and iteration failures become terminal `error` or `aborted`
+   908→   * finish chunks; middleware, nested-call, cleanup, and consumer failures
+   909→   * remain thrown.
+   910→   * @param options - the full request; `options.provider` selects the adapter.
+   911→   * @returns the chunk stream, possibly wrapped by `llm/stream` listeners.
+   912→   */
+   913→  stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+   914→    return this.streamWithRegistration(options)
+   915→  }
+   916→
+   917→  private streamWithRegistration(
+   918→    options: GenerateOptions,
+   919→    prepared?: { registration: AdapterRegistration; config: LlmCallConfig },
+   920→  ): AsyncIterable<StreamChunk> {
+   921→    return this.ctx.waterfall(
+   922→      this,
+   923→      'llm/stream',
+   924→      options,
+   925→      () => this.adapterStream(options, prepared),
+   926→    )
+   927→  }
+   928→}
+   929→
+   930→/** Convert one adapter throw into the stream protocol's terminal outcome. */
+   931→function adapterFailureChunk(error: unknown, signal?: AbortSignal): StreamChunk {
+   932→  const failure = normalizeLlmFailure(error)
+   933→  return {
+   934→    type: 'finish',
+   935→    reason: signal?.aborted || failure.code === 'ABORTED'
+   936→      ? { kind: 'aborted', failure }
+   937→      : { kind: 'error', failure },
+   938→  }
+   939→}
+   940→
+   941→interface AdapterRegistration {
+   942→  readonly adapter: LlmAdapter
+   943→  readonly provider: LlmProviderInfo
+   944→  readonly retryPolicy: ResolvedRetryPolicy
+   945→}
+   946→
+   947→export default LlmRuntime
+   948→

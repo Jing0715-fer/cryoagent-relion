@@ -1,0 +1,723 @@
+     1→---
+     2→
+     3→## Task ID: EXPLORE-DSH
+     4→
+     5→**Agent:** Explore
+     6→
+     7→**Task:** Investigate the DeepSeek Harness repository at `/tmp/deepseek-harness` (a plugin-based agent harness built on vendored Cordis) and report a thorough architectural understanding sufficient to use it as the agent layer for a cryo-EM RELION processing agent. Cover plugin/capability architecture, LLM capability, tool/subprocess/fs/workflow/shell capabilities, session log + agent loop, how to run it, how to add a custom plugin, Node/pnpm/build requirements, and the Python SDK.
+     8→
+     9→---
+    10→
+    11→### Work Log
+    12→
+    13→I read every primary source below in full or to the depth needed; excerpts below are kept short (5–15 lines each) and every claim is annotated with a concrete file path.
+    14→
+    15→Key files read:
+    16→
+    17→- `docs/architecture.md`, `docs/cordis-primer.md`, `docs/glossary.md`, `docs/capability-seams.md`, `packages/README.md`
+    18→- `packages/llm/README.md`, `packages/llm/llm/src/index.ts`, `packages/llm/llm/src/types.ts`, `packages/llm/llm-deepseek/README.md`, `packages/llm/llm-deepseek/src/adapter.ts`, `packages/llm/llm-deepseek/src/index.ts`, `packages/llm/llm-pi-ai/README.md`
+    19→- `packages/core/tools/src/index.ts`, `packages/core/tools/src/schema.ts`, `packages/core/agent/src/index.ts`, `packages/core/agent/src/dispatch.ts`, `packages/core/agent/src/runtime-types.ts`, `packages/core/agent-loop/src/index.ts`, `packages/core/agent-loop/src/agent.ts`, `packages/core/session/src/index.ts`, `packages/core/session/README.md`
+    20→- `packages/subprocess/subprocess/src/index.ts`, `packages/subprocess/subprocess-local/src/index.ts`, `packages/subprocess/README.md`
+    21→- `packages/shell/shell/src/index.ts`, `packages/fs/fs/src/index.ts`, `packages/fs/tool-fs/src/index.ts`
+    22→- `packages/workflow/workflow/src/index.ts`, `packages/workflow/tool-workflow/src/index.ts`, `packages/workflow/workflow-worker-thread/src/index.ts`, `packages/workflow/README.md`
+    23→- `packages/bundle/base/README.md`, `packages/bundle/base/cordis.patch.yml`, `packages/bundle/headless/README.md`, `packages/bundle/headless/cordis.patch.yml`, `packages/bundle/headless/src/index.ts`
+    24→- `packages/examples/README.md`, `packages/examples/agent-spine-demo/src/index.ts`, `packages/examples/jsonrpc-demo/src/bin.ts`, `packages/examples/jsonrpc-demo/src/runner.ts`
+    25→- `apps/cli/README.md`, `apps/cli/src/bin.ts`, `apps/cli/src/args.ts`
+    26→- `examples/jsonrpc-agent/cordis.yml`, `examples/jsonrpc-agent/minimal.cordis.yml`, `examples/jsonrpc-agent/minimal.py`, `examples/jsonrpc-agent/README.md`
+    27→- `docs/cookbook/adding-a-tool.md`, `docs/cookbook/adding-a-package.md`, `docs/cookbook/adding-an-llm-adapter.md`, `docs/cookbook/extension-cookbook.md`
+    28→- `package.json`, `pnpm-workspace.yaml`
+    29→- `python/README.md`, `python/sdk/README.md`, `python/sdk/src/deepseek_harness/__init__.py`, `python/sdk/src/deepseek_harness/api.py`, `python/sdk/src/deepseek_harness/client.py`, `python/sdk/src/deepseek_harness/models.py`
+    30→- `python/sdk-runtime/README.md`, `python/sdk-runtime/src/deepseek_harness_runtime/runtime/cordis.yml`
+    31→
+    32→No code was modified. No commands were executed that mutate state (only `cat`, `ls`, `find`, `sed`, `grep` reads were used inside the persistent shell session).
+    33→
+    34→---
+    35→
+    36→### Stage Summary
+    37→
+    38→Below is the structured architectural report. All file paths are relative to `/tmp/deepseek-harness/` unless otherwise noted.
+    39→
+    40→---
+    41→
+    42→## 1. Plugin / capability architecture
+    43→
+    44→### Cordis fundamentals (`docs/cordis-primer.md`, `docs/architecture.md`)
+    45→
+    46→DeepSeek Harness (DSH) is built on a **vendored** Cordis (`vendor/cordis/`). Everything — model adapter, tool registry, session log, agent loop — is a plugin. There is no privileged core; you extend by mounting plugins beside the others, and every registration is a reversible effect that unwinds on plugin unload.
+    47→
+    48→Five Cordis ideas (`docs/cordis-primer.md:8-13`):
+    49→
+    50→> - **A plugin is a object that implements Service.** It can be a function with optional `inject` and `apply(ctx)` fields, or a `Service` subclass whose lifecycle Cordis mounts into the current context.
+    51→> - **A context is a repository of services.** A service claims a stable `ctx.<key>` such as `ctx.tools`, `ctx.llm`, or `ctx.sessions` …
+    52→> - **Declare service dependency via `inject`.** … load order is expressed through service requirements rather than manual boot sequencing.
+    53→> - **Typed Events for communication.** … `emit`, `waterfall`, `parallel`, or `serial` …
+    54→> - **Registrations are reversible effects.** Prompt sections, tool schemas, adapters, providers, and listeners are installed through `ctx.effect()` or `ctx.on()` …
+    55→
+    56→Dispatch modes (`docs/cordis-primer.md:19-25`):
+    57→
+    58→| Mode | Awaited? | Dispatch Order | Has Return Value? |
+    59→|---|---|---|---|
+    60→| `emit` | No | registration order | No |
+    61→| `waterfall` | No | registration order | Yes (around-middleware; `next()` delegates) |
+    62→| `parallel` | Yes | all in parallel | No |
+    63→| `serial` | Yes | registration order | Yes |
+    64→
+    65→A plugin is the standard Cordis shape (`packages/llm/llm-deepseek/src/index.ts:41-42`):
+    66→
+    67→```ts
+    68→export const name = 'llm-deepseek'
+    69→export const inject = ['llm']
+    70→// ...
+    71→export function apply(ctx: Context, config: Config): void {
+    72→  ctx.llm.registerAdapter([PROVIDER], adapter)
+    73→  // ...
+    74→}
+    75→```
+    76→
+    77→### Capability seam (`docs/glossary.md:7-9`, `docs/architecture.md:98-103`)
+    78→
+    79→A **seam** is a swappable capability with three roles:
+    80→
+    81→> - **Service Definition** — the Cordis `Service` that owns its `ctx.<key>` and vocabulary types (abstract class such as `ShellExecutor`, or a concrete registry such as `WebRuntime`, never a TypeScript `interface`)
+    82→> - one or more **Service Providers**
+    83→> - one or more **Consumers** that inject the service
+    84→
+    85→The canonical example is `packages/shell`: `dsh-shell` (Definition), `dsh-bash-local` / `dsh-bash-sandbox` (providers), `dsh-tool-bash` (Consumer). Roles normally occupy separate packages so providers can be swapped by composition. "Seam" = the *whole* capability, never one role.
+    86→
+    87→The capability graph (`docs/capability-seams.md`) enumerates every seam (e.g. `ctx.llm`, `ctx.fs`, `ctx.shell`, `ctx.subprocess`, `ctx.workflowEngine`, `ctx.tools`, `ctx.sessions`, `ctx.agents`, `ctx.sandbox`, `ctx.attachments`, `ctx.subagents`, `ctx.tokenMeter`, `ctx.compaction`, `ctx.toolResultPruner`, `ctx.sessionQuery`, `ctx.settings`, `ctx.credentials`, …).
+    88→
+    89→### Profiles & bundles (`docs/architecture.md:15-37`, `packages/bundle/base/README.md`)
+    90→
+    91→A running `dsh` is a **plugin tree composed at boot from ordered layers**:
+    92→
+    93→- A **profile** is a named composition stored in the Harness home (`$DSH_HOME/profiles/<name>`); it lists bundles it stacks, holds any out-of-tree plugins, and keeps `cordis.patch.yml`. `web` and `headless` ship as templates.
+    94→- A **bundle** is a distribution format for Cordis config rows and the code they mount. Each declares itself in its own `package.json` under a `dsh` field: `dsh.profile` lists a profile's bundles, `dsh.bundle.patch` points at a bundle's patch file.
+    95→
+    96→Composition order (`docs/architecture.md:27`): each bundle in the profile's listed order → the profile's `cordis.patch.yml` → home-level `cordis.patch.yml` → any `--patch` overlays. Patches target rows by id and replace their whole config (or insert new rows). Inspect with `dsh --profile web --dump-config`.
+    97→
+    98→The base layer (`packages/bundle/base/cordis.patch.yml`) is a single ~450-line `insert` list of every core plugin row (timer, hmr, llm, session, typert, agent, agent-default-model, jobs, llm-retry, settings, credentials, llm-pi-ai, session-persistence-jsonl, attachment-local, session-query-sqlite, session-projection, session-telemetry-otel, subprocess, sandbox, sandbox-policy, bash-sandbox, pwsh-sandbox, approval, permission, shell-env, tool-bash, tool-pwsh, tool-jobs, fs-observation-policy, tool-fs, tool-fs-search, agent-instructions, skill, skill-filesystem, skill-badge, tool-skill, commands, command-feedback, goal, goal-round-driver, command-goal, plan-mode, token-meter, compaction-basic, command-compact, subagent, subagent-spawn-in-process, subagent-fork-in-process, tool-subagent-control, tool-subagent-list-agents, tool-subagent, tool-subagent-fork, tool-subagent-report, workflow-worker-thread, tool-workflow, timeout-policy, spill-local, spill-policy, session-checkpoint-policy, tool-result-pruner, tool-todo, tool-goal, tool-ralph, tool-str-replace-editor, repeat-tool-reminder, web, web-search-deepseek, tool-web, tools, system-prompt, agent-loop, fs-sandbox, llm-deepseek). This is the entire shipping toolchain.
+    99→
+   100→### `ctx.effect()` / `ctx.on()` registrations
+   101→
+   102→`ctx.effect(generatorFn, label?)` registers a reversible side-effect — yield a disposer function and it runs on fiber teardown. `ctx.on(eventName, listener)` registers an event listener scoped to the fiber. Both unwind automatically on plugin unmount / HMR. Example from `packages/subprocess/subprocess-local/src/index.ts:48-60`:
+   103→
+   104→```ts
+   105→constructor(ctx: Context) {
+   106→  super(ctx)
+   107→  ctx.effect(() => {
+   108→    const onHostExit = (): void => { this.terminateForHostExit() }
+   109→    process.prependListener('exit', onHostExit)
+   110→    return async () => {
+   111→      try { await this.disposeManagedProcesses() }
+   112→      finally { process.off('exit', onHostExit) }
+   113→    }
+   114→  }, 'local subprocess teardown')
+   115→}
+   116→```
+   117→
+   118→Tool registration via `ctx.tools.register()` (`packages/core/tools/src/index.ts:1037-1062`) returns a disposer and is itself an effect (`layers.effect(...)`), so fiber teardown unregisters the tool. The same pattern is used by `ctx.llm.registerAdapter(...)` (`packages/llm/llm/src/index.ts:338-367`) — its handle is both a disposer and an atomic `.replace(providers)` for swapping routes.
+   119→
+   120→### The agent loop drives a session (`docs/architecture.md:64-90`, `packages/core/agent-loop/src/agent.ts`)
+   121→
+   122→A **step** = one model request + the tools it calls. A **turn** = zero or more steps (opens before first input is claimed, closes once nothing is owed). The flow is:
+   123→
+   124→```
+   125→turn/start
+   126→  claim next-step input plus one queued message
+   127→  assemble prompt sections + tool schemas
+   128→  -> agent/pre-step                reject | enter(messages)
+   129→  step/start
+   130→  append entered messages as user/message
+   131→  derive model history from the log
+   132→  agent/request -> llm/stream -> assistant/chunk* -> assistant/message
+   133→  tool/call* -> tools/pre-execute -> tools/execute -> tools/post-execute -> tool/result*
+   134→  step/end
+   135→  -> agent/turn-stopping
+   136→turn/end
+   137→```
+   138→
+   139→`turn/*`, `step/*`, `user/message`, `assistant/*`, `tool/*` are **durable session events** (persisted to the log); `agent/pre-step`, `agent/request`, `llm/stream`, the three `tools/*` events are **live waterfalls** (listeners must `next()`); `agent/turn-stopping` is `serial` with no `next()`. `agent/pre-step` decides what the model sees; listeners may rewrite or reject claimed messages.
+   140→
+   141→The driver is `ReactLoopAgent` (`packages/core/agent-loop/src/agent.ts:64-97`). It maintains an `Inbox` of queued `UserMessage`s and a `Phase` state machine (`idle | maintenance | running`). Wake from idle → `kick()` → loop `turn()` until false → settle. `agent.followup(msg)` (next-turn wake), `agent.steer(msg)` (next-step wake), `agent.inject(msg)` (next-step, non-waking), and `agent.cancel(cause)` are the input verbs (`packages/core/agent-loop/src/agent.ts:122-148`).
+   142→
+   143→---
+   144→
+   145→## 2. LLM capability
+   146→
+   147→### Service Definition (`packages/llm/llm/src/index.ts`, `packages/llm/README.md`)
+   148→
+   149→`ctx.llm: LlmRuntime` is the seam — an adapter registry plus a streaming model-call API, interceptable via the `llm/stream` waterfall. It declares the `llm/stream` event via TypeScript declaration merging:
+   150→
+   151→```ts
+   152→declare module '@deepseek-ai/cordis' {
+   153→  interface Context { llm: LlmRuntime }
+   154→  interface Events {
+   155→    'llm/stream'(this: LlmRuntime, options: GenerateOptions,
+   156→                 next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
+   157→  }
+   158→}
+   159→```
+   160→
+   161→The abstract adapter contract (`packages/llm/llm/src/index.ts:180-232`):
+   162→
+   163→```ts
+   164→export abstract class LlmAdapter {
+   165→  providerInfo(provider: string): LlmProviderInfo { return { id: provider, name: provider } }
+   166→  providerRetryPolicy(_provider: string): ResolvedRetryPolicy | undefined { return undefined }
+   167→  listModels(_provider: string): Promise<readonly LlmModelInfo[]> { return Promise.resolve([]) }
+   168→  resolveModel(provider, model, _signal?): Promise<LlmResolvedModelInfo> { … }
+   169→  abstract stream(options: GenerateOptions): AsyncIterable<StreamChunk>
+   170→}
+   171→```
+   172→
+   173→`ctx.llm.registerAdapter(['provider-route'], adapter)` is effect-based; duplicate routes throw `LlmError('DUPLICATE_ADAPTER')`. The returned handle is `(() => void) & { replace(providers: string[]): void }` for atomic swap.
+   174→
+   175→`ctx.llm` also exposes:
+   176→- `prepareCall(config, signal)` → `PreparedLlmCall` — binds an adapter registration to one call.
+   177→- `listProviders()`, `listModels(provider)`, `resolveModelInfo(provider, model, signal)`.
+   178→- `registerConfigurableProviders([...])` — directory entries the web "Models page" surfaces.
+   179→- `registerModelDiscovery('llm-pi-ai', …)` — endpoint interrogation (no storage).
+   180→
+   181→### DeepSeek adapter (`packages/llm/llm-deepseek/`)
+   182→
+   183→The direct-fetch adapter (`packages/llm/llm-deepseek/src/adapter.ts`) talks SSE directly to `https://api.deepseek.com/chat/completions` (or any `baseURL`). Config (`packages/llm/llm-deepseek/src/index.ts:62-101`):
+   184→
+   185→```ts
+   186→export interface Config {
+   187→  apiKeyEnv?: string            // default 'DEEPSEEK_API_KEY'
+   188→  baseURL?: string              // falls back to $DEEPSEEK_BASE_URL then https://api.deepseek.com
+   189→  thinking?: 'enabled' | 'disabled'
+   190→  reasoningEffort?: 'off' | 'high' | 'max'   // default 'high'
+   191→  maxTokens?: number            // default 256_000
+   192→  defaultContextWindow?: number // default 1_000_000
+   193→  models?: DeepSeekCatalogModel[]
+   194→  streamIdleTimeoutMs?: number  // default 5 min
+   195→  retryPolicy?: RetryPolicyConfig
+   196→}
+   197→```
+   198→
+   199→Provider route name: `deepseek-official`. It registers exactly one route; registering another adapter for the same route throws `DUPLICATE_ADAPTER`. The adapter re-reads connection facts **once per operation** (via a thunk), so a settings change reaches the *next* request without restart. The key resolves per request through `ctx.credentials` if mounted, else through the trusted environment layer (`launchEnvironmentOf(ctx)`).
+   200→
+   201→### Does it support custom base URLs / OpenAI-compatible endpoints? **YES.**
+   202→
+   203→Two routes:
+   204→
+   205→1. **`dsh-llm-deepseek`** — set `baseURL: https://your-openai-compatible-endpoint` in the plugin config or in the `llm-deepseek:` settings section, and `apiKeyEnv: YOUR_KEY_ENV`. Any OpenAI-compatible `/chat/completions` endpoint (proxy, gateway, z-ai-web-dev-sdk backed server) works.
+   206→
+   207→2. **`dsh-llm-pi-ai`** — the more flexible twin, designed exactly for this (`packages/llm/llm-pi-ai/README.md:48-72`):
+   208→
+   209→```yaml
+   210→- id: llm
+   211→  name: '@deepseek-ai/dsh-llm-pi-ai'
+   212→  config:
+   213→    providers:
+   214→      acme-gateway:               # hand-declared route; pi-ai ships nothing here
+   215→        displayName: Acme Gateway
+   216→        apiKeyEnv: ACME_GATEWAY_API_KEY
+   217→        api: openai-completions
+   218→        baseURL: https://gateway.acme.example/v1
+   219→        compat:
+   220→          thinkingFormat: deepseek
+   221→        models:
+   222→          - id: acme-large
+   223→            contextWindow: 65536
+   224→            maxTokens: 4096
+   225→```
+   226→
+   227→Supported `api` protocols (`supportedProtocols()`): `openai-completions` and `openai-responses` (the only protocols fully describable with a key + endpoint + headers). Bedrock, Vertex, Azure, Codex are excluded as not authenticatable by config alone. So pointing DSH at a z-ai-web-dev-sdk backed OpenAI-compatible HTTP endpoint is supported either way.
+   228→
+   229→### Providers that ship by default
+   230→
+   231→- `deepseek-official` via `@deepseek-ai/dsh-llm-deepseek` (mounted in `dsh-base`).
+   232→- `llm-pi-ai` via `@deepseek-ai/dsh-llm-pi-ai` mounted **dormant** in `dsh-base` (`packages/bundle/base/cordis.patch.yml:95-96`); zero routes until a `llm-pi-ai:` settings section supplies profiles. pi-ai's installed catalog includes `openai`, `anthropic`, `deepseek`, `google`, `mistral`, etc.
+   233→- Default model mounted: `provider: deepseek-official`, `model: deepseek-v4-flash` (`packages/bundle/base/cordis.patch.yml:64-67`).
+   234→
+   235→The LLM seam also includes:
+   236→- `dsh-llm-retry` — provider-scoped retry policy on `agent/request-error`.
+   237→- `dsh-token-meter` — `ctx.tokenMeter`, replay-aware token measurement.
+   238→
+   239→---
+   240→
+   241→## 3. Tool / subprocess / fs / workflow / shell capabilities
+   242→
+   243→### Tool registry (`packages/core/tools/src/index.ts`, `docs/cookbook/adding-a-tool.md`)
+   244→
+   245→`ctx.tools: ToolRuntime` is the seam. A plugin exposes a tool the agent can call by registering a `ToolDefinition`:
+   246→
+   247→```ts
+   248→// docs/cookbook/adding-a-tool.md:14-35
+   249→export const name = 'my-tool'
+   250→export const inject = ['tools']
+   251→
+   252→export function apply(ctx: Context) {
+   253→  ctx.tools.register(defineTool({
+   254→    name: 'read_file',
+   255→    description: 'Read a file from disk.',
+   256→    parameters: {
+   257→      path: { type: 'string', required: true, description: 'Absolute path' },
+   258→      limit: { type: 'number' },
+   259→    },
+   260→    output: {
+   261→      schema: { type: 'string' },
+   262→      render: (_args, value) => [{ type: 'text', text: value }],
+   263→    },
+   264→    async execute(args, exec) {
+   265→      return readFile(args.path, { encoding: 'utf8', signal: exec.signal })
+   266→    },
+   267→  }))
+   268→}
+   269→```
+   270→
+   271→`defineTool` (`packages/core/tools/src/schema.ts`) is the typed helper; raw `ToolDefinition`s are also accepted (this is how MCP-sourced tools arrive). The tool pipeline (`packages/core/tools/src/index.ts:137-209`):
+   272→
+   273→- `tools/pre-execute` (waterfall) — allow / deny / ask before dispatch.
+   274→- `tools/execute` (waterfall) — around-dispatch wrapper for timeout / retry / metrics; may replace `exec.signal` but cannot remove it.
+   275→- `tools/post-execute` (waterfall) — accept / replace / enrich / block the normalized result.
+   276→- `tools/result` (emit) — observe the immutable frozen outcome.
+   277→- `tools/change` (emit) — registry mutation notification.
+   278→
+   279→Tool schemas flow into prompt assembly automatically via `ctx.systemPrompt`. The `tools` registry also supports:
+   280→- `tools.restrict({ allow, deny })` — per-agent-scope tool filtering.
+   281→- `tools.guard(guard)` — monotonic final denial that later listeners cannot undo.
+   282→
+   283→### Subprocess (`packages/subprocess/`)
+   284→
+   285→`ctx.subprocess: SubprocessRuntime` (`packages/subprocess/subprocess/src/index.ts:102-140`) is the abstract Service Definition with three abstract methods:
+   286→
+   287→```ts
+   288→export abstract class SubprocessRuntime extends Service {
+   289→  abstract resolveExecutable(command, env?, signal?): Promise<string>
+   290→  abstract spawn(spec: SubprocessSpawnSpec): SubprocessHandle
+   291→  abstract spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<SubprocessTerminalHandle>
+   292→}
+   293→```
+   294→
+   295→The provider `@deepseek-ai/dsh-subprocess-local` (`packages/subprocess/subprocess-local/src/index.ts`) implements these via `child_process` + `node-pty`. Each spawn is a **detached process tree**; tree-scoped SIGTERM→grace→SIGKILL; environment is scrubbed (`SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i` and all `DSH_*` names removed; `scrubbedParentEnv()`). Consumers own what a process means (a bash command, an LSP server, a subagent). Disposal of the service terminates and awaits all managed processes.
+   296→
+   297→### Filesystem (`packages/fs/`)
+   298→
+   299→`ctx.fs: FileSystem` (`packages/fs/fs/src/index.ts:86-250`) is the abstract filesystem provider for one execution world. Backends own stable target identity, process paths, file URIs, containment, text reads, atomic mutations:
+   300→
+   301→```ts
+   302→export abstract class FileSystem extends Service {
+   303→  abstract resolve(path, opts?): Promise<FsTarget>
+   304→  abstract processPath(target): string
+   305→  abstract fileUrl(target): string
+   306→  abstract contains(parent, child): boolean
+   307→  abstract stat(target, signal?): Promise<FsInfo | undefined>
+   308→  abstract readText(target, signal?): Promise<string>
+   309→  abstract streamText(target, signal?): Promise<AsyncIterable<string>>
+   310→  abstract readBytes(target, signal, maxBytes): Promise<Uint8Array>
+   311→  abstract listDir(target, signal?): Promise<FsDirEntry[]>
+   312→  abstract writeText(target, content, expected?, signal?, sandboxPolicy?): Promise<FsWriteOutcome>
+   313→  abstract editText(target, edit, expected?, signal?, sandboxPolicy?): Promise<FsEditOutcome>
+   314→}
+   315→```
+   316→
+   317→Three events: `fs/write-intent` (waterfall, single-slot decision), `fs/edit-intent` (waterfall), `fs/observed` (emit). Implementations:
+   318→- `dsh-fs-local` — bare local FS.
+   319→- `dsh-fs-sandbox` — wraps `dsh-fs-local` and confines writes by a `ctx.sandbox` policy (`packages/bundle/base/cordis.patch.yml:443-444`). Note: **only one `ctx.fs` provider can mount at a time** — `dsh-base` mounts `dsh-fs-sandbox`, not `dsh-fs-local`.
+   320→
+   321→Model-facing tools: `dsh-tool-fs` (read/write/edit/read_image), `dsh-tool-fs-search` (ripgrep-backed grep + glob), `dsh-tool-str-replace-editor` (string-replace editor). `tool-fs/src/index.ts:54-79` is a clean reference for the Consumer pattern: it reads `ctx.fs` and `ctx.systemPrompt` via `inject: ['tools', 'fs', 'systemPrompt']`, then `applyReadTool` / `applyWriteTool` / `applyEditTool` each call `ctx.tools.register(defineTool({ … }))`.
+   322→
+   323→### Shell / Bash (`packages/shell/`)
+   324→
+   325→`ctx.shell: ShellExecutor` (`packages/shell/shell/src/index.ts:65-101`):
+   326→
+   327→```ts
+   328→export abstract class ShellExecutor extends Service {
+   329→  get sandboxMode(): SandboxMode | undefined { return undefined }
+   330→  abstract resolve(request: ShellExecRequest): ShellExecSpec
+   331→  abstract run(spec: ShellExecSpec): Promise<ShellRunResult>
+   332→  abstract start(spec: ShellExecSpec): ShellProcess   // background
+   333→}
+   334→```
+   335→
+   336→Providers: `dsh-bash-local` (no sandbox), `dsh-bash-sandbox` (sandboxed via `ctx.sandbox` — Landlock on Linux, Seatbelt on macOS, bwrap on Linux for non-Landlock), `dsh-pwsh-local`, `dsh-pwsh-sandbox` (Windows ACL). Consumer: `dsh-tool-bash`. **Only one `ctx.shell` can mount at a time**; `dsh-base` gates bash and pwsh rows by platform (`disabled: !!js process.platform === 'win32'`).
+   337→
+   338→### Workflow (`packages/workflow/`)
+   339→
+   340→`ctx.workflowEngine: WorkflowEngine` (`packages/workflow/workflow/src/index.ts:157-187`):
+   341→
+   342→```ts
+   343→export abstract class WorkflowEngine extends Service {
+   344→  abstract start(request: WorkflowStartRequest): WorkflowRun
+   345→  protected emitWorkflowEvent(name: WorkflowEventName, ...args: unknown[]): void
+   346→}
+   347→```
+   348→
+   349→Events (`workflow/*`, all `emit`): `workflow/start`, `workflow/phase`, `workflow/log`, `workflow/agent-start`, `workflow/agent-end`, `workflow/end`. The worker-thread engine (`@deepseek-ai/dsh-workflow-worker-thread`) executes model-authored JavaScript orchestration scripts inside a `vm.Script` on a fresh `Worker` thread (`packages/workflow/workflow-worker-thread/src/index.ts:30-74`). Configurable caps: `maxConcurrentAgents` (default `min(16, cores-2)`), `maxTotalAgents` (1000), `maxItemsPerCall` (4096), `syncTimeoutMs` (5000), `disposeGraceMs` (5000). The script body has hooks `agent(prompt, opts?)`, `pipeline(items, ...stages)`, `parallel(thunks)`, `phase(title)`, `log(message)`, and `args`. No fs/network/timer/Node access from inside the script — agents do the work.
+   350→
+   351→Consumer: `dsh-tool-workflow` (`packages/workflow/tool-workflow/src/index.ts:29-43`) registers the model-facing `workflow` tool:
+   352→
+   353→```ts
+   354→export const name = 'tool-workflow'
+   355→export const inject = ['tools', 'workflowEngine', 'systemPrompt']
+   356→export const Config: z<Config> = z.object({
+   357→  toolName: z.string().default('workflow'),
+   358→  maxResultChars: z.natural().min(1).default(50_000),
+   359→})
+   360→```
+   361→
+   362→`dsh-tool-ralph` is a second consumer: a fixed fresh-agent Ralph workflow (multiple fresh child sessions toward an immutable objective).
+   363→
+   364→### How a plugin exposes a tool the agent can call (summary)
+   365→
+   366→1. Add a new package or use a `cordis.patch.yml` row with `name: '@deepseek-ai/dsh-<your-tool>'`.
+   367→2. The plugin exports `name`, `inject: ['tools']` (plus anything else you need, e.g. `'fs'`, `'subprocess'`, `'systemPrompt'`), and `apply(ctx, config)`.
+   368→3. Inside `apply`, call `ctx.tools.register(defineTool({ name, description, parameters, output, execute }))`.
+   369→4. The tool's JSON Schema automatically flows into prompt assembly; the agent loop calls `execute` and threads `exec.signal` for cancellation.
+   370→
+   371→---
+   372→
+   373→## 4. Session log + agent loop
+   374→
+   375→### Session log (`packages/core/session/README.md`, `packages/core/session/src/index.ts`)
+   376→
+   377→A `Session` is the **append-only source of truth** for an agent's whole interaction history; the LLM message history is *derived* from it via `session.deriveMessages()`. Service: `ctx.sessions: SessionStore`.
+   378→
+   379→Public API (`packages/core/session/README.md:14-19`):
+   380→
+   381→```ts
+   382→ctx.sessions.create(id?, { seed?, meta? }?): Session
+   383→ctx.sessions.flush(session): Promise<void>        // awaited parallel durability checkpoint
+   384→ctx.sessions.fork(source, boundary?, childSessionId?): Session
+   385→ctx.sessions.get(id: SessionId): Session | undefined
+   386→ctx.sessions.list(): Session[]
+   387→```
+   388→
+   389→Durable session events (a closed, merge-extensible vocabulary — see `docs/persistence-catalog.md`): `turn/start`, `turn/end`, `step/start`, `step/end`, `user/message`, `assistant/chunk`, `assistant/message`, `tool/call`, `tool/result`, `request/header`, plus plugin-merged types (`compaction/*`, `llm/retry`, `hook/*`, `tool-workflow/*`, `plan/mode`, …). Every `SessionEvent` carries optional `sourceEventSeqs`, `surfaceOp`, and `ignorable`. **Model-visible means logged**: anything reaching a model request must be reconstructable from the log (runtime invariant asserts it).
+   390→
+   391→Persistence is a plugin concern: subscribe to `session/event` (write-behind) and drain on `session/flush` (awaited). The shipped JSONL backend is `@deepseek-ai/dsh-session-persistence-jsonl`, mounted in `dsh-base` at `dshHomePath('sessions')` (`packages/bundle/base/cordis.patch.yml:98-99`). SQLite is `dsh-session-query-sqlite` (FTS) mounted with `openAt: never` by default (opt-in).
+   392→
+   393→The "surface" layer is an ordered projection of message-producing events, maintained on top of the raw log for efficient derivation and compaction. `session.surface.replaceGeneration` increments on every committed rewrite.
+   394→
+   395→### Agent loop (`packages/core/agent-loop/src/agent.ts`, `packages/core/agent/src/dispatch.ts`)
+   396→
+   397→The driver is `ReactLoopAgent` (`packages/core/agent-loop/src/agent.ts:64`). It owns the `Inbox` (queued user messages) and a `Phase` state machine: `idle | maintenance | running`. Input verbs (`agent.ts:122-148`):
+   398→
+   399→```ts
+   400→send(message, target, wakeup)        // internal router
+   401→followup(input)   // target='next-turn', wake=true  — ordinary user turn
+   402→steer(input)      // target='next-step', wake=true   — mid-turn steering
+   403→inject(input)     // target='next-step', wake=false  — context-only, no wake
+   404→cancel(cause, { keepInbox } = {})
+   405→runMaintenance<T>(job: (signal) => Promise<T>): Promise<T>
+   406→whenIdle(): Promise<void>
+   407→```
+   408→
+   409→`turn()` (`agent.ts:227-322`) opens `turn/start`, then loops: `preStep()` → assemble system prompt + tool schemas → `agent/pre-step` waterfall (which can reject or rewrite messages) → if entering, `step/start`, append `user/message`s → `step()` → `step/end`. If turn ends and no `next-step` inbox messages, dispatches `agent/turn-stopping` (serial), then `turn/end`.
+   410→
+   411→`step()` (`agent.ts:325-388`) builds the request via `buildRequest()`, calls `preparedCall.stream(request)` (or `ctx.llm.stream(request)`), appends each chunk as `assistant/chunk`, the assembled message as `assistant/message`, then `executeToolCalls(...)` for any `tool-call` blocks:
+   412→
+   413→```ts
+   414→const toolCalls = message.content.filter(b => b.type === 'tool-call')
+   415→if (toolCalls.length === 0) return { kind: 'completed' }
+   416→const { concluded } = await executeToolCalls(
+   417→  this.loopCtx, turn, step, toolCalls, signal,
+   418→  context => this.inbox.splice('next-step', this.inbox.nextStep.length, 0, [context]),
+   419→)
+   420→return concluded ? { kind: 'completed' } : null
+   421→```
+   422→
+   423→`buildRequest()` (`agent.ts:391-446`) runs `agent/request` waterfall to allow listeners to rewrite the LlmCallConfig (provider/model/reasoningEffort/maxTokens). Then `ctx.llm.prepareCall(config, signal)` resolves the adapter and binds the call.
+   424→
+   425→### Events emitted (the full agent-subject catalog)
+   426→
+   427→From `packages/core/agent/src/runtime-types.ts:159-290`:
+   428→
+   429→| Event | Mode | Purpose |
+   430→|---|---|---|
+   431→| `agent/created` | emit | agent published |
+   432→| `agent/disposed` | emit | agent torn down |
+   433→| `agent/status` | emit | `idle | running` |
+   434→| `agent/inbox/inserted` | emit | message queued |
+   435→| `agent/inbox/claimed` | emit | message claimed by a turn |
+   436→| `agent/inbox/discarded` | emit | message dropped (cancel, splice) |
+   437→| `agent/session-start` | emit | session-bound setup runs |
+   438→| `agent/pre-step` | waterfall | reject or rewrite claimed messages |
+   439→| `agent/request` | waterfall | propose LlmCallConfig |
+   440→| `agent/request-error` | waterfall | retry policy decision |
+   441→| `agent/turn-stopping` | serial (no `next()`) | steer another step |
+   442→| `agent/error` | emit | failure reported at its live boundary |
+   443→
+   444→Plus the session-subject events (`session/created`, `session/disposed`, `session/event`, `session/flush`), the tool events (`tools/pre-execute`, `tools/execute`, `tools/post-execute`, `tools/result`, `tools/change`, `tools/code-dispatch-log`), the LLM event (`llm/stream`, `llm/adapters-updated`), the fs events (`fs/write-intent`, `fs/edit-intent`, `fs/observed`), the workflow events (`workflow/start`, `workflow/phase`, `workflow/log`, `workflow/agent-start`, `workflow/agent-end`, `workflow/end`), and plugin-merged events.
+   445→
+   446→The fused dispatcher is `agentEvents(ctx, agent)` (`packages/core/agent/src/dispatch.ts:107-130`), which couples the agent subject to its scope carrier. It exposes `emit(name, payload)`, `serial(name, payload)`, and `waterfall(name, payload, ...rest)` — all scope-filtered so an agent-scoped listener only sees its own agent's events.
+   447→
+   448→---
+   449→
+   450→## 5. How to run it
+   451→
+   452→### The CLI (`apps/cli/`)
+   453→
+   454→The `dsh` launcher (`apps/cli/src/args.ts:112-191`, `apps/cli/README.md`) parses only its own flags (`--profile`, `--patch`, `--dump-config`, `--dump-default-config`) and hands everything after to the booted profile's app plugin. From the root `package.json:136`: `"dsh": "node --import tsx/esm apps/cli/src/bin.ts"`. So in dev: `pnpm dsh web` or `pnpm dsh --profile headless "task"`.
+   455→
+   456→Entry modes (`apps/cli/README.md:9-14`):
+   457→
+   458→| Command | Purpose |
+   459→|---|---|
+   460→| `dsh --profile <name>` | Boot the named profile under `$DSH_HOME/profiles/<name>`. |
+   461→| `dsh --profile headless "job"` | Run one fresh persisted session, print the final answer, exit. |
+   462→| `dsh web` | Alias of `--profile web`. |
+   463→| `dsh plugin --profile <name> <pnpm args>` | Manage a profile's plugins via pnpm. |
+   464→
+   465→`web` and `headless` profiles auto-initialize on first use from shipped templates; other profiles must be created via `dsh plugin`. The invoking directory is the default workspace root.
+   466→
+   467→### Minimal runnable agent (`packages/examples/agent-spine-demo/`, `packages/bundle/headless/`)
+   468→
+   469→`@deepseek-ai/dsh-agent-spine-demo` (`packages/examples/agent-spine-demo/src/index.ts`) is a reusable bundle that loads Timer, LlmRuntime, SessionStore, SessionTitleService, SystemPrompt, ToolRuntime, SkillRegistry, SkillFileSystem, AgentRegistry, llmRetry, LocalJobRegistry, InvariantRegistry, the bash/skill/job tool plugins, and `AgentLoop`. Load order is irrelevant (Cordis pends each fiber on `inject`), but it's listed in dependency layering for readability.
+   470→
+   471→`@deepseek-ai/dsh-headless` (`packages/bundle/headless/src/index.ts:96-134`) is the one-shot driver — it creates one Agent via `ctx.agents.create({ sessionId, meta: { cwd }, agentOptions: { provider, model }, setup })`, calls `agent.followup(createUserMessage(...))`, awaits `agent.whenIdle()`, flushes the session, prints the last assistant text to stdout, and exits 0 (or 1 on error). The bundle patch (`packages/bundle/headless/cordis.patch.yml`) rides directly over `dsh-base`, mounts `dsh-code-runtime-worker-thread` and `dsh-headless/startup`, sets the persona to `You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.`, disables HMR, and supplies the task from the launcher's positional arg.
+   472→
+   473→### Env vars
+   474→
+   475→- `DEEPSEEK_API_KEY` — credential resolved per request via `ctx.credentials` (or trusted env layer if no seam).
+   476→- `DEEPSEEK_BASE_URL` — endpoint override; honored only from trusted layers (the product CLI trusts the launching project).
+   477→- `DSH_HOME` — harness home directory; profiles live under `$DSH_HOME/profiles/<name>`, JSONL sessions under `$DSH_HOME/sessions`.
+   478→- `DSH_CWD` — agent workspace root for bash/fs (the jsonrpc-agent example uses `process.env.DSH_CWD ?? process.cwd()`).
+   479→- `DSH_SESSION_ROOT` — JSONL session log directory.
+   480→- `DSH_PERMISSION_MODE` — `read-only | workspace-write | danger-full-access` (default `workspace-write`).
+   481→- `DSH_SYSTEM_PROMPT` — deployment persona override.
+   482→- `DSH_MODEL`, `DSH_CONTEXT_WINDOW`, `DSH_MAX_TOKENS_AS_SUCCESS`, `DSH_TELEMETRY_MODE`, `DSH_TELEMETRY_OTLP_URL`, `DSH_TELEMETRY_DISABLED`, `DSH_TOOLS_MODE`, `DSH_CORDIS_CONFIG`, `DSH_RUNTIME_MODE`.
+   483→
+   484→### JSON-RPC dev leaves (`packages/examples/jsonrpc-demo/`, `examples/jsonrpc-agent/cordis.yml`)
+   485→
+   486→`@deepseek-ai/dsh-sdk-jsonrpc-demo` runs the bundled JSON-RPC server over stdio (`packages/examples/jsonrpc-demo/src/runner.ts:20-54`). It reads `DSH_CORDIS_CONFIG` or argv[1] as the config path, calls `boot(NAME, configPath, ...)`, and on stdin-EOF / SIGTERM / SIGINT disposes the fiber and exits. The `examples/jsonrpc-agent/cordis.yml` composition mounts `sdk-jsonrpc-server`, `llm-deepseek`, `subprocess-local`, `bash-local`, `agent-spine` (= `dsh-agent-spine-demo` with workspaceContext/skills/jobs off), session-persistence-jsonl, session-checkpoints, subagent + subagent-spawn-in-process + tool-subagent, tool-todo, fs-local + fs-observation-policy + tool-fs, token-meter, compaction-basic. A minimal variant (`examples/jsonrpc-agent/minimal.cordis.yml`) keeps only persistent bash + str_replace_editor with `danger-full-access` policy.
+   487→
+   488→---
+   489→
+   490→## 6. How to add a custom plugin
+   491→
+   492→`docs/cookbook/adding-a-tool.md` and `docs/cookbook/adding-a-package.md` are the cookbooks (there is no `adding-a-plugin.md`; "plugin" = "package" in this repo's vocabulary). The minimal pattern:
+   493→
+   494→### Minimal tool plugin (TypeScript source)
+   495→
+   496→```ts
+   497→// packages/<group>/<pkg>/src/index.ts
+   498→import { readFile } from 'node:fs/promises'
+   499→import type { Context } from '@deepseek-ai/cordis'
+   500→import { defineTool } from '@deepseek-ai/dsh-tools'
+   501→
+   502→export const name = 'my-tool'
+   503→export const inject = ['tools']
+   504→
+   505→export function apply(ctx: Context) {
+   506→  ctx.tools.register(defineTool({
+   507→    name: 'read_file',
+   508→    description: 'Read a file from disk.',
+   509→    parameters: { path: { type: 'string', required: true, description: 'Absolute path' } },
+   510→    output: { schema: { type: 'string' },
+   511→              render: (_args, value) => [{ type: 'text', text: value }] },
+   512→    async execute(args, exec) { return readFile(args.path, { encoding: 'utf8', signal: exec.signal }) },
+   513→  }))
+   514→}
+   515→```
+   516→
+   517→Registration is effect-based: disposing the plugin fiber unregisters the tool. Schemas flow into system-prompt assembly automatically.
+   518→
+   519→### Minimal cordis.yml row to load it
+   520→
+   521→```yaml
+   522→- id: my-tool
+   523→  name: '@deepseek-ai/dsh-my-tool'
+   524→  # config: { ... }            # optional, validated by the plugin's schemastery Config schema
+   525→  # disabled: false             # optional, can be a !!js expression
+   526→```
+   527→
+   528→Drop this row in your profile's `cordis.patch.yml`, your home-level `cordis.patch.yml`, or a `--patch` overlay.
+   529→
+   530→### Minimal capability provider plugin
+   531→
+   532→A swappable capability has three roles in three packages (when they evolve independently). For a RELION runner you'd likely create:
+   533→
+   534→1. **Service Definition** — abstract `Service` subclass claiming `ctx.relion` (a Cordis `Service`, never a TS `interface`).
+   535→2. **Service Provider** — concrete subclass implementing the abstract methods, registered as a plugin that mounts on `ctx.relion`.
+   536→3. **Consumer** — model-facing tool(s) under `ctx.tools` that inject `['relion']` and call `ctx.relion.*`.
+   537→
+   538→The shell trio is the template: `packages/shell/shell/` (Definition), `packages/shell/bash-local/` and `packages/shell/bash-sandbox/` (providers), `packages/shell/tool-bash/` (Consumer).
+   539→
+   540→### Package layout (`docs/cookbook/adding-a-package.md:9-25`)
+   541→
+   542→```
+   543→packages/<group>/<pkg>/
+   544→  package.json     # copy from packages/core/tools; name '@deepseek-ai/dsh-<name>'
+   545→  tsconfig.json    # extends ../../../tsconfig.base.json, rootDir src, outDir lib/types,
+   546→                   # references to vendor/cordis, vendor/cosmokit, vendor/schemastery,
+   547→                   # plus each dsh dependency
+   548→  src/index.ts     # service default export OR plugin (name/inject/apply/Config)
+   549→  README.md        # service API, events, extension points, Model Experience,
+   550→                   # Known Limitations and Deferred Work
+   551→```
+   552→
+   553→package.json invariants (enforced by `pnpm run constraints`): `private: true`, version matching root, `type: module`, `main: "lib/index.js"`, `types: "lib/types/index.d.ts"`, `exports["."].types: "./lib/types/index.d.ts"`, `exports["."].default: "./lib/index.js"`, `@deepseek-ai/cordis` in BOTH peerDependencies and devDependencies (same range), mirror every dsh peer in devDependencies, `@deepseek-ai/schemastery` in `dependencies` (runtime validator), `files: ["lib/index.js", "lib/types/**/*.d.ts", ...]`.
+   554→
+   555→For an existing group, no tsconfig edit is needed. For a new group, add `./packages/<group>/*/src` to the `@deepseek-ai/dsh-*` wildcard in `tsconfig.base.json`, and add `{ "path": "./packages/<group>/<pkg>" }` to either `tsconfig.host.json` (host packages) or `tsconfig.client.json` (client packages) — exactly one, never both.
+   556→
+   557→### Hook plugin (permission gate) — `docs/cookbook/extension-cookbook.md:23-31`
+   558→
+   559→```ts
+   560→export const name = 'permission-gate'
+   561→export function apply(ctx: Context) {
+   562→  ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+   563→    if (!(await isAllowed(exec))) return { kind: 'deny', reason: 'Denied by policy.' }
+   564→    return next()
+   565→  })
+   566→}
+   567→```
+   568→
+   569→### LLM adapter — `docs/cookbook/adding-an-llm-adapter.md`
+   570→
+   571→```ts
+   572→class MyAdapter extends LlmAdapter {
+   573→  async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> { … }
+   574→}
+   575→export const name = 'llm-myprovider'
+   576→export const inject = ['llm']
+   577→export const Config: z<Config> = z.object({ apiKey: z.string(), … })
+   578→export function apply(ctx: Context, config: Config) {
+   579→  ctx.llm.registerAdapter(['my-provider'], new MyAdapter(…))
+   580→}
+   581→```
+   582→
+   583→---
+   584→
+   585→## 7. Node / pnpm / build requirements
+   586→
+   587→From `package.json` and `pnpm-workspace.yaml`:
+   588→
+   589→- **Node**: `^22.19.0 || >=24.0.0` (`package.json:8-10` `engines.node`). The dev-only node carrier of the Python SDK requires Node ≥ 22.19.
+   590→- **pnpm**: `11.7.0` (the root `packageManager`).
+   591→- **TypeScript**: `^6.0.3`. The peerDependencyRules allow `typescript: '>=5 <7'`.
+   592→- Workspaces: `vendor/*`, `packages/*/*`, `native/landlock-run`, `native/landlock-run/packages/*`, `apps/*`, `website`, `examples`, `python/sdk-runtime`.
+   593→- `linkWorkspacePackages: true`; overrides pin `@deepseek-ai/cosmokit` and `@deepseek-ai/schemastery` to local vendored sources.
+   594→- `allowBuilds` allowlist (pnpm 10 strictDepBuilds): only `esbuild`, `lefthook`, `node-pty`, `koffi`, `@deepseek-ai/dsh-subprocess-local@file:...` are allowed to run install scripts; `@google/genai`, `protobufjs`, `node-addon-require-builtin*` are explicitly denied.
+   595→- `patchedDependencies: node-pty@1.1.0: patches/node-pty@1.1.0.patch`.
+   596→
+   597→Build steps (`package.json:19-24`):
+   598→
+   599→```
+   600→pnpm install
+   601→pnpm run build       # = build:lib + build:web
+   602→  build:lib:host     # tsc -b tsconfig.host.json && tsdown --env.DSH_BUILD_FACE host
+   603→  build:lib:client   # tsc -b tsconfig.client.json && tsdown --env.DSH_BUILD_FACE client
+   604→  build:web          # pnpm --filter @deepseek-ai/dsh-web-frontend run build
+   605→```
+   606→
+   607→Run in dev (no build needed): `pnpm dsh <args...>` (uses `tsx` to run TypeScript directly). Production runs require built artifacts: `pnpm run build && pnpm dsh <args>`.
+   608→
+   609→Other useful scripts: `pnpm run typecheck`, `pnpm run lint` (oxlint), `pnpm test` (vitest), `pnpm run gen-cordis-catalog`, `pnpm run gen-tool-catalog`, `pnpm run gen-config-catalog`, `pnpm run gen-module-graph`, `pnpm run doc-sync`, `pnpm run hygiene`.
+   610→
+   611→---
+   612→
+   613→## 8. Python SDK (`python/sdk/`)
+   614→
+   615→The Python SDK drives the bundled Node runtime as a subprocess over newline-delimited JSON-RPC on stdio. Two PyPI distributions:
+   616→
+   617→- `deepseek-harness-sdk` (module `deepseek_harness`) — high-level turns API + low-level JSON-RPC client.
+   618→- `deepseek-harness-runtime-bin` (module `deepseek_harness_runtime`) — bundled single-file Node executable (`dsh-jsonrpc-agent-pkg-<platform>-<arch>`) + the default `cordis.yml`.
+   619→
+   620→Install + zero-config run (`python/sdk/README.md:13-23`):
+   621→
+   622→```sh
+   623→python -m pip install deepseek-harness-sdk
+   624→```
+   625→
+   626→```py
+   627→from deepseek_harness import DeepSeekHarness
+   628→
+   629→with DeepSeekHarness() as harness:
+   630→    result = harness.run("Say hi.")
+   631→```
+   632→
+   633→`DeepSeekHarness` config (`python/sdk/src/deepseek_harness/api.py:13-35`):
+   634→
+   635→```py
+   636→@dataclass(slots=True)
+   637→class DeepSeekHarnessConfig:
+   638→    provider: str = "deepseek-official"
+   639→    model: str = "deepseek-v4-flash"
+   640→    max_tokens: int | None = None
+   641→    cwd: str | None = None
+   642→    runtime_cwd: str | None = None
+   643→    session_root: str | None = None
+   644→    cordis: str | None = None
+   645→    env: dict[str, str] = field(default_factory=dict)
+   646→    runtime_bin: str | None = None
+   647→    launch_args_override: tuple[str, ...] | None = None
+   648→    request_timeout_seconds: float | None = None
+   649→    shutdown_timeout_seconds: float | None = 1.0
+   650→    base_url: str | None = None
+   651→    api_key: str | None = None
+   652→```
+   653→
+   654→Passing `base_url=` / `api_key=` sets `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` in the subprocess env (`api.py:69-72`). Passing `cordis="path/to/cordis.yml"` sets `DSH_CORDIS_CONFIG` and overrides the bundled default.
+   655→
+   656→`DeepSeekHarness.run(input, *, session_id=None, on_notification=None) -> RunResult` (`api.py:117-124`) wraps `Session.run`, which owns one activity interval from the prompt's durable inbox receipt through the next whole-agent idle. `RunResult` (`api.py:38-45`):
+   657→
+   658→```py
+   659→@dataclass(slots=True)
+   660→class RunResult:
+   661→    session_id: str
+   662→    final_response: str
+   663→    finish_reason: str | None
+   664→    events: list[JsonObject]
+   665→    notifications: list[Notification]
+   666→    session_root: str | None = None
+   667→```
+   668→
+   669→`final_response` = last committed root-session assistant text in the interval. `finish_reason` = `kind` of the last `turn/end` (`completed`, `max-tokens`, `error`, …). `events` = root-session events only (descendant messages can't replace the root response); `notifications` = root + all known descendants (including nested subagent lifecycle and session events).
+   670→
+   671→Wire protocol (JSON-RPC methods exposed by `@deepseek-ai/dsh-sdk-jsonrpc-server`):
+   672→
+   673→- `initialize` (`{ cwd, provider, model, maxTokens? }`) → `{ serverInfo }`.
+   674→- `session/prompt` (`{ sessionId, contentBlocks }`) → `{ messageId }` (queued receipt; turn runs asynchronously).
+   675→- Notifications streamed: `session.event` (carries durable events), `session.status` (`idle | running`), subagent lifecycle, etc.
+   676→- The client also exposes `subscribe_session_notifications(session_id)` to follow descendants discovered from subagent lifecycle edges (`client.py:138-156`, `client.py:194-205`).
+   677→
+   678→### Bundled default `cordis.yml` (`python/sdk-runtime/src/deepseek_harness_runtime/runtime/cordis.yml`)
+   679→
+   680→Mounts exactly: `sdk-jsonrpc-server`, `agent-core` (`@deepseek-ai/dsh-agent-spine-demo` with `workspaceContext: { maxBytes: 65536 }`), `llm-deepseek`, `sessions` (`session-persistence-jsonl` with `root: $DSH_SESSION_ROOT ?? './.sessions'`), `session-checkpoints`, `subprocess`, `bash` (`dsh-bash-local` with `cwd: $DSH_CWD ?? process.cwd()`), `fs-local`. The runtime reads `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DSH_SESSION_ROOT` / `DSH_CWD` from its environment.
+   681→
+   682→### Can a RELION runner (Python) talk to the harness via the Python SDK?
+   683→
+   684→**Yes**, in three ways:
+   685→
+   686→1. **Out-of-process, JSON-RPC stdio** — Use `DeepSeekHarness` from Python exactly as above. Pass `cordis="path/to/your-relion-cordis.yml"`. The Python process owns the Node subprocess; turns are driven by `harness.run(...)`; you collect events / notifications / final_response. This is the recommended path — no Node in the Python process, full access to DSH's plugin ecosystem by composition.
+   687→
+   688→2. **Custom JSON-RPC client** — `HarnessClient` (`python/sdk/src/deepseek_harness/client.py:37`) is the low-level client. It exposes `initialize`, `session_prompt`, `request`, `notify`, `subscribe_session_notifications`, `next_notification`, `next_request`, `respond`, `respond_error`. The last three (`next_request` / `respond` / `respond_error`) let a Python host answer **server-initiated requests** — e.g. permission gates (`tools/pre-execute` ask), user-questions, ACP-style subagent delegation, plan-review approvals — synchronously over the same stdio channel. This is exactly the surface a RELION runner would use if it wants to drive tools, approvals, or human-in-the-loop interactions from Python.
+   689→
+   690→3. **Custom Node plugin via the bundler** — Build a Node-side plugin (e.g. `dsh-relion` with `ctx.relion` + `dsh-tool-relion-*` consumers), add it as a dependency in `python/sdk-runtime/package.json`, rebuild the exe via `scripts/build-exe-for-python-sdk.ts`, and ship the resulting wheel. The Python SDK then loads it by composition.
+   691→
+   692→For a RELION integration the most pragmatic path is **(1) + (2)**: write a `cordis.yml` that mounts the agent spine, the DeepSeek LLM adapter (pointed at your endpoint), local subprocess + bash + fs (so the agent can actually run `relion_refine` etc.), and your RELION-specific tool plugins (which can be loaded either as in-tree `@deepseek-ai/dsh-*` packages or as out-of-tree plugins installed into a profile via `dsh plugin --profile <name> add <package>`). Then drive it from Python through `DeepSeekHarness` and answer server requests through `HarnessClient.next_request()` / `respond()`.
+   693→
+   694→---
+   695→
+   696→### Concrete integration pointers for the cryo-EM RELION agent
+   697→
+   698→Based on the architecture above, the natural design is:
+   699→
+   700→1. **LLM adapter**: Reuse `dsh-llm-deepseek` with `baseURL: <your z-ai-web-dev-sdk backed OpenAI-compatible endpoint>` and `apiKeyEnv: <YOUR_KEY_ENV>`. No custom adapter needed unless your endpoint speaks a non-OpenAI dialect; in that case either (a) use `dsh-llm-pi-ai` with a hand-declared route (`api: openai-completions`, `baseURL: …`, `compat.thinkingFormat: deepseek`), or (b) write a 50-line `LlmAdapter` subclass following `docs/cookbook/adding-an-llm-adapter.md`.
+   701→
+   702→2. **RELION tool plugin**: Author a `dsh-tool-relion` package (or several: `dsh-relion` definition + `dsh-relion-local` provider + `dsh-tool-relion` consumer). The Consumer calls `ctx.tools.register(defineTool({ name: 'relion_run', parameters: { … star_file, params … }, execute: async (args, exec) => { /* call ctx.subprocess.spawn */ } }))`. For long-running RELION jobs, use the `run_in_background` pattern (`docs/cookbook/adding-a-tool.md:51-55`) with `ctx.jobs.start({ kind, label, owner: exec.agent, run })`.
+   703→
+   704→3. **Subprocess + sandbox**: `dsh-subprocess-local` + `dsh-bash-sandbox` already let the agent spawn `relion_refine` etc. Set `sandbox-policy` mode `workspace-write` (or `danger-full-access` for a HPC node). Configure `bash` timeoutMs to a large value (RELION runs are long).
+   705→
+   706→4. **Drive from Python**: Use `DeepSeekHarness(cordis="relion-cordis.yml", cwd=<project_root>, session_root=<sessions_dir>)`. Call `harness.run("Run relion_refine on the uploaded micrographs…")` to get a one-shot turn, or use `Session.run` repeatedly for multi-turn interactive refinement. For human-in-the-loop approvals, register a `tools/pre-execute` ask listener and answer via `HarnessClient.next_request()` / `respond()`.
+   707→
+   708→5. **Workflow orchestration**: For multi-step pipelines (motioncorr → ctffind → autopick → extract → refine), use the `workflow` tool (`packages/workflow/tool-workflow/`) — the agent writes a JS script that fans out subagents per micrograph or per stage. Or compose a Ralph loop (`tool-ralph`) for iterative fresh-agent attempts at an immutable objective.
+   709→
+   710→6. **Persistence**: JSONL session log is on by default (`dsh-session-persistence-jsonl`); enable `session-query-sqlite` with `openAt: first-search` if you want full-text search over past runs.
+   711→
+   712→**Verification**: Run `pnpm install` (Node ≥ 22.19, pnpm 11.7), then either `pnpm dsh --profile web` (dev mode via tsx) or `pnpm run build && pnpm dsh --profile headless "list the available RELION commands"`. Inspect composition with `pnpm dsh --profile <name> --dump-config`.
+   713→
+   714→---
+   715→
+   716→### Open questions / follow-ups for the implementing agent
+   717→
+   718→- Whether the z-ai-web-dev-sdk backed endpoint supports OpenAI-compatible streaming SSE with `stream_options.include_usage` (the DeepSeek adapter requires this). If not, write a custom `LlmAdapter` that emits the harness `StreamChunk` protocol directly.
+   719→- Whether `reasoning_content` passback is required by the endpoint (DeepSeek requires it for tool-call turns; if the endpoint doesn't, configure `thinking: disabled`).
+   720→- Sandbox strategy on the HPC nodes where RELION actually runs — `dsh-sandbox-local` supports Linux Landlock, macOS Seatbelt, and Windows ACL; HPC clusters may need a custom `ctx.sandbox` backend.
+   721→- Whether to mount `dsh-tool-str-replace-editor` for editing `.star` files, or write a custom typed editor that validates STAR syntax.
+   722→- The `tools/execute` waterfall is the right extension point for per-tool timeouts (RELION jobs need hours, not 60 s).
+   723→

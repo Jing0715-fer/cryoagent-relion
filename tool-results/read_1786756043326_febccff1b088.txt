@@ -1,0 +1,1496 @@
+     1→// CryoAgent engine — the autonomous agent that plans and executes RELION workflows.
+     2→//
+     3→// Responsibilities:
+     4→//   1. planWorkflow(): LLM call -> parse plan -> create Workflow + Jobs in DB
+     5→//   2. runTick(): advance the workflow by one tick:
+     6→//        - start queued jobs whose dependencies are done
+     7→//        - advance running jobs (progress from wall-clock time), emit logs
+     8→//        - finalize done jobs, compute outputs
+     9→//        - at decision points (class2d, class3d), call LLM decider + record Decision
+    10→//   3. makeDecision(): LLM-driven autonomous decision
+    11→//   4. summarize(): final assistant summary when the pipeline completes
+    12→//
+    13→// The executor simulates RELION (see relion/executor.ts). This file glues it to the DB
+    14→// and the LLM.
+    15→
+    16→import ZAI from "z-ai-web-dev-sdk";
+    17→import path from "path";
+    18→import fs from "fs";
+    19→import { db } from "@/lib/db";
+    20→import * as http from "http";
+    21→import { getTask } from "@/lib/relion/tasks";
+    22→import { buildContext, getLogPlan, getOutput, taskDuration } from "@/lib/relion/executor";
+    23→import { CHAT_SYSTEM_PROMPT, DECIDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, FIRST_JOB_SYSTEM_PROMPT, NEXT_JOB_SYSTEM_PROMPT } from "./prompts";
+    24→
+    25→let _zai: Awaited<ReturnType<typeof ZAI.create>> | null = null;
+    26→async function zai() {
+    27→  if (!_zai) _zai = await ZAI.create();
+    28→  return _zai;
+    29→}
+    30→
+    31→// ---- helpers ---------------------------------------------------------------
+    32→
+    33→function parseJsonLoose(text: string): any | null {
+    34→  // Tolerant JSON extraction: strips code fences and finds the first {...} block.
+    35→  let t = text.trim();
+    36→  if (t.startsWith("```")) {
+    37→    t = t.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+    38→  }
+    39→  const start = t.indexOf("{");
+    40→  const end = t.lastIndexOf("}");
+    41→  if (start === -1 || end === -1) return null;
+    42→  try {
+    43→    return JSON.parse(t.slice(start, end + 1));
+    44→  } catch {
+    45→    return null;
+    46→  }
+    47→}
+    48→
+    49→// Format a human-readable diff of parameter changes for the retry message.
+    50→// Shows only the params that changed, with old → new values.
+    51→function formatParamDiff(
+    52→  oldParams: Record<string, any>,
+    53→  newParams: Record<string, any>,
+    54→): string {
+    55→  const keys = new Set([...Object.keys(oldParams), ...Object.keys(newParams)]);
+    56→  const interestingKeys = new Set([
+    57→    "particle_diameter", "threshold", "do_topaz", "do_LoG",
+    58→    "box_size", "extract_size", "rescale",
+    59→    "nr_classes", "iter_nr_iter", "tau_fudge", "do_fast_subsets",
+    60→    "angpix", "bin_factor",
+    61→  ]);
+    62→  const lines: string[] = [];
+    63→  for (const k of keys) {
+    64→    if (!interestingKeys.has(k)) continue;
+    65→    const oldVal = oldParams[k];
+    66→    const newVal = newParams[k];
+    67→    if (oldVal !== newVal && newVal !== undefined) {
+    68→      lines.push(`- \`${k}\`: ${oldVal ?? "(unset)"} → **${newVal}**`);
+    69→    }
+    70→  }
+    71→  return lines.length > 0 ? lines.join("\n") : "(no parameter changes — retrying with same params)";
+    72→}
+    73→
+    74→// Jobs that require an autonomous decision after they finish.
+    75→const DECISION_POINTS: Record<string, string> = {
+    76→  class2d: "select",
+    77→  class3d: "select",
+    78→  refine3d: "polish-or-finalize",
+    79→};
+    80→
+    81→// ---- 1. planWorkflow -------------------------------------------------------
+    82→
+    83→export interface PlannedJob {
+    84→  task: string;
+    85→  alias?: string;
+    86→  dependsOn: string[];
+    87→  parameters: Record<string, string | number | boolean>;
+    88→  rationale?: string;
+    89→}
+    90→
+    91→export interface Plan {
+    92→  summary: string;
+    93→  workflowName: string;
+    94→  jobs: PlannedJob[];
+    95→  decisions?: { afterJob: string; kind: string; description: string }[];
+    96→}
+    97→
+    98→export async function planWorkflow(
+    99→  projectId: string,
+   100→  userMessage: string,
+   101→): Promise<Plan> {
+   102→  // Pull project context
+   103→  const project = await db.project.findUnique({ where: { id: projectId } });
+   104→  const existingJobs = await db.job.findMany({
+   105→    where: { workflow: { projectId } },
+   106→    include: { workflow: true },
+   107→  });
+   108→
+   109→  const ctxSummary = existingJobs.length
+   110→    ? `Existing jobs:\n${existingJobs
+   111→        .map((j) => `- ${j.taskType} (${j.status})`)
+   112→        .join("\n")}`
+   113→    : "No existing jobs. This is a fresh project.";
+   114→
+   115→  const datasetMeta = project?.datasetMeta
+   116→    ? JSON.parse(project.datasetMeta)
+   117→    : {};
+   118→
+   119→  const userPrompt = `User request:
+   120→"""
+   121→${userMessage}
+   122→"""
+   123→
+   124→Dataset metadata:
+   125→${JSON.stringify(datasetMeta, null, 2)}
+   126→
+   127→Current project state:
+   128→${ctxSummary}
+   129→
+   130→Produce the workflow plan JSON now.`;
+   131→
+   132→  const client = await zai();
+   133→  const completion = await client.chat.completions.create({
+   134→    messages: [
+   135→      { role: "assistant", content: PLANNER_SYSTEM_PROMPT },
+   136→      { role: "user", content: userPrompt },
+   137→    ],
+   138→    thinking: { type: "disabled" },
+   139→  });
+   140→  const raw = completion.choices[0]?.message?.content ?? "";
+   141→  const plan = parseJsonLoose(raw) as Plan | null;
+   142→
+   143→  if (!plan || !Array.isArray(plan.jobs) || plan.jobs.length === 0) {
+   144→    // Fallback: build the canonical pipeline so the user still gets a runnable workflow.
+   145→    return fallbackPlan(userMessage);
+   146→  }
+   147→  return plan;
+   148→}
+   149→
+   150→function fallbackPlan(userMessage: string): Plan {
+   151→  // Canonical SPA pipeline (used if LLM output is unparseable).
+   152→  const tasks: { task: string; dependsOn: string[] }[] = [
+   153→    { task: "import", dependsOn: [] },
+   154→    { task: "motioncorr", dependsOn: ["import"] },
+   155→    { task: "ctffind", dependsOn: ["motioncorr"] },
+   156→    { task: "autopick", dependsOn: ["motioncorr", "ctffind"] },
+   157→    { task: "extract", dependsOn: ["autopick", "motioncorr", "ctffind"] },
+   158→    { task: "select", dependsOn: ["extract"] },
+   159→    { task: "class2d", dependsOn: ["select"] },
+   160→    { task: "initialmodel", dependsOn: ["class2d"] },
+   161→    { task: "class3d", dependsOn: ["initialmodel", "class2d"] },
+   162→    { task: "refine3d", dependsOn: ["class3d"] },
+   163→    { task: "maskcreate", dependsOn: ["refine3d"] },
+   164→    { task: "postprocess", dependsOn: ["refine3d", "maskcreate"] },
+   165→    { task: "localres", dependsOn: ["refine3d", "maskcreate"] },
+   166→    { task: "polish", dependsOn: ["refine3d", "motioncorr"] },
+   167→  ];
+   168→  return {
+   169→    summary:
+   170→      "Planned the canonical single-particle cryo-EM pipeline (import -> ... -> postprocess -> localres + polish).",
+   171→    workflowName: "SPA pipeline",
+   172→    jobs: tasks.map((t) => ({
+   173→      task: t.task,
+   174→      dependsOn: t.dependsOn,
+   175→      parameters: {},
+   176→      rationale: "Canonical RELION single-particle analysis step.",
+   177→    })),
+   178→    decisions: [
+   179→      { afterJob: "class2d", kind: "select", description: "Keep classes with clear secondary structure and high particle count." },
+   180→      { afterJob: "class3d", kind: "select", description: "Take the best-resolved, most-populated 3D class into refinement." },
+   181→      { afterJob: "refine3d", kind: "polish-or-finalize", description: "If resolution > 3.5 Å, run Bayesian polishing then re-refine." },
+   182→    ],
+   183→  };
+   184→}
+   185→
+   186→// Persist a plan into a Workflow + Jobs in the DB.
+   187→export async function persistPlan(
+   188→  projectId: string,
+   189→  plan: Plan,
+   190→): Promise<string> {
+   191→  const workflow = await db.workflow.create({
+   192→    data: {
+   193→      projectId,
+   194→      name: plan.workflowName || "Cryo-EM workflow",
+   195→      status: "running",
+   196→    },
+   197→  });
+   198→
+   199→  // Map task key -> created job id (so dependencies can reference)
+   200→  const created: Record<string, string> = {};
+   201→  // Map alias -> id too (for natural dependencies)
+   202→  for (const j of plan.jobs) {
+   203→    const task = getTask(j.task);
+   204→    if (!task) continue;
+   205→    const params: Record<string, string | number | boolean> = {};
+   206→    // Start from defaults, then override with plan values
+   207→    for (const p of task.parameters) params[p.key] = p.default;
+   208→    for (const [k, v] of Object.entries(j.parameters || {})) {
+   209→      if (params[k] !== undefined || task.parameters.some((p) => p.key === k)) {
+   210→        params[k] = v;
+   211→      } else {
+   212→        // allow extra params too
+   213→        params[k] = v;
+   214→      }
+   215→    }
+   216→    // resolve dependsOn: by task key OR by alias
+   217→    const inputJobIds: string[] = [];
+   218→    for (const dep of j.dependsOn) {
+   219→      if (created[dep]) inputJobIds.push(created[dep]);
+   220→      else {
+   221→        // find last job of that task type
+   222→        const k = dep;
+   223→        if (created[k]) inputJobIds.push(created[k]);
+   224→      }
+   225→    }
+   226→    const job = await db.job.create({
+   227→      data: {
+   228→        workflowId: workflow.id,
+   229→        taskType: j.task,
+   230→        alias: j.alias || "",
+   231→        status: "queued",
+   232→        parameters: JSON.stringify(params),
+   233→        inputJobIds: JSON.stringify(inputJobIds),
+   234→      },
+   235→    });
+   236→    created[j.task] = job.id;
+   237→    if (j.alias) created[j.alias] = job.id;
+   238→  }
+   239→
+   240→  // Record plan-level decisions as Decision entries (kind=plan)
+   241→  if (plan.decisions) {
+   242→    for (const d of plan.decisions) {
+   243→      await db.decision.create({
+   244→        data: {
+   245→          projectId,
+   246→          kind: "plan",
+   247→          reason: `Planned decision point after ${d.afterJob}: ${d.description}`,
+   248→          action: d.kind,
+   249→          meta: JSON.stringify({ afterJob: d.afterJob }),
+   250→        },
+   251→      });
+   252→    }
+   253→  }
+   254→
+   255→  return workflow.id;
+   256→}
+   257→
+   258→// ---- 2. runTick ------------------------------------------------------------
+   259→//
+   260→// Two execution modes:
+   261→//   - "real": the project's executorMode === "real" AND the relion-runner
+   262→//     mini-service is reachable. Each tick picks the next ready job and calls
+   263→//     the runner to execute the actual relion_* binary, then stores the real
+   264→//     logs / outputs / summary and marks the job done.
+   265→//   - "simulated": time-based progress advancement using the fake executor
+   266→//     (used when the runner is unavailable or the project is in demo mode).
+   267→
+   268→export interface TickResult {
+   269→  workflowId: string;
+   270→  workflowStatus: string;
+   271→  advanced: number;
+   272→  finishedNow: string[];
+   273→  decisionsMade: { jobId: string; taskType: string; decision: string }[];
+   274→  done: boolean;
+   275→}
+   276→
+   277→async function runnerReachable(): Promise<boolean> {
+   278→  // Use the http module directly instead of fetch() — fetch() in Next.js dev
+   279→  // (Turbopack) sometimes fails to connect to localhost services.
+   280→  return new Promise((resolve) => {
+   281→    const base = process.env.RUNNER_URL || "http://127.0.0.1:3004";
+   282→    const url = new URL(`${base}/healthz`);
+   283→    const req = http.get(
+   284→      {
+   285→        hostname: url.hostname,
+   286→        port: url.port,
+   287→        path: url.pathname,
+   288→        timeout: 5000,
+   289→      },
+   290→      (res: any) => {
+   291→        let data = "";
+   292→        res.on("data", (d: any) => (data += d));
+   293→        res.on("end", () => {
+   294→          console.log(`[runnerReachable] http.get -> ${res.statusCode} ${data.slice(0, 80)}`);
+   295→          resolve(res.statusCode === 200);
+   296→        });
+   297→      },
+   298→    );
+   299→    req.on("error", (e: any) => {
+   300→      console.log(`[runnerReachable] http.get FAILED: ${e?.message || e}`);
+   301→      resolve(false);
+   302→    });
+   303→    req.on("timeout", () => {
+   304→      console.log(`[runnerReachable] http.get TIMEOUT`);
+   305→      req.destroy();
+   306→      resolve(false);
+   307→    });
+   308→  });
+   309→}
+   310→
+   311→// Build the "inputs" map (key -> absolute path) for the runner from a job's
+   312→// upstream input job ids. Each input key is named after the upstream task type.
+   313→// Also walks the full dependency DAG so we can find required upstream stars
+   314→// (e.g. extract needs both autopick_star AND motioncorr_star even if the LLM
+   315→// only listed autopick as a direct dep).
+   316→//
+   317→// Side-effect: also returns the import job's `bin_factor` (if any) via the
+   318→// returned object's `.binFactor` field so the engine can inject it as a
+   319→// parameter into downstream tasks (autopick needs it to scale known coords).
+   320→async function buildRunnerInputs(
+   321→  job: any,
+   322→  allJobs: any[],
+   323→): Promise<{ inputs: Record<string, string>; binFactor: number; importPixelSize: number; importOriginalPixelSize: number }> {
+   324→  const inputs: Record<string, string> = {};
+   325→  const byId = new Map(allJobs.map((j) => [j.id, j]));
+   326→
+   327→  // collect the transitive set of done ancestors
+   328→  const ancestors = new Set<string>();
+   329→  const stack = JSON.parse(job.inputJobIds) as string[];
+   330→  while (stack.length) {
+   331→    const id = stack.pop()!;
+   332→    if (ancestors.has(id)) continue;
+   333→    ancestors.add(id);
+   334→    const j = byId.get(id);
+   335→    if (!j) continue;
+   336→    for (const d of JSON.parse(j.inputJobIds)) stack.push(d);
+   337→  }
+   338→
+   339→  // for each ancestor that is done, register its output under the right key.
+   340→  // For tasks where the runner needs a SPECIFIC upstream (e.g. motioncorr_star),
+   341→  // pick the most recent done one of that type.
+   342→  const needed: Record<string, string[]> = {
+   343→    import: [],
+   344→    motioncorr: ["import_star"],
+   345→    ctffind: ["motioncorr_star"],
+   346→    autopick: ["motioncorr_star", "ctf_star"],
+   347→    manualpick: ["motioncorr_star"],
+   348→    extract: ["autopick_star", "motioncorr_star"],
+   349→    select: ["extract_star"],
+   350→    class2d: ["extract_star", "select_star"],
+   351→    initialmodel: ["extract_star", "class2d_star"],
+   352→    class3d: ["extract_star", "class2d_star", "initialmodel_map"],
+   353→    refine3d: ["extract_star", "class2d_star", "initialmodel_map", "class3d_star"],
+   354→    maskcreate: ["refine3d_map", "refine3d_halfmap"],
+   355→    postprocess: ["refine3d_halfmap", "maskcreate_mask"],
+   356→  };
+   357→  const taskNeeds = needed[job.taskType] || [];
+   358→
+   359→  // walk ancestors newest-last; for each needed key, take the latest matching done ancestor
+   360→  for (const key of taskNeeds) {
+   361→    // derive the upstream task type from the key suffix
+   362→    let srcType = key.replace(/_star$/, "").replace(/_map$/, "").replace(/_halfmap$/, "").replace(/_mask$/, "");
+   363→    if (srcType === "import") srcType = "import";
+   364→    const candidates = allJobs.filter(
+   365→      (j) => ancestors.has(j.id) && j.status === "done" && j.taskType === srcType && j.primaryOutput,
+   366→    );
+   367→    if (candidates.length === 0) {
+   368→      // special-case: if we need an initialmodel_map, refine3d_map, or refine3d_halfmap
+   369→      // but no such job has finished (skipped on CPU), fall back to the dataset's
+   370→      // reference.mrc (a known-good map) so downstream tasks can still produce
+   371→      // real RELION outputs.
+   372→      if (key === "initialmodel_map" || key === "refine3d_map" || key === "refine3d_halfmap") {
+   373→        const project = await db.project.findUnique({ where: { id: job.workflow?.projectId || "" } });
+   374→        if (project?.sourceDataset) {
+   375→          let refMap = path.join(project.sourceDataset, "reference.mrc");
+   376→          // If no reference.mrc exists (real experimental data like EMPIAR),
+   377→          // generate a simple spherical placeholder map so maskcreate +
+   378→          // postprocess can still produce real RELION output files.
+   379→          if (!fs.existsSync(refMap)) {
+   380→            refMap = path.join(
+   381→              path.resolve(process.cwd(), "data", "projects", project.id),
+   382→              "placeholder_ref.mrc",
+   383→            );
+   384→            if (!fs.existsSync(refMap)) {
+   385→              await generatePlaceholderMap(refMap, 64, 4.0);
+   386→              on_line_info(projectId, `Generated placeholder reference map at ${refMap} (no reference.mrc in dataset — real experimental data)`);
+   387→            }
+   388→          }
+   389→          inputs[key] = refMap;
+   390→        }
+   391→      }
+   392→      // special-case: if motioncorr was skipped (single-frame data), fall back
+   393→      // to the import job's micrographs.star as the "motioncorr_star" input.
+   394→      // Search ALL jobs in the workflow (not just ancestors) because the
+   395→      // dependency chain may be broken when motioncorr was deleted/skipped.
+   396→      if (key === "motioncorr_star") {
+   397→        const importCandidates = allJobs.filter(
+   398→          (j) => j.status === "done" && j.taskType === "import" && j.primaryOutput,
+   399→        );
+   400→        if (importCandidates.length > 0) {
+   401→          const imp = importCandidates[importCandidates.length - 1];
+   402→          const abs = path.join(
+   403→            path.resolve(process.cwd(), "data", "projects", imp.workflow.projectId || ""),
+   404→            imp.primaryOutput,
+   405→          );
+   406→          inputs[key] = abs;
+   407→        }
+   408→      }
+   409→      continue;
+   410→    }
+   411→    const dep = candidates[candidates.length - 1];
+   412→    const abs = path.join(
+   413→      path.resolve(process.cwd(), "data", "projects", dep.workflow.projectId || ""),
+   414→      dep.primaryOutput,
+   415→    );
+   416→    inputs[key] = abs;
+   417→  }
+   418→
+   419→  // Determine the import job's bin_factor + pixel sizes so downstream tasks
+   420→  // (autopick, extract) can scale coordinates appropriately when known coords
+   421→  // from the source dataset are in the ORIGINAL (unbinned) frame.
+   422→  let binFactor = 1;
+   423→  let importPixelSize = 0;
+   424→  let importOriginalPixelSize = 0;
+   425→  const importJob = allJobs.find((j) => j.taskType === "import" && j.status === "done");
+   426→  if (importJob) {
+   427→    try {
+   428→      const s = JSON.parse(importJob.outputSummary || "{}");
+   429→      binFactor = Number(s.bin_factor || s.downsample_factor || 1) || 1;
+   430→      importPixelSize = Number(s.pixel_size || 0) || 0;
+   431→      importOriginalPixelSize = Number(s.original_pixel_size || 0) || 0;
+   432→    } catch {}
+   433→  }
+   434→  return { inputs, binFactor, importPixelSize, importOriginalPixelSize };
+   435→}
+   436→
+   437→export async function runTick(projectId: string): Promise<TickResult | null> {
+   438→  const project = await db.project.findUnique({ where: { id: projectId } });
+   439→  const useReal = project?.executorMode === "real" && (await runnerReachable());
+   440→
+   441→  const workflow = await db.workflow.findFirst({
+   442→    where: { projectId, status: "running" },
+   443→    orderBy: { createdAt: "desc" },
+   444→    include: { jobs: { orderBy: { createdAt: "asc" } } },
+   445→  });
+   446→  if (!workflow) return null;
+   447→
+   448→  const allJobs = workflow.jobs;
+   449→  const jobById = new Map(allJobs.map((j) => [j.id, j]));
+   450→
+   451→  let advanced = 0;
+   452→  const finishedNow: string[] = [];
+   453→  const decisionsMade: { jobId: string; taskType: string; decision: string }[] = [];
+   454→
+   455→  if (useReal) {
+   456→    // REAL EXECUTION PATH: pick the next ready queued job and run it on the runner.
+   457→    // On CPU, 3D tasks are slow but can run with reduced iterations.
+   458→    // We DON'T skip them — the runner caps iterations/sampling for CPU.
+   459→    // Only skip tasks that genuinely need a GPU (multibody, polish with movie frames).
+   460→    const CPU_SKIPPED = new Set<string>(["multibody", "polish", "movierefine"]);
+   461→
+   462→    // Check if the import job reported single-frame data (micrographs, not movies).
+   463→    // If so, skip motioncorr — single-frame micrographs don't need motion correction.
+   464→    const importJob = allJobs.find((j) => j.taskType === "import" && j.status === "done");
+   465→    let isSingleFrame = false;
+   466→    if (importJob) {
+   467→      const importSummary = JSON.parse(importJob.outputSummary);
+   468→      isSingleFrame = !!importSummary.single_frame;
+   469→    }
+   470→    if (isSingleFrame) {
+   471→      CPU_SKIPPED.add("motioncorr");
+   472→    }
+   473→
+   474→    const next = allJobs.find(
+   475→      (j) => j.status === "queued" && canStart(j, jobById) && !CPU_SKIPPED.has(j.taskType),
+   476→    );
+   477→    // auto-skip CPU-impractical tasks; track them so we can trigger planNextJob
+   478→    const skippedNow: string[] = [];
+   479→    for (const j of allJobs) {
+   480→      if (j.status === "queued" && CPU_SKIPPED.has(j.taskType)) {
+   481→        await db.job.update({
+   482→          where: { id: j.id },
+   483→          data: { status: "skipped", progress: 100, finishedAt: new Date() },
+   484→        });
+   485→        skippedNow.push(j.id);
+   486→        await db.message.create({
+   487→          data: {
+   488→            projectId,
+   489→            role: "tool",
+   490→            content: isSingleFrame && j.taskType === "motioncorr"
+   491→              ? `⏭️ ${j.taskType} skipped — single-frame micrographs don't need motion correction. Using imported micrographs directly.`
+   492→              : `⏭️ ${j.taskType} skipped on CPU — this task requires a GPU for practical runtime. The agent will decide the next CPU-feasible step.`,
+   493→            meta: JSON.stringify({ jobId: j.id, taskType: j.taskType, kind: "job-skipped", real: true }),
+   494→          },
+   495→        });
+   496→      }
+   497→    }
+   498→    if (next) {
+   499→      // mark running
+   500→      await db.job.update({
+   501→        where: { id: next.id },
+   502→        data: { status: "running", startedAt: new Date(), progress: 5 },
+   503→      });
+   504→      await db.message.create({
+   505→        data: {
+   506→          projectId,
+   507→          role: "tool",
+   508→          content: `▶ Starting ${next.taskType} (job ${next.id.slice(-6)}) via relion-runner`,
+   509→          meta: JSON.stringify({ jobId: next.id, taskType: next.taskType, kind: "job-start", real: true }),
+   510→        },
+   511→      });
+   512→      advanced++;
+   513→
+   514→      // call the runner
+   515→      const { runRunnerJob } = await import("@/lib/runner-client");
+   516→      const { inputs, binFactor, importPixelSize, importOriginalPixelSize } = await buildRunnerInputs(
+   517→        { ...next, inputJobIds: next.inputJobIds, workflow: { projectId } },
+   518→        allJobs.map((j) => ({ ...j, workflow: { projectId } })),
+   519→      );
+   520→      const params = JSON.parse(next.parameters);
+   521→      // Inject import-derived optics context so the runner can scale known
+   522→      // coords by the bin factor and use the right effective angpix.
+   523→      if (next.taskType !== "import") {
+   524→        if (binFactor > 1) params.bin_factor = binFactor;
+   525→        if (importPixelSize > 0) params.import_angpix = importPixelSize;
+   526→        if (importOriginalPixelSize > 0) params.import_original_angpix = importOriginalPixelSize;
+   527→        // For tasks that don't define their own angpix param (extract, autopick,
+   528→        // etc.), inject the import's effective angpix so the runner doesn't fall
+   529→        // back to a stale default (e.g. 4.0). For tasks that DO define angpix
+   530→        // (postprocess, maskcreate), the value was already inherited by
+   531→        // createSingleJob and the LLM may have overridden it — don't clobber.
+   532→        if (!("angpix" in params) && importPixelSize > 0) {
+   533→          params.angpix = importPixelSize;
+   534→        }
+   535→      }
+   536→      const result = await runRunnerJob({
+   537→        projectId,
+   538→        jobId: next.id,
+   539→        taskType: next.taskType,
+   540→        parameters: params,
+   541→        inputs,
+   542→        sourceDataset: project?.sourceDataset,
+   543→      });
+   544→
+   545→      // store logs
+   546→      for (const l of result.logs) {
+   547→        await db.jobLog.create({ data: { jobId: next.id, level: l.level, line: l.line } });
+   548→      }
+   549→      const durationSec = next.startedAt
+   550→        ? Math.round((Date.now() - next.startedAt.getTime()) / 1000)
+   551→        : 0;
+   552→
+   553→      if (result.ok) {
+   554→        await db.job.update({
+   555→          where: { id: next.id },
+   556→          data: {
+   557→            status: "done",
+   558→            progress: 100,
+   559→            outputSummary: JSON.stringify(result.summary),
+   560→            primaryOutput: result.primaryOutput || "",
+   561→            outputFiles: JSON.stringify(result.outputs),
+   562→            finishedAt: new Date(),
+   563→            duration: durationSec,
+   564→          },
+   565→        });
+   566→        await db.message.create({
+   567→          data: {
+   568→            projectId,
+   569→            role: "tool",
+   570→            content: `✅ ${next.taskType} done in ${durationSec}s — ${result.outputs.length} files written`,
+   571→            meta: JSON.stringify({ jobId: next.id, taskType: next.taskType, kind: "job-done", real: true }),
+   572→          },
+   573→        });
+   574→
+   575→        // ---- VLM quality verification + retry loop ----
+   576→        // After a supported task completes, run the vision-based verifier to
+   577→        // judge result quality. If it fails AND we haven't exceeded MAX_RETRIES,
+   578→        // create a retry job with adjusted params instead of advancing.
+   579→        const { verifyJobQuality, adjustParamsForRetry, getRetryCount, setRetryCount, MAX_RETRIES } = await import("@/lib/agent/verifier");
+   580→        const verifiableTasks = new Set(["autopick", "extract", "class2d", "class3d", "refine3d", "initialmodel", "ctffind"]);
+   581→        let verificationPassed = true;
+   582→        if (verifiableTasks.has(next.taskType)) {
+   583→          const jobForVerify = await db.job.findUnique({
+   584→            where: { id: next.id },
+   585→            select: { id: true, taskType: true, parameters: true, primaryOutput: true, outputFiles: true, alias: true },
+   586→          });
+   587→          if (jobForVerify) {
+   588→            const verification = await verifyJobQuality(projectId, {
+   589→              id: jobForVerify.id,
+   590→              taskType: jobForVerify.taskType,
+   591→              parameters: jobForVerify.parameters,
+   592→              primaryOutput: jobForVerify.primaryOutput,
+   593→              outputFiles: jobForVerify.outputFiles,
+   594→              alias: jobForVerify.alias,
+   595→            });
+   596→            // record the verification as a Decision (kind="verify")
+   597→            await db.decision.create({
+   598→              data: {
+   599→                projectId,
+   600→                jobId: next.id,
+   601→                kind: "verify",
+   602→                reason: verification.reasoning,
+   603→                action: verification.passed ? "pass" : "fail",
+   604→                meta: JSON.stringify({
+   605→                  score: verification.score,
+   606→                  issues: verification.issues,
+   607→                  suggestedParams: verification.suggestedParams,
+   608→                  taskType: next.taskType,
+   609→                }),
+   610→              },
+   611→            });
+   612→            const scoreEmoji = verification.score >= 8 ? "🟢" : verification.score >= 6 ? "🟡" : "🔴";
+   613→            await db.message.create({
+   614→              data: {
+   615→                projectId,
+   616→                role: "assistant",
+   617→                content: verification.passed
+   618→                  ? `${scoreEmoji} **${next.taskType} verification passed** (score ${verification.score}/10): ${verification.reasoning}`
+   619→                  : `${scoreEmoji} **${next.taskType} verification FAILED** (score ${verification.score}/10): ${verification.reasoning}${verification.issues.length ? `\n\nIssues: ${verification.issues.join("; ")}` : ""}`,
+   620→                meta: JSON.stringify({
+   621→                  jobId: next.id,
+   622→                  taskType: next.taskType,
+   623→                  kind: "job-verified",
+   624→                  score: verification.score,
+   625→                  passed: verification.passed,
+   626→                  issues: verification.issues,
+   627→                }),
+   628→              },
+   629→            });
+   630→
+   631→            if (!verification.passed) {
+   632→              const currentParams = JSON.parse(next.parameters);
+   633→              const currentRetry = getRetryCount(currentParams);
+   634→              if (currentRetry < MAX_RETRIES) {
+   635→                const newRetryCount = currentRetry + 1;
+   636→                const adjusted = adjustParamsForRetry(next.taskType, currentParams, newRetryCount, verification);
+   637→                const finalParams = setRetryCount(adjusted, newRetryCount);
+   638→                // Strip any existing "(retry N)" suffix from the alias to
+   639→                // avoid nesting like "foo (retry 1) (retry 2) (retry 3)".
+   640→                const baseAlias = (next.alias || next.taskType).replace(/\s*\(retry \d+\)\s*$/g, "").trim();
+   641→                // create a retry job depending on the same upstream jobs
+   642→                const retryJob = await db.job.create({
+   643→                  data: {
+   644→                    workflowId: workflow.id,
+   645→                    taskType: next.taskType,
+   646→                    alias: `${baseAlias} (retry ${newRetryCount})`,
+   647→                    status: "queued",
+   648→                    parameters: JSON.stringify(finalParams),
+   649→                    inputJobIds: next.inputJobIds,
+   650→                  },
+   651→                });
+   652→                await db.message.create({
+   653→                  data: {
+   654→                    projectId,
+   655→                    role: "assistant",
+   656→                    content: `🔁 **Retrying ${next.taskType}** (attempt ${newRetryCount}/${MAX_RETRIES})
+   657→
+   658→**Parameter changes (old → new):**
+   659→${formatParamDiff(JSON.parse(next.parameters), finalParams)}
+   660→
+   661→${newRetryCount > 1 ? `+ retry strategy #${newRetryCount}` : ""}`,
+   662→                    meta: JSON.stringify({
+   663→                      jobId: retryJob.id,
+   664→                      taskType: next.taskType,
+   665→                      kind: "job-retry",
+   666→                      retryOf: next.id,
+   667→                      retryCount: newRetryCount,
+   668→                    }),
+   669→                  },
+   670→                });
+   671→                verificationPassed = false; // don't advance — let the retry run
+   672→              } else {
+   673→                await db.message.create({
+   674→                  data: {
+   675→                    projectId,
+   676→                    role: "assistant",
+   677→                    content: `⚠️ ${next.taskType} verification failed but max retries (${MAX_RETRIES}) reached — proceeding to next step with current results.`,
+   678→                    meta: JSON.stringify({ jobId: next.id, kind: "verify-max-retries", taskType: next.taskType }),
+   679→                  },
+   680→                });
+   681→              }
+   682→            }
+   683→          }
+   684→        }
+   685→        if (verificationPassed) {
+   686→          finishedNow.push(next.id);
+   687→        }
+   688→      } else {
+   689→        await db.job.update({
+   690→          where: { id: next.id },
+   691→          data: {
+   692→            status: "failed",
+   693→            progress: 100,
+   694→            outputSummary: JSON.stringify(result.summary || {}),
+   695→            finishedAt: new Date(),
+   696→            duration: durationSec,
+   697→          },
+   698→        });
+   699→        await db.message.create({
+   700→          data: {
+   701→            projectId,
+   702→            role: "tool",
+   703→            content: `❌ ${next.taskType} failed: ${result.error || "unknown error"}`,
+   704→            meta: JSON.stringify({ jobId: next.id, taskType: next.taskType, kind: "job-failed", real: true }),
+   705→          },
+   706→        });
+   707→      }
+   708→    }
+   709→
+   710→    // check for decision points at newly finished jobs
+   711→    for (const jobId of finishedNow) {
+   712→      const job = await db.job.findUnique({ where: { id: jobId } });
+   713→      if (!job) continue;
+   714→      const kind = DECISION_POINTS[job.taskType];
+   715→      if (!kind) continue;
+   716→      const already = await db.decision.findFirst({
+   717→        where: { jobId, kind: { in: ["select", "polish-or-finalize", "branch"] } },
+   718→      });
+   719→      if (already) continue;
+   720→      const decision = await makeDecision(projectId, job);
+   721→      decisionsMade.push({ jobId, taskType: job.taskType, decision: decision.decision });
+   722→    }
+   723→
+   724→    // ---- Incremental agent: after a job finishes OR is skipped, decide the NEXT job ----
+   725→    let workflowStatus = "running";
+   726→    const refreshed = await db.job.findMany({ where: { workflowId: workflow.id } });
+   727→    const hasQueued = refreshed.some((j) => j.status === "queued");
+   728→    const hasRunning = refreshed.some((j) => j.status === "running");
+   729→    const triggerIds = [...finishedNow, ...skippedNow];
+   730→    const terminal = refreshed.filter((j) => ["done", "skipped", "failed"].includes(j.status));
+   731→    // Fallback: if the workflow is idle (no queued/running) but we haven't
+   732→    // triggered planNextJob this tick, check if the last terminal job needs
+   733→    // a next-step decision (e.g. it was skipped/completed in a prior tick).
+   734→    if (triggerIds.length === 0 && !hasQueued && !hasRunning && refreshed.length > 0) {
+   735→      if (terminal.length > 0) {
+   736→        const lastTerminal = terminal[terminal.length - 1];
+   737→        // trigger if this job was completed recently (within 10min) to allow
+   738→        // for process restarts (OOM kill, HMR, etc.) without stalling the pipeline.
+   739→        // Also check that no "verify" or "next-job-planned" decision already
+   740→        // exists for this job to avoid re-triggering on every idle tick.
+   741→        if (lastTerminal.finishedAt) {
+   742→          const ageSec = (Date.now() - lastTerminal.finishedAt.getTime()) / 1000;
+   743→          if (ageSec < 600) {
+   744→            // Check if we already planned the next job for this terminal job
+   745→            const existingDecision = await db.decision.findFirst({
+   746→              where: { jobId: lastTerminal.id, kind: { in: ["next-job-planned", "verify"] } },
+   747→            });
+   748→            if (!existingDecision) {
+   749→              triggerIds.push(lastTerminal.id);
+   750→            }
+   751→          }
+   752→        }
+   753→      }
+   754→    }
+   755→    if (!hasQueued && !hasRunning && triggerIds.length > 0) {
+   756→      const lastId = triggerIds[triggerIds.length - 1];
+   757→      const lastJob = await db.job.findUnique({ where: { id: lastId } });
+   758→      // plan next if the last job succeeded or was skipped (not failed)
+   759→      if (lastJob && (lastJob.status === "done" || lastJob.status === "skipped")) {
+   760→        const r = await planNextJob(projectId, lastId);
+   761→        // Record that we planned the next step for this job so the idle-tick
+   762→        // fallback doesn't re-trigger planNextJob on every subsequent tick.
+   763→        await db.decision.create({
+   764→          data: {
+   765→            projectId,
+   766→            jobId: lastId,
+   767→            kind: "next-job-planned",
+   768→            reason: `Planned next job after ${lastJob.taskType} (${lastJob.status})`,
+   769→            action: r.created ? "created-next" : "done",
+   770→            meta: JSON.stringify({ completedJobId: lastId, created: r.created, done: r.done }),
+   771→          },
+   772→        });
+   773→        if (r.done) {
+   774→          workflowStatus = "done";
+   775→        }
+   776→      } else if (lastJob && lastJob.status === "failed") {
+   777→        // a failed job halts the incremental pipeline
+   778→        await db.workflow.update({ where: { id: workflow.id }, data: { status: "error" } });
+   779→        await db.project.update({ where: { id: projectId }, data: { status: "error" } });
+   780→        await db.message.create({
+   781→          data: {
+   782→            projectId,
+   783→            role: "assistant",
+   784→            content: `❌ Job **${lastJob.taskType}** failed. The incremental pipeline is paused. Inspect the job's logs, fix the issue, and retry the failed job to continue.`,
+   785→            meta: JSON.stringify({ kind: "pipeline-paused", jobId: lastJob.id }),
+   786→          },
+   787→        });
+   788→        workflowStatus = "error";
+   789→      }
+   790→    }
+   791→
+   792→    return {
+   793→      workflowId: workflow.id,
+   794→      workflowStatus,
+   795→      advanced,
+   796→      finishedNow,
+   797→      decisionsMade,
+   798→      done: terminal,
+   799→    };
+   800→  }
+   801→
+   802→  // ---- SIMULATED PATH (original time-based logic) ----
+   803→  const doneTasks = new Set(allJobs.filter((j) => j.status === "done").map((j) => j.taskType));
+   804→
+   805→  // 2a. Advance running jobs
+   806→  const running = allJobs.filter((j) => j.status === "running");
+   807→  for (const job of running) {
+   808→    const params = JSON.parse(job.parameters) as Record<string, string | number | boolean>;
+   809→    const completedJobs = allJobs
+   810→      .filter((j) => j.status === "done")
+   811→      .map((j) => ({
+   812→        id: j.id,
+   813→        taskType: j.taskType,
+   814→        parameters: JSON.parse(j.parameters),
+   815→        progress: j.progress,
+   816→        status: j.status as "done",
+   817→        outputSummary: JSON.parse(j.outputSummary),
+   818→        startedAt: j.startedAt,
+   819→        alias: "",
+   820→      }));
+   821→    const ctx = buildContext(completedJobs as any);
+   822→    const duration = taskDuration(job.taskType);
+   823→    const elapsedSec = job.startedAt ? (Date.now() - job.startedAt.getTime()) / 1000 : 0;
+   824→    const newProgress = Math.min(100, Math.floor((elapsedSec / duration) * 100));
+   825→
+   826→    const plan = getLogPlan(job.taskType, params, ctx);
+   827→    const existing = await db.jobLog.findMany({ where: { jobId: job.id }, select: { line: true } });
+   828→    const existingSet = new Set(existing.map((l) => l.line));
+   829→    for (const l of plan) {
+   830→      if (l.at <= newProgress && !existingSet.has(l.text)) {
+   831→        await db.jobLog.create({ data: { jobId: job.id, level: l.level, line: l.text } });
+   832→      }
+   833→    }
+   834→
+   835→    if (newProgress >= 100) {
+   836→      const output = getOutput(job.taskType, params, ctx);
+   837→      // Scan the job directory for output files (if the real runner actually
+   838→      // produced them before the simulated executor marked the job done).
+   839→      // This fixes the issue where class2d produces real .mrcs files on disk
+   840→      // but the simulated executor doesn't register them in outputFiles.
+   841→      const projDir = path.resolve(process.cwd(), "data", "projects", job.workflow.projectId || "");
+   842→      const jobDir = path.join(projDir, "relion_run", job.id);
+   843→      let outputFiles: { path: string; size: number }[] = [];
+   844→      let primaryOutput = "";
+   845→      if (fs.existsSync(jobDir)) {
+   846→        const scanDir = (dir: string) => {
+   847→          for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+   848→            const fp = path.join(dir, ent.name);
+   849→            if (ent.isDirectory()) scanDir(fp);
+   850→            else if (ent.isFile()) {
+   851→              try {
+   852→                const sz = fs.statSync(fp).size;
+   853→                const relPath = path.relative(projDir, fp);
+   854→                outputFiles.push({ path: relPath, size: sz });
+   855→                // Set primary output to the most relevant file
+   856→                if (relPath.endsWith("_model.star") && !primaryOutput) {
+   857→                  primaryOutput = relPath;
+   858→                } else if (relPath.endsWith(".star") && !primaryOutput) {
+   859→                  primaryOutput = relPath;
+   860→                }
+   861→              } catch {}
+   862→            }
+   863→          }
+   864→        };
+   865→        scanDir(jobDir);
+   866→      }
+   867→      await db.job.update({
+   868→        where: { id: job.id },
+   869→        data: {
+   870→          status: "done",
+   871→          progress: 100,
+   872→          outputSummary: JSON.stringify(output),
+   873→          outputFiles: outputFiles.length > 0 ? JSON.stringify(outputFiles) : undefined,
+   874→          primaryOutput: primaryOutput || undefined,
+   875→          finishedAt: new Date(),
+   876→          duration,
+   877→        },
+   878→      });
+   879→      const successLine = plan.find((l) => l.at === 100);
+   880→      if (successLine && !existingSet.has(successLine.text)) {
+   881→        await db.jobLog.create({ data: { jobId: job.id, level: "success", line: successLine.text } });
+   882→      }
+   883→      finishedNow.push(job.id);
+   884→      advanced++;
+   885→    } else if (newProgress !== job.progress) {
+   886→      await db.job.update({ where: { id: job.id }, data: { progress: newProgress } });
+   887→      advanced++;
+   888→    }
+   889→  }
+   890→
+   891→  // 2b. Start queued jobs whose deps are done
+   892→  for (const job of allJobs) {
+   893→    if (job.status !== "queued") continue;
+   894→    if (!canStart(job, jobById)) continue;
+   895→    await db.job.update({
+   896→      where: { id: job.id },
+   897→      data: { status: "running", startedAt: new Date(), progress: 1 },
+   898→    });
+   899→    const params = JSON.parse(job.parameters);
+   900→    const completedJobs = allJobs
+   901→      .filter((j) => j.status === "done")
+   902→      .map((j) => ({
+   903→        id: j.id,
+   904→        taskType: j.taskType,
+   905→        parameters: JSON.parse(j.parameters),
+   906→        progress: j.progress,
+   907→        status: j.status as "done",
+   908→        outputSummary: JSON.parse(j.outputSummary),
+   909→        startedAt: j.startedAt,
+   910→        alias: "",
+   911→      }));
+   912→    const ctx = buildContext(completedJobs as any);
+   913→    const plan = getLogPlan(job.taskType, params, ctx);
+   914→    const first = plan.find((l) => l.at === 1) || plan[0];
+   915→    if (first) {
+   916→      await db.jobLog.create({ data: { jobId: job.id, level: first.level, line: first.text } });
+   917→    }
+   918→    const task = getTask(job.taskType);
+   919→    await db.message.create({
+   920→      data: {
+   921→        projectId,
+   922→        role: "tool",
+   923→        content: `▶ Starting ${task?.name || job.taskType} (job ${job.id.slice(-6)})`,
+   924→        meta: JSON.stringify({ jobId: job.id, taskType: job.taskType, kind: "job-start" }),
+   925→      },
+   926→    });
+   927→    advanced++;
+   928→    break;
+   929→  }
+   930→
+   931→  // 2c. Decisions at completed decision-point jobs
+   932→  for (const jobId of finishedNow) {
+   933→    const job = await db.job.findUnique({ where: { id: jobId } });
+   934→    if (!job) continue;
+   935→    const kind = DECISION_POINTS[job.taskType];
+   936→    if (!kind) continue;
+   937→    const already = await db.decision.findFirst({
+   938→      where: { jobId, kind: { in: ["select", "polish-or-finalize", "branch"] } },
+   939→    });
+   940→    if (already) continue;
+   941→    const decision = await makeDecision(projectId, job);
+   942→    decisionsMade.push({ jobId, taskType: job.taskType, decision: decision.decision });
+   943→  }
+   944→
+   945→  // 2d. Finalize workflow if all done
+   946→  const refreshed = await db.job.findMany({ where: { workflowId: workflow.id } });
+   947→  const allDone = refreshed.every((j) => j.status === "done" || j.status === "skipped");
+   948→  let workflowStatus = "running";
+   949→  if (allDone) {
+   950→    await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
+   951→    await db.project.update({ where: { id: projectId }, data: { status: "done" } });
+   952→    await summarize(projectId);
+   953→    workflowStatus = "done";
+   954→  }
+   955→
+   956→  return {
+   957→    workflowId: workflow.id,
+   958→    workflowStatus,
+   959→    advanced,
+   960→    finishedNow,
+   961→    decisionsMade,
+   962→    done: allDone,
+   963→  };
+   964→}
+   965→
+   966→function canStart(job: any, jobById: Map<string, any>): boolean {
+   967→  const deps = JSON.parse(job.inputJobIds) as string[];
+   968→  // A dependency is satisfied if it is done OR skipped (skipped upstream jobs
+   969→  // mean the engine chose an alternative path, e.g. using a reference map).
+   970→  return deps.every((d) => ["done", "skipped"].includes(jobById.get(d)?.status));
+   971→}
+   972→
+   973→// Generate a simple spherical 3D density map as a placeholder when no
+   974→// reference.mrc exists (real experimental data like EMPIAR). This lets
+   975→// maskcreate + postprocess produce real RELION output files.
+   976→async function generatePlaceholderMap(mapPath: string, boxSize: number, angpix: number): Promise<void> {
+   977→  const { execFile } = await import("child_process");
+   978→  const { promisify } = await import("util");
+   979→  const exec = promisify(execFile);
+   980→  const script = `
+   981→import sys, numpy as np, mrcfile
+   982→box = ${boxSize}
+   983→angpix = ${angpix}
+   984→z = np.zeros((box, box, box), dtype=np.float32)
+   985→c = box // 2
+   986→r = box // 4
+   987→xx, yy, zz = np.meshgrid(np.arange(box), np.arange(box), np.arange(box), indexing='ij')
+   988→d2 = (xx - c)**2 + (yy - c)**2 + (zz - c)**2
+   989→z = np.exp(-d2 / (2 * r * r)).astype(np.float32)
+   990→z /= z.max()
+   991→with mrcfile.new(sys.argv[1], overwrite=True) as m:
+   992→    m.set_data(z)
+   993→    m.voxel_size = (angpix, angpix, angpix)
+   994→print(f"wrote placeholder map {box}^3 at {angpix} A/px")
+   995→`;
+   996→  try {
+   997→    await exec("python3", ["-c", script, mapPath]);
+   998→  } catch (e) {
+   999→    // ignore — the maskcreate task will fail gracefully
+  1000→  }
+  1001→}
+  1002→
+  1003→// Helper to send an info message to the chat from within buildRunnerInputs
+  1004→async function on_line_info(projectId: string, content: string): Promise<void> {
+  1005→  await db.message.create({
+  1006→    data: {
+  1007→      projectId,
+  1008→      role: "tool",
+  1009→      content,
+  1010→      meta: JSON.stringify({ kind: "info" }),
+  1011→    },
+  1012→  });
+  1013→}
+  1014→
+  1015→// ---- 3. makeDecision -------------------------------------------------------
+  1016→
+  1017→export interface Decision {
+  1018→  decision: string;
+  1019→  reason: string;
+  1020→  action: "proceed" | "retry" | "branch";
+  1021→  nextJob?: string;
+  1022→  parameters?: Record<string, string | number | boolean>;
+  1023→  keepClasses?: number[];
+  1024→}
+  1025→
+  1026→export async function makeDecision(projectId: string, job: { id: string; taskType: string }): Promise<Decision> {
+  1027→  const fullJob = await db.job.findUnique({ where: { id: job.id } });
+  1028→  if (!fullJob) return { decision: "skip", reason: "job missing", action: "proceed" };
+  1029→  const outputSummary = JSON.parse(fullJob.outputSummary);
+  1030→  const params = JSON.parse(fullJob.parameters);
+  1031→
+  1032→  // Try LLM decision
+  1033→  let decision: Decision | null = null;
+  1034→  try {
+  1035→    const client = await zai();
+  1036→    const userPrompt = `Decision point after: ${fullJob.taskType}
+  1037→Job output summary:
+  1038→${JSON.stringify(outputSummary, null, 2)}
+  1039→
+  1040→Job parameters:
+  1041→${JSON.stringify(params, null, 2)}
+  1042→
+  1043→Decide the next action.`;
+  1044→    const completion = await client.chat.completions.create({
+  1045→      messages: [
+  1046→        { role: "assistant", content: DECIDER_SYSTEM_PROMPT },
+  1047→        { role: "user", content: userPrompt },
+  1048→      ],
+  1049→      thinking: { type: "disabled" },
+  1050→    });
+  1051→    const raw = completion.choices[0]?.message?.content ?? "";
+  1052→    decision = parseJsonLoose(raw) as Decision | null;
+  1053→  } catch (e) {
+  1054→    decision = null;
+  1055→  }
+  1056→
+  1057→  // Fallback heuristic decision if LLM failed or returned nothing usable
+  1058→  if (!decision || !decision.action) {
+  1059→    decision = heuristicDecision(fullJob.taskType, outputSummary);
+  1060→  }
+  1061→
+  1062→  // Record the decision
+  1063→  await db.decision.create({
+  1064→    data: {
+  1065→      projectId,
+  1066→      jobId: fullJob.id,
+  1067→      kind: DECISION_POINTS[fullJob.taskType] || "branch",
+  1068→      reason: decision.reason,
+  1069→      action: `${decision.action}: ${decision.decision}`,
+  1070→      meta: JSON.stringify({
+  1071→        decision: decision.decision,
+  1072→        keepClasses: decision.keepClasses,
+  1073→        nextJob: decision.nextJob,
+  1074→        parameters: decision.parameters,
+  1075→      }),
+  1076→    },
+  1077→  });
+  1078→
+  1079→  // Announce to chat
+  1080→  const task = getTask(fullJob.taskType);
+  1081→  await db.message.create({
+  1082→    data: {
+  1083→      projectId,
+  1084→      role: "assistant",
+  1085→      content: `🧭 Decision after ${task?.name}: ${decision.decision}\n${decision.reason}`,
+  1086→      meta: JSON.stringify({ kind: "decision", jobId: fullJob.id, taskType: fullJob.taskType, decision }),
+  1087→    },
+  1088→  });
+  1089→
+  1090→  return decision;
+  1091→}
+  1092→
+  1093→function heuristicDecision(
+  1094→  taskType: string,
+  1095→  output: Record<string, number | string>,
+  1096→): Decision {
+  1097→  if (taskType === "class2d") {
+  1098→    const good = Number(output.good_classes ?? 6);
+  1099→    return {
+  1100→      decision: `keep-${good}-good-classes`,
+  1101→      reason: `Keeping ${good} classes with clear secondary structure and high particle count; discarding junk/edge classes.`,
+  1102→      action: "proceed",
+  1103→      nextJob: "initialmodel",
+  1104→      keepClasses: Array.from({ length: good }, (_, i) => i + 1),
+  1105→    };
+  1106→  }
+  1107→  if (taskType === "class3d") {
+  1108→    const best = Number(output.best_class ?? 1);
+  1109→    return {
+  1110→      decision: `refine-class-${best}`,
+  1111→      reason: `Class ${best} is the best-resolved and most populated; taking it into 3D auto-refinement.`,
+  1112→      action: "proceed",
+  1113→      nextJob: "refine3d",
+  1114→    };
+  1115→  }
+  1116→  if (taskType === "refine3d") {
+  1117→    const res = Number(output.resolution_A ?? 3.5);
+  1118→    if (res > 3.5) {
+  1119→      return {
+  1120→        decision: "polish-then-rerefine",
+  1121→        reason: `Resolution ${res} Å exceeds the 3.5 Å threshold; running Bayesian polishing then re-refinement.`,
+  1122→        action: "proceed",
+  1123→        nextJob: "polish",
+  1124→      };
+  1125→    }
+  1126→    return {
+  1127→      decision: "finalize-pipeline",
+  1128→      reason: `Resolution ${res} Å is good; proceeding to post-processing and local resolution.`,
+  1129→      action: "proceed",
+  1130→      nextJob: "maskcreate",
+  1131→    };
+  1132→  }
+  1133→  return { decision: "proceed", reason: "No specific heuristic; continuing pipeline.", action: "proceed" };
+  1134→}
+  1135→
+  1136→// ---- 4. summarize ----------------------------------------------------------
+  1137→
+  1138→export async function summarize(projectId: string): Promise<void> {
+  1139→  const jobs = await db.job.findMany({
+  1140→    where: { workflow: { projectId } },
+  1141→    orderBy: { createdAt: "asc" },
+  1142→  });
+  1143→  const refine = jobs.find((j) => j.taskType === "refine3d");
+  1144→  const post = jobs.find((j) => j.taskType === "postprocess");
+  1145→  const refineOut = refine ? JSON.parse(refine.outputSummary) : {};
+  1146→  const postOut = post ? JSON.parse(post.outputSummary) : {};
+  1147→
+  1148→  const client = await zai();
+  1149→  const completion = await client.chat.completions.create({
+  1150→    messages: [
+  1151→      { role: "assistant", content: CHAT_SYSTEM_PROMPT },
+  1152→      {
+  1153→        role: "user",
+  1154→        content: `The pipeline finished. Final state:
+  1155→- Refined resolution: ${refineOut.resolution_A ?? "n/a"} Å
+  1156→- Postprocess resolution: ${postOut.resolution_A ?? "n/a"} Å
+  1157→- Particles: ${refineOut.n_particles ?? "n/a"}
+  1158→- Symmetry: ${refineOut.symmetry ?? "C1"}
+  1159→
+  1160→Write a concise final summary (2-3 sentences) for the user, in markdown.`,
+  1161→      },
+  1162→    ],
+  1163→    thinking: { type: "disabled" },
+  1164→  });
+  1165→  const summary = completion.choices[0]?.message?.content ?? "Pipeline complete.";
+  1166→  await db.message.create({
+  1167→    data: {
+  1168→      projectId,
+  1169→      role: "assistant",
+  1170→      content: `## ✅ Pipeline complete\n\n${summary}\n\n**Final resolution:** ${postOut.resolution_A ?? refineOut.resolution_A ?? "n/a"} Å`,
+  1171→      meta: JSON.stringify({ kind: "summary" }),
+  1172→    },
+  1173→  });
+  1174→}
+  1175→
+  1176→// ---- 5. chatReply (incremental: plans only the FIRST job) ------------------
+  1177→
+  1178→// The agent is now incremental: chatReply plans ONLY the first job. After each
+  1179→// job completes, planNextJob() decides the next single job based on the result.
+  1180→// This makes the agent truly adaptive — it doesn't pre-commit to a fixed DAG.
+  1181→
+  1182→export async function chatReply(
+  1183→  projectId: string,
+  1184→  userMessage: string,
+  1185→): Promise<{ workflowId: string | null; assistantMessage: string }> {
+  1186→  const project = await db.project.findUnique({ where: { id: projectId } });
+  1187→  const datasetMeta = project?.datasetMeta ? JSON.parse(project.datasetMeta) : {};
+  1188→
+  1189→  // Decide the FIRST job via the LLM
+  1190→  const client = await zai();
+  1191→  const completion = await client.chat.completions.create({
+  1192→    messages: [
+  1193→      { role: "assistant", content: FIRST_JOB_SYSTEM_PROMPT },
+  1194→      {
+  1195→        role: "user",
+  1196→        content: `User request:
+  1197→"""
+  1198→${userMessage}
+  1199→"""
+  1200→
+  1201→Dataset metadata:
+  1202→${JSON.stringify(datasetMeta, null, 2)}
+  1203→
+  1204→Source dataset path: ${project?.sourceDataset || "unknown"}
+  1205→
+  1206→Decide the single first RELION job now.`,
+  1207→      },
+  1208→    ],
+  1209→    thinking: { type: "disabled" },
+  1210→  });
+  1211→  const raw = completion.choices[0]?.message?.content ?? "";
+  1212→  const parsed = parseJsonLoose(raw) as
+  1213→    | { firstJob?: PlannedJob; ackMessage?: string; done?: boolean }
+  1214→    | null;
+  1215→
+  1216→  // Create the workflow (empty — jobs are added one at a time)
+  1217→  const workflow = await db.workflow.create({
+  1218→    data: {
+  1219→      projectId,
+  1220→      name: "Incremental RELION pipeline",
+  1221→      status: "running",
+  1222→    },
+  1223→  });
+  1224→  await db.project.update({ where: { id: projectId }, data: { status: "running" } });
+  1225→
+  1226→  let assistantMessage: string;
+  1227→  if (parsed?.firstJob) {
+  1228→    // store the user's original goal on the workflow for the next-job planner
+  1229→    await db.message.create({
+  1230→      data: {
+  1231→        projectId,
+  1232→        role: "system",
+  1233→        content: `USER_GOAL: ${userMessage}`,
+  1234→        meta: JSON.stringify({ kind: "user-goal" }),
+  1235→      },
+  1236→    });
+  1237→    // create the first job
+  1238→    await createSingleJob(workflow.id, projectId, parsed.firstJob, []);
+  1239→    assistantMessage =
+  1240→      parsed.ackMessage ||
+  1241→      `I'll start with **${parsed.firstJob.task}** and decide each next step based on the results. Watch the workflow panel — each job's results appear as it completes.`;
+  1242→  } else {
+  1243→    assistantMessage = `I understood your request but couldn't decide on a first step. Could you give me more detail about the dataset (pixel size, voltage, particle)?`;
+  1244→  }
+  1245→
+  1246→  await db.message.create({
+  1247→    data: {
+  1248→      projectId,
+  1249→      role: "assistant",
+  1250→      content: assistantMessage,
+  1251→      meta: JSON.stringify({ kind: "first-job", workflowId: workflow.id }),
+  1252→    },
+  1253→  });
+  1254→
+  1255→  return { workflowId: workflow.id, assistantMessage };
+  1256→}
+  1257→
+  1258→// ---- 6. planNextJob (called after a job completes) -------------------------
+  1259→
+  1260→// Creates a single job in the DB with its parameters + input dependencies.
+  1261→async function createSingleJob(
+  1262→  workflowId: string,
+  1263→  projectId: string,
+  1264→  job: PlannedJob,
+  1265→  inputJobIds: string[],
+  1266→): Promise<string> {
+  1267→  const task = getTask(job.task);
+  1268→  if (!task) throw new Error(`unknown task ${job.task}`);
+  1269→  const params: Record<string, string | number | boolean> = {};
+  1270→  for (const p of task.parameters) params[p.key] = p.default;
+  1271→  for (const [k, v] of Object.entries(job.parameters || {})) params[k] = v;
+  1272→  // For the IMPORT job, copy the user-selected bin_factor from the project's
+  1273→  // datasetMeta (set via the NewProjectDialog "Micrograph binning" dropdown).
+  1274→  // The LLM doesn't know about bin_factor — the UI choice is authoritative.
+  1275→  if (job.task === "import") {
+  1276→    const project = await db.project.findUnique({ where: { id: projectId } });
+  1277→    if (project?.datasetMeta) {
+  1278→      try {
+  1279→        const meta = JSON.parse(project.datasetMeta) as Record<string, unknown>;
+  1280→        const bf = Number(meta.bin_factor);
+  1281→        if (Number.isFinite(bf) && (bf === 0 || bf === 1 || bf === 2 || bf === 4)) {
+  1282→          params["bin_factor"] = bf;
+  1283→        }
+  1284→      } catch {}
+  1285→    }
+  1286→  }
+  1287→  // Inherit critical optics parameters (angpix, kV, Cs, Q0) from the import
+  1288→  // job if the LLM didn't specify them — every downstream task needs the
+  1289→  // correct pixel size / voltage to work.
+  1290→  if (job.task !== "import" && inputJobIds.length > 0) {
+  1291→    // walk back to find the import job
+  1292→    const allJobs = await db.job.findMany({ where: { workflowId } });
+  1293→    const importJob = allJobs.find((j) => j.taskType === "import");
+  1294→    if (importJob) {
+  1295→      const importParams = JSON.parse(importJob.parameters) as Record<string, string | number | boolean>;
+  1296→      const importSummary = JSON.parse(importJob.outputSummary || "{}") as Record<string, unknown>;
+  1297→      for (const key of ["angpix", "kV", "Cs", "Q0"]) {
+  1298→        if (importParams[key] !== undefined && params[key] !== undefined) {
+  1299→          // only override if the LLM left the default (didn't explicitly set it)
+  1300→          const taskDefault = task.parameters.find((p) => p.key === key)?.default;
+  1301→          if (params[key] === taskDefault) {
+  1302→            params[key] = importParams[key];
+  1303→          }
+  1304→        }
+  1305→      }
+  1306→      // If import downsampled, use the EFFECTIVE pixel size from the import
+  1307→      // output summary (which has the adjusted angpix after binning).
+  1308→      if (importSummary.downsampled && importSummary.pixel_size) {
+  1309→        params["angpix"] = importSummary.pixel_size as number | string;
+  1310→      }
+  1311→    }
+  1312→  }
+  1313→  const created = await db.job.create({
+  1314→    data: {
+  1315→      workflowId,
+  1316→      taskType: job.task,
+  1317→      alias: job.alias || "",
+  1318→      status: "queued",
+  1319→      parameters: JSON.stringify(params),
+  1320→      inputJobIds: JSON.stringify(inputJobIds),
+  1321→    },
+  1322→  });
+  1323→  return created.id;
+  1324→}
+  1325→
+  1326→// After a job completes, ask the LLM what the next single job should be (or done).
+  1327→export async function planNextJob(
+  1328→  projectId: string,
+  1329→  completedJobId: string,
+  1330→): Promise<{ created: boolean; done: boolean }> {
+  1331→  const workflow = await db.workflow.findFirst({
+  1332→    where: { projectId, status: "running" },
+  1333→    orderBy: { createdAt: "desc" },
+  1334→  });
+  1335→  if (!workflow) return { created: false, done: true };
+  1336→
+  1337→  const allJobs = await db.job.findMany({
+  1338→    where: { workflowId: workflow.id },
+  1339→    orderBy: { createdAt: "asc" },
+  1340→  });
+  1341→  const completedJob = allJobs.find((j) => j.id === completedJobId);
+  1342→  if (!completedJob) return { created: false, done: false };
+  1343→
+  1344→  // Find the user's original goal (stored as a system message)
+  1345→  const goalMsg = await db.message.findFirst({
+  1346→    where: { projectId, role: "system", content: { startsWith: "USER_GOAL:" } },
+  1347→  });
+  1348→  const userGoal = goalMsg?.content?.replace("USER_GOAL:", "").trim() || "";
+  1349→
+  1350→  // Build a summary of all completed jobs + their outputs
+  1351→  const doneJobs = allJobs.filter((j) => ["done", "skipped"].includes(j.status));
+  1352→  const jobHistory = doneJobs
+  1353→    .map((j) => {
+  1354→      const o = JSON.parse(j.outputSummary);
+  1355→      const summaryEntries = Object.entries(o)
+  1356→        .slice(0, 6)
+  1357→        .map(([k, v]) => `${k}=${v}`)
+  1358→        .join(", ");
+  1359→      return `- ${j.taskType} (${j.status}): ${summaryEntries || "no metrics"}`;
+  1360→    })
+  1361→    .join("\n");
+  1362→
+  1363→  const justOut = JSON.parse(completedJob.outputSummary);
+  1364→
+  1365→  const client = await zai();
+  1366→  const completion = await client.chat.completions.create({
+  1367→    messages: [
+  1368→      { role: "assistant", content: NEXT_JOB_SYSTEM_PROMPT },
+  1369→      {
+  1370→        role: "user",
+  1371→        content: `User's original goal:
+  1372→"""
+  1373→${userGoal}
+  1374→"""
+  1375→
+  1376→Pipeline history so far:
+  1377→${jobHistory || "(no jobs completed yet)"}
+  1378→
+  1379→NOTE: 3D tasks (initialmodel, class3d, refine3d) CAN run on this CPU deployment.
+  1380→They use reduced iterations but should produce real 3D maps. Proceed with the full
+  1381→pipeline: class2d -> initialmodel -> class3d -> refine3d -> maskcreate -> postprocess.
+  1382→Only multibody/polish/movierefine require a GPU and are auto-skipped.
+  1383→
+  1384→The just-completed job was: ${completedJob.taskType} (${completedJob.status})
+  1385→Its output summary: ${JSON.stringify(justOut)}
+  1386→
+  1387→Decide the SINGLE next RELION job to run (or declare done). If all feasible steps are done, declare done.`,
+  1388→      },
+  1389→    ],
+  1390→    thinking: { type: "disabled" },
+  1391→  });
+  1392→  const raw = completion.choices[0]?.message?.content ?? "";
+  1393→  const parsed = parseJsonLoose(raw) as
+  1394→    | { nextJob?: PlannedJob; done?: boolean; summary?: string }
+  1395→    | null;
+  1396→
+  1397→  if (parsed?.done) {
+  1398→    // pipeline complete
+  1399→    await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
+  1400→    await db.project.update({ where: { id: projectId }, data: { status: "done" } });
+  1401→    const summary = parsed.summary || "Pipeline complete.";
+  1402→    await db.message.create({
+  1403→      data: {
+  1404→        projectId,
+  1405→        role: "assistant",
+  1406→        content: `## ✅ Pipeline complete\n\n${summary}`,
+  1407→        meta: JSON.stringify({ kind: "summary" }),
+  1408→      },
+  1409→    });
+  1410→    return { created: false, done: true };
+  1411→  }
+  1412→
+  1413→  if (parsed?.nextJob) {
+  1414→    const nj = parsed.nextJob;
+  1415→    // Cycle detection: if this task type has already been run 2+ times, don't
+  1416→    // create another — declare done to prevent infinite loops.
+  1417→    const sameTypeCount = doneJobs.filter((j) => j.taskType === nj.task).length;
+  1418→    if (sameTypeCount >= 2) {
+  1419→      await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
+  1420→      await db.project.update({ where: { id: projectId }, data: { status: "done" } });
+  1421→      await db.message.create({
+  1422→        data: {
+  1423→          projectId,
+  1424→          role: "assistant",
+  1425→          content: `## ✅ Pipeline complete\n\nThe agent has run all feasible steps. ${nj.task} was already attempted ${sameTypeCount} times — stopping to avoid a cycle.`,
+  1426→          meta: JSON.stringify({ kind: "summary", cycleBreak: true }),
+  1427→        },
+  1428→      });
+  1429→      return { created: false, done: true };
+  1430→    }
+  1431→    // resolve dependsOn: by task key → last done job of that type
+  1432→    const inputJobIds: string[] = [];
+  1433→    for (const dep of nj.dependsOn || []) {
+  1434→      const cand = doneJobs.filter((j) => j.taskType === dep);
+  1435→      if (cand.length) inputJobIds.push(cand[cand.length - 1].id);
+  1436→    }
+  1437→    await createSingleJob(workflow.id, projectId, nj, inputJobIds);
+  1438→    await db.message.create({
+  1439→      data: {
+  1440→        projectId,
+  1441→        role: "assistant",
+  1442→        content: `🧭 Next: **${nj.task}**${nj.rationale ? ` — ${nj.rationale}` : ""}`,
+  1443→        meta: JSON.stringify({ kind: "next-job", taskType: nj.task }),
+  1444→      },
+  1445→    });
+  1446→    return { created: true, done: false };
+  1447→  }
+  1448→
+  1449→  // fallback: if LLM gave nothing usable, try a heuristic next-step
+  1450→  const heuristicNext = heuristicNextJob(completedJob.taskType, justOut);
+  1451→  if (heuristicNext) {
+  1452→    const inputJobIds = [completedJob.id];
+  1453→    await createSingleJob(workflow.id, projectId, heuristicNext, inputJobIds);
+  1454→    await db.message.create({
+  1455→      data: {
+  1456→        projectId,
+  1457→        role: "assistant",
+  1458→        content: `🧭 Next: **${heuristicNext.task}** (heuristic — LLM gave no usable plan)`,
+  1459→        meta: JSON.stringify({ kind: "next-job", taskType: heuristicNext.task, heuristic: true }),
+  1460→      },
+  1461→    });
+  1462→    return { created: true, done: false };
+  1463→  }
+  1464→
+  1465→  // nothing more to do
+  1466→  await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
+  1467→  await db.project.update({ where: { id: projectId }, data: { status: "done" } });
+  1468→  return { created: false, done: true };
+  1469→}
+  1470→
+  1471→// Heuristic next-step fallback (used if the LLM plan is unparseable).
+  1472→function heuristicNextJob(
+  1473→  taskType: string,
+  1474→  output: Record<string, number | string>,
+  1475→): PlannedJob | null {
+  1476→  const seq: Record<string, string> = {
+  1477→    import: "motioncorr",
+  1478→    motioncorr: "ctffind",
+  1479→    ctffind: "autopick",
+  1480→    autopick: "extract",
+  1481→    extract: "select",
+  1482→    select: "class2d",
+  1483→    class2d: "maskcreate",
+  1484→    maskcreate: "postprocess",
+  1485→    postprocess: "localres",
+  1486→  };
+  1487→  const next = seq[taskType];
+  1488→  if (!next) return null;
+  1489→  return {
+  1490→    task: next,
+  1491→    dependsOn: [taskType],
+  1492→    parameters: {},
+  1493→    rationale: `Heuristic next step after ${taskType}.`,
+  1494→  };
+  1495→}
+  1496→

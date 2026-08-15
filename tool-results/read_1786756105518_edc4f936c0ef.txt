@@ -1,0 +1,681 @@
+     1→// src/lib/agent/verifier.ts
+     2→//
+     3→// VLM-driven job quality verification.
+     4→//
+     5→// After each supported task completes (autopick, extract, class2d, class3d,
+     6→// refine3d, ctffind), the engine calls verifyJobQuality() which:
+     7→//   1. Renders the relevant result images to PNG (micrograph+picking overlay,
+     8→//      class averages grid, particle thumbnails grid, 3D map slice)
+     9→//   2. Sends the PNG(s) to the vision LLM with a task-specific prompt
+    10→//   3. Parses the structured JSON response into a VerificationResult
+    11→//
+    12→// If verification fails, the engine creates a RETRY job of the same task type
+    13→// with adjusted parameters (see adjustParamsForRetry). Max 3 retries per task.
+    14→
+    15→import ZAI from "z-ai-web-dev-sdk";
+    16→import { execFile } from "child_process";
+    17→import fs from "fs";
+    18→import path from "path";
+    19→import { db } from "@/lib/db";
+    20→import { promisify } from "util";
+    21→
+    22→const execFileAsync = promisify(execFile);
+    23→
+    24→let _zai: Awaited<ReturnType<typeof ZAI.create>> | null = null;
+    25→async function zai() {
+    26→  if (!_zai) _zai = await ZAI.create();
+    27→  return _zai;
+    28→}
+    29→
+    30→export const MAX_RETRIES = 3;
+    31→
+    32→export interface VerificationResult {
+    33→  passed: boolean;
+    34→  score: number; // 1-10
+    35→  reasoning: string;
+    36→  issues: string[];
+    37→  suggestedParams: Record<string, string | number | boolean>;
+    38→}
+    39→
+    40→export interface VerifiableJob {
+    41→  id: string;
+    42→  taskType: string;
+    43→  parameters: string;
+    44→  primaryOutput: string;
+    45→  outputFiles: string;
+    46→  alias: string;
+    47→}
+    48→
+    49→// ---------------------------------------------------------------------------
+    50→// Render helpers — call the Python render_preview.py script to produce PNGs
+    51→// ---------------------------------------------------------------------------
+    52→
+    53→const RENDER_SCRIPT = path.resolve(
+    54→  process.cwd(),
+    55→  "mini-services",
+    56→  "relion-runner",
+    57→  "render_preview.py",
+    58→);
+    59→
+    60→async function renderPickingOverlay(
+    61→  micrographPath: string,
+    62→  autopickStarPath: string,
+    63→  outputPath: string,
+    64→): Promise<boolean> {
+    65→  try {
+    66→    await execFileAsync("python3", [
+    67→      RENDER_SCRIPT, "--mode", "picking",
+    68→      "--micrograph", micrographPath,
+    69→      "--coords", autopickStarPath,
+    70→      "--output", outputPath,
+    71→    ], { timeout: 30000 });
+    72→    return fs.existsSync(outputPath);
+    73→  } catch {
+    74→    return false;
+    75→  }
+    76→}
+    77→
+    78→async function renderClassGrid(
+    79→  stackPath: string,
+    80→  outputPath: string,
+    81→  max = 10,
+    82→): Promise<boolean> {
+    83→  try {
+    84→    await execFileAsync("python3", [
+    85→      RENDER_SCRIPT, "--mode", "classgrid",
+    86→      "--stack", stackPath,
+    87→      "--output", outputPath,
+    88→      "--max", String(max),
+    89→    ], { timeout: 30000 });
+    90→    return fs.existsSync(outputPath);
+    91→  } catch {
+    92→    return false;
+    93→  }
+    94→}
+    95→
+    96→async function renderParticles(
+    97→  stackPath: string,
+    98→  outputPath: string,
+    99→  max = 12,
+   100→): Promise<boolean> {
+   101→  try {
+   102→    await execFileAsync("python3", [
+   103→      RENDER_SCRIPT, "--mode", "particles",
+   104→      "--stack", stackPath,
+   105→      "--output", outputPath,
+   106→      "--max", String(max),
+   107→    ], { timeout: 30000 });
+   108→    return fs.existsSync(outputPath);
+   109→  } catch {
+   110→    return false;
+   111→  }
+   112→}
+   113→
+   114→async function renderSlice(volumePath: string, outputPath: string): Promise<boolean> {
+   115→  try {
+   116→    await execFileAsync("python3", [
+   117→      RENDER_SCRIPT, "--mode", "slice",
+   118→      "--volume", volumePath,
+   119→      "--output", outputPath,
+   120→    ], { timeout: 30000 });
+   121→    return fs.existsSync(outputPath);
+   122→  } catch {
+   123→    return false;
+   124→  }
+   125→}
+   126→
+   127→// ---------------------------------------------------------------------------
+   128→// VLM call helper
+   129→// ---------------------------------------------------------------------------
+   130→
+   131→function imageToDataUrl(pngPath: string): string | null {
+   132→  try {
+   133→    const buf = fs.readFileSync(pngPath);
+   134→    return `data:image/png;base64,${buf.toString("base64")}`;
+   135→  } catch {
+   136→    return null;
+   137→  }
+   138→}
+   139→
+   140→interface VLMResponse {
+   141→  score?: number;
+   142→  passed?: boolean;
+   143→  pass?: boolean;
+   144→  reasoning?: string;
+   145→  reason?: string;
+   146→  issues?: string[];
+   147→  issues_found?: string[];
+   148→  suggested_params?: Record<string, string | number | boolean>;
+   149→  suggestedParams?: Record<string, string | number | boolean>;
+   150→}
+   151→
+   152→async function callVLM(prompt: string, imagePaths: string[]): Promise<VerificationResult> {
+   153→  const client = await zai();
+   154→  const content: any[] = [{ type: "text", text: prompt }];
+   155→  for (const p of imagePaths) {
+   156→    const url = imageToDataUrl(p);
+   157→    if (url) {
+   158→      content.push({ type: "image_url", image_url: { url } });
+   159→    }
+   160→  }
+   161→  try {
+   162→    const response = await client.chat.completions.createVision({
+   163→      messages: [{ role: "user", content }],
+   164→      thinking: { type: "disabled" },
+   165→    });
+   166→    const raw = response.choices[0]?.message?.content ?? "";
+   167→    const parsed = parseVLMJson(raw);
+   168→    const score = Number(parsed.score) || 0;
+   169→    const passed = parsed.passed ?? parsed.pass ?? score >= 7;
+   170→    return {
+   171→      passed,
+   172→      score,
+   173→      reasoning: parsed.reasoning || parsed.reason || raw.slice(0, 500),
+   174→      issues: parsed.issues || parsed.issues_found || [],
+   175→      suggestedParams: parsed.suggested_params || parsed.suggestedParams || {},
+   176→    };
+   177→  } catch (e: any) {
+   178→    // VLM call failed — fail-open (assume passed) so the pipeline doesn't stall
+   179→    return {
+   180→      passed: true,
+   181→      score: 7,
+   182→      reasoning: `VLM verification failed (${e?.message || "unknown error"}); proceeding without verification.`,
+   183→      issues: ["vlm-call-failed"],
+   184→      suggestedParams: {},
+   185→    };
+   186→  }
+   187→}
+   188→
+   189→function parseVLMJson(raw: string): VLMResponse {
+   190→  // strip code fences
+   191→  let t = raw.trim();
+   192→  if (t.startsWith("```")) {
+   193→    t = t.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+   194→  }
+   195→  const start = t.indexOf("{");
+   196→  const end = t.lastIndexOf("}");
+   197→  if (start === -1 || end === -1) return {};
+   198→  try {
+   199→    return JSON.parse(t.slice(start, end + 1));
+   200→  } catch {
+   201→    return {};
+   202→  }
+   203→}
+   204→
+   205→// ---------------------------------------------------------------------------
+   206→// Per-task verifiers
+   207→// ---------------------------------------------------------------------------
+   208→
+   209→// Find the first .mrc micrograph referenced by the import/motioncorr job's
+   210→// outputs (for autopick overlay rendering).
+   211→async function findFirstMicrograph(projectId: string, jobId: string): Promise<string | null> {
+   212→  const projDir = path.resolve(process.cwd(), "data", "projects", projectId);
+   213→  // Look at ALL jobs' output files — the micrographs may be in the import
+   214→  // job (single-frame) or motioncorr job (movie data).
+   215→  const jobs = await db.job.findMany({
+   216→    where: { workflow: { projectId } },
+   217→    select: { taskType: true, outputFiles: true },
+   218→  });
+   219→  for (const j of jobs) {
+   220→    if (j.taskType !== "import" && j.taskType !== "motioncorr") continue;
+   221→    const files: { path: string; size: number }[] = j.outputFiles ? JSON.parse(j.outputFiles) : [];
+   222→    for (const f of files) {
+   223→      const p = f.path.toLowerCase();
+   224→      if (p.endsWith(".mrc") && !p.includes("particles/") && !p.includes("ctffind") && !p.includes("mask")) {
+   225→        const full = path.join(projDir, f.path);
+   226→        if (fs.existsSync(full)) return full;
+   227→      }
+   228→    }
+   229→  }
+   230→  return null;
+   231→}
+   232→
+   233→// Find the particles.mrcs stack produced by an extract job (for class2d/
+   234→// extract verification).
+   235→async function findParticlesStack(projectId: string, jobId: string): Promise<string | null> {
+   236→  const job = await db.job.findUnique({ where: { id: jobId }, select: { outputFiles: true } });
+   237→  const projDir = path.resolve(process.cwd(), "data", "projects", projectId);
+   238→  const files: { path: string; size: number }[] = job?.outputFiles ? JSON.parse(job.outputFiles) : [];
+   239→  for (const f of files) {
+   240→    if (f.path.endsWith("particles.mrcs")) {
+   241→      const full = path.join(projDir, f.path);
+   242→      if (fs.existsSync(full)) return full;
+   243→    }
+   244→  }
+   245→  return null;
+   246→}
+   247→
+   248→// Find the run_itNNN_classes.mrcs stack produced by a class2d job.
+   249→async function findClassAveragesStack(projectId: string, jobId: string): Promise<string | null> {
+   250→  const job = await db.job.findUnique({ where: { id: jobId }, select: { outputFiles: true, primaryOutput: true } });
+   251→  const projDir = path.resolve(process.cwd(), "data", "projects", projectId);
+   252→  const files: { path: string; size: number }[] = job?.outputFiles ? JSON.parse(job.outputFiles) : [];
+   253→  // Prefer the final iteration's _classes.mrcs; fall back to run_unmasked_classes.mrcs
+   254→  const classStacks = files
+   255→    .filter((f) => /run_it\d+_classes\.mrcs$/.test(f.path))
+   256→    .sort((a, b) => {
+   257→      const ai = parseInt(a.path.match(/run_it(\d+)_classes/)?.[1] || "0", 10);
+   258→      const bi = parseInt(b.path.match(/run_it(\d+)_classes/)?.[1] || "0", 10);
+   259→      return bi - ai;
+   260→    });
+   261→  if (classStacks.length > 0) {
+   262→    const full = path.join(projDir, classStacks[0].path);
+   263→    if (fs.existsSync(full)) return full;
+   264→  }
+   265→  const unmasked = files.find((f) => f.path.endsWith("run_unmasked_classes.mrcs"));
+   266→  if (unmasked) {
+   267→    const full = path.join(projDir, unmasked.path);
+   268→    if (fs.existsSync(full)) return full;
+   269→  }
+   270→  return null;
+   271→}
+   272→
+   273→// Find a 3D map .mrc produced by class3d/refine3d/initialmodel.
+   274→async function findVolumeMap(projectId: string, jobId: string): Promise<string | null> {
+   275→  const job = await db.job.findUnique({ where: { id: jobId }, select: { outputFiles: true, primaryOutput: true } });
+   276→  const projDir = path.resolve(process.cwd(), "data", "projects", projectId);
+   277→  const files: { path: string; size: number }[] = job?.outputFiles ? JSON.parse(job.outputFiles) : [];
+   278→  // Prefer the primary output if it's a .mrc volume
+   279→  if (job?.primaryOutput && job.primaryOutput.endsWith(".mrc")) {
+   280→    const full = path.join(projDir, job.primaryOutput);
+   281→    if (fs.existsSync(full)) return full;
+   282→  }
+   283→  // Otherwise look for halfmap or class volume
+   284→  const vol = files.find((f) => /run_it\d+_(class|half|map).*\.mrc$/.test(f.path) && !f.path.includes("classes.mrcs"));
+   285→  if (vol) {
+   286→    const full = path.join(projDir, vol.path);
+   287→    if (fs.existsSync(full)) return full;
+   288→  }
+   289→  return null;
+   290→}
+   291→
+   292→// --- autopick -------------------------------------------------------------
+   293→async function verifyAutopick(projectId: string, job: VerifiableJob): Promise<VerificationResult> {
+   294→  const projDir = path.resolve(process.cwd(), "data", "projects", projectId);
+   295→  const files: { path: string; size: number }[] = job.outputFiles ? JSON.parse(job.outputFiles) : [];
+   296→  const autopickStar = files.find((f) => f.path.endsWith("autopick.star"));
+   297→  if (!autopickStar) {
+   298→    return { passed: true, score: 7, reasoning: "No autopick.star found — skipping verification", issues: [], suggestedParams: {} };
+   299→  }
+   300→  const autopickStarPath = path.join(projDir, autopickStar.path);
+   301→  const micrographPath = await findFirstMicrograph(projectId, job.id);
+   302→  if (!micrographPath) {
+   303→    return { passed: true, score: 7, reasoning: "No micrograph found for overlay — skipping verification", issues: [], suggestedParams: {} };
+   304→  }
+   305→  const tmpPng = path.join(projDir, `_verify_${job.id}_picking.png`);
+   306→  const ok = await renderPickingOverlay(micrographPath, autopickStarPath, tmpPng);
+   307→  if (!ok) {
+   308→    return { passed: true, score: 7, reasoning: "Picking overlay render failed — skipping verification", issues: ["render-failed"], suggestedParams: {} };
+   309→  }
+   310→  const params = JSON.parse(job.parameters);
+   311→  // Get angpix from the import job's output summary if the current job doesn't have it
+   312→  let angpix = Number(params.angpix) || Number(params.import_angpix) || 0;
+   313→  if (!angpix) {
+   314→    const importJob = await db.job.findFirst({
+   315→      where: { workflow: { projectId }, taskType: "import", status: "done" },
+   316→      select: { outputSummary: true },
+   317→    });
+   318→    if (importJob?.outputSummary) {
+   319→      try {
+   320→        const importSummary = JSON.parse(importJob.outputSummary);
+   321→        angpix = Number(importSummary.pixel_size) || 0;
+   322→      } catch {}
+   323→    }
+   324→  }
+   325→  if (!angpix) angpix = 7.08; // fallback
+   326→  const prompt = `You are a cryo-EM data-processing expert verifying particle picking quality.
+   327→
+   328→This image shows a cryo-EM micrograph with GREEN CIRCLES drawn at the positions of auto-picked particles. The particles are protein molecules — in cryo-EM micrographs they appear as DARK SPOTS on a brighter background.
+   329→
+   330→CURRENT PARAMETERS:
+   331→- pixel size: ${angpix} Å/px
+   332→- method: ${params.do_topaz ? "topaz (deep learning)" : params.do_LoG ? "LoG (RELION built-in Laplacian-of-Gaussian)" : "known coords (copied from source)"}
+   333→- particle_diameter: ${params.particle_diameter} Å (= ${(Number(params.particle_diameter) / angpix).toFixed(1)} px at ${angpix} Å/px)
+   334→- threshold: ${params.threshold ?? "n/a"}
+   335→
+   336→CONTEXT: At ${angpix} Å/px, a typical protein particle of 100-200 Å diameter spans ${((100 / angpix).toFixed(0))}-${((200 / angpix).toFixed(0))} px. The green circles should match the visible particle size — if circles are much larger or smaller than the dark spots, the diameter is wrong.
+   337→
+   338→Evaluate:
+   339→1. Are the green circles placed on actual protein particles (visible dark spots), or on empty background/noise?
+   340→2. Is the CIRCLE SIZE appropriate — do the circles match the size of visible particles? If particles look ~${((130 / angpix).toFixed(0))} px wide, is the diameter setting close to that?
+   341→3. Is the picking density reasonable (not too sparse, not overcrowded)?
+   342→4. Are obvious particles being missed (false negatives)?
+   343→
+   344→CRITICAL: If the picking is bad, suggest SPECIFIC parameter changes:
+   345→- particle_diameter (in Å): measure the visible particle size in the image and suggest the right diameter
+   346→- threshold: if too many false positives, increase; if too few picks, decrease
+   347→- do_LoG: true to use RELION's built-in LoG picker, false to use Topaz
+   348→
+   349→Respond in EXACTLY this JSON format (no markdown):
+   350→{
+   351→  "score": <1-10 integer>,
+   352→  "passed": <true if score>=7 else false>,
+   353→  "reasoning": "<2-3 sentence explanation>",
+   354→  "issues": ["<issue 1>", "<issue 2>"],
+   355→  "suggested_params": {"particle_diameter": <int in Å, e.g. 130>, "threshold": <float 0-1>, "do_topaz": <bool>, "do_LoG": <bool>}
+   356→}`;
+   357→  const result = await callVLM(prompt, [tmpPng]);
+   358→  try { fs.unlinkSync(tmpPng); } catch {}
+   359→  return result;
+   360→}
+   361→
+   362→// --- extract ---------------------------------------------------------------
+   363→async function verifyExtract(projectId: string, job: VerifiableJob): Promise<VerificationResult> {
+   364→  const stackPath = await findParticlesStack(projectId, job.id);
+   365→  if (!stackPath) {
+   366→    return { passed: true, score: 7, reasoning: "No particles.mrcs found — skipping verification", issues: [], suggestedParams: {} };
+   367→  }
+   368→  const projDir = path.resolve(process.cwd(), "data", "projects", projectId);
+   369→  const tmpPng = path.join(projDir, `_verify_${job.id}_particles.png`);
+   370→  const ok = await renderParticles(stackPath, tmpPng, 12);
+   371→  if (!ok) {
+   372→    return { passed: true, score: 7, reasoning: "Particle render failed — skipping", issues: ["render-failed"], suggestedParams: {} };
+   373→  }
+   374→  const params = JSON.parse(job.parameters);
+   375→  // Get angpix from the import job's output summary if the current job doesn't have it
+   376→  let angpix = Number(params.angpix) || Number(params.import_angpix) || 0;
+   377→  if (!angpix) {
+   378→    const importJob = await db.job.findFirst({
+   379→      where: { workflow: { projectId }, taskType: "import", status: "done" },
+   380→      select: { outputSummary: true },
+   381→    });
+   382→    if (importJob?.outputSummary) {
+   383→      try {
+   384→        const importSummary = JSON.parse(importJob.outputSummary);
+   385→        angpix = Number(importSummary.pixel_size) || 0;
+   386→      } catch {}
+   387→    }
+   388→  }
+   389→  if (!angpix) angpix = 7.08; // fallback
+   390→  let currentBox = Number(params.box_size) || Number(params.extract_size) || 0;
+   391→  // Also try to get the actual box_size from the job's output summary
+   392→  // (the runner may have capped it from the requested value)
+   393→  const extractJob = await db.job.findUnique({ where: { id: job.id }, select: { outputSummary: true } });
+   394→  if (extractJob?.outputSummary) {
+   395→    try {
+   396→      const summary = JSON.parse(extractJob.outputSummary);
+   397→      if (summary.box_size) {
+   398→        if (Number(summary.box_size) > 0) currentBox = Number(summary.box_size);
+   399→      }
+   400→    } catch {}
+   401→  }
+   402→  const prompt = `You are a cryo-EM expert verifying particle extraction quality.
+   403→
+   404→This image shows a GRID of the first 12 extracted particle boxes from a particles.mrcs stack. Each cell is a small box centered on a picked particle. The display uses the classic cryo-EM convention: PROTEIN = WHITE (bright), BACKGROUND = BLACK (dark).
+   405→
+   406→CURRENT PARAMETERS:
+   407→- box_size: ${currentBox} px (= ${(currentBox * angpix).toFixed(0)} Å field of view at ${angpix} Å/px)
+   408→- pixel size: ${angpix} Å/px
+   409→- particle_diameter: ${params.particle_diameter} Å (= ${(Number(params.particle_diameter) / angpix).toFixed(1)} px)
+   410→
+   411→CONTEXT: The box should be ~2x the particle diameter in pixels so the particle fills ~50% of the box. For a ${params.particle_diameter} Å particle at ${angpix} Å/px, the ideal box is ~${Math.round(Number(params.particle_diameter) / angpix * 2)} px.
+   412→
+   413→Evaluate:
+   414→1. Do the boxes contain visible WHITE protein density (bright centered regions)?
+   415→2. Are the particles centered in the boxes (not clipped at edges)?
+   416→3. Is the box size appropriate? If the particle fills <30% of the box, the box is TOO LARGE. If the particle is clipped at edges, the box is TOO SMALL.
+   417→4. Are there junk boxes (empty/black, or ice contamination)?
+   418→
+   419→CRITICAL: If the box size is wrong, suggest a SPECIFIC new box_size:
+   420→- If particle is clipped → increase box_size
+   421→- If particle fills <30% of box → decrease box_size
+   422→- Ideal: particle fills 40-60% of the box
+   423→
+   424→Respond in EXACTLY this JSON format:
+   425→{
+   426→  "score": <1-10>,
+   427→  "passed": <true if score>=7>,
+   428→  "reasoning": "<explanation>",
+   429→  "issues": ["..."],
+   430→  "suggested_params": {"box_size": <int in px, e.g. 96>, "particle_diameter": <int in Å, e.g. 130>}
+   431→}`;
+   432→  const result = await callVLM(prompt, [tmpPng]);
+   433→  try { fs.unlinkSync(tmpPng); } catch {}
+   434→  return result;
+   435→}
+   436→
+   437→// --- class2d ---------------------------------------------------------------
+   438→async function verifyClass2D(projectId: string, job: VerifiableJob): Promise<VerificationResult> {
+   439→  const stackPath = await findClassAveragesStack(projectId, job.id);
+   440→  if (!stackPath) {
+   441→    return { passed: true, score: 7, reasoning: "No class averages stack found — skipping verification", issues: [], suggestedParams: {} };
+   442→  }
+   443→  const projDir = path.resolve(process.cwd(), "data", "projects", projectId);
+   444→  const tmpPng = path.join(projDir, `_verify_${job.id}_classgrid.png`);
+   445→  const params = JSON.parse(job.parameters);
+   446→  const nrClasses = Number(params.nr_classes) || 10;
+   447→  const ok = await renderClassGrid(stackPath, tmpPng, Math.min(nrClasses, 10));
+   448→  if (!ok) {
+   449→    return { passed: true, score: 7, reasoning: "Class grid render failed — skipping", issues: ["render-failed"], suggestedParams: {} };
+   450→  }
+   451→  const prompt = `You are a cryo-EM expert verifying 2D classification quality.
+   452→
+   453→This image shows a GRID of 2D class averages produced by RELION relion_refine. Each cell is one class average (the average of all particles assigned to that class). The display uses the classic cryo-EM convention: PROTEIN = WHITE (bright), BACKGROUND = BLACK (dark).
+   454→
+   455→For a good classification, the class averages should show:
+   456→- Clear, distinct views of the particle (different orientations)
+   457→- Sharp features (not blurry blobs)
+   458→- High signal-to-noise (the particle should be clearly WHITE against BLACK background)
+   459→
+   460→CURRENT PARAMETERS:
+   461→- nr_classes: ${nrClasses}
+   462→- iterations: ${params.iter_nr_iter}
+   463→- tau_fudge (regularization T): ${params.tau_fudge}
+   464→
+   465→Evaluate:
+   466→1. Do the class averages show CLEAR WHITE particle views with distinguishable features?
+   467→2. Are there junk classes (pure noise, blurred, or empty/black)?
+   468→3. Is the number of good classes reasonable (at least 2-3 clearly-resolved views)?
+   469→4. Are the features sharp enough to suggest the particles are well-aligned?
+   470→5. If ALL classes look like noise or blurry blobs, the problem is likely upstream (bad picking or bad box size) — note this in issues.
+   471→
+   472→If the classification is poor, suggest parameter changes:
+   473→- iter_nr_iter: more iterations (5→10→15) for better convergence
+   474→- tau_fudge: higher T (2→4) gives smoother/sharper classes; lower T gives more diverse classes
+   475→- nr_classes: fewer classes (10→5) concentrates particles into better averages
+   476→
+   477→Respond in EXACTLY this JSON format:
+   478→{
+   479→  "score": <1-10>,
+   480→  "passed": <true if score>=7>,
+   481→  "reasoning": "<explanation>",
+   482→  "issues": ["..."],
+   483→  "suggested_params": {"iter_nr_iter": <int>, "tau_fudge": <float>, "nr_classes": <int>}
+   484→}`;
+   485→  const result = await callVLM(prompt, [tmpPng]);
+   486→  try { fs.unlinkSync(tmpPng); } catch {}
+   487→  return result;
+   488→}
+   489→
+   490→// --- class3d / refine3d / initialmodel ------------------------------------
+   491→async function verify3DRefinement(projectId: string, job: VerifiableJob): Promise<VerificationResult> {
+   492→  const volPath = await findVolumeMap(projectId, job.id);
+   493→  if (!volPath) {
+   494→    return { passed: true, score: 7, reasoning: "No 3D volume map found — skipping verification", issues: [], suggestedParams: {} };
+   495→  }
+   496→  const projDir = path.resolve(process.cwd(), "data", "projects", projectId);
+   497→  const tmpPng = path.join(projDir, `_verify_${job.id}_slice.png`);
+   498→  const ok = await renderSlice(volPath, tmpPng);
+   499→  if (!ok) {
+   500→    return { passed: true, score: 7, reasoning: "Slice render failed — skipping", issues: ["render-failed"], suggestedParams: {} };
+   501→  }
+   502→  const prompt = `You are a cryo-EM expert verifying 3D reconstruction quality.
+   503→
+   504→This image shows the MIDDLE Z-SLICE of a 3D density map produced by RELION ${job.taskType}.
+   505→
+   506→Evaluate:
+   507→1. Does the slice show a clear, contiguous protein density (not just noise)?
+   508→2. Is the density well-defined with sharp boundaries?
+   509→3. Are there signs of over-refinement (noise amplification, spurious density)?
+   510→4. For an initial model: does it look like a plausible low-resolution particle envelope?
+   511→
+   512→Respond in EXACTLY this JSON format:
+   513→{
+   514→  "score": <1-10>,
+   515→  "passed": <true if score>=6>,
+   516→  "reasoning": "<explanation>",
+   517→  "issues": ["..."],
+   518→  "suggested_params": {"iter_nr_iter": <int>}
+   519→}`;
+   520→  const result = await callVLM(prompt, [tmpPng]);
+   521→  try { fs.unlinkSync(tmpPng); } catch {}
+   522→  return result;
+   523→}
+   524→
+   525→// --- ctffind ---------------------------------------------------------------
+   526→async function verifyCtffind(projectId: string, job: VerifiableJob): Promise<VerificationResult> {
+   527→  // CTF verification uses the CTF quality scatter data (parsed from the star).
+   528→  // Since we can't easily render a plot server-side, we use the summary stats.
+   529→  const summary = JSON.parse((await db.job.findUnique({ where: { id: job.id }, select: { outputSummary: true } }))?.outputSummary || "{}");
+   530→  const avgRes = Number(summary.avg_resolution_A) || 0;
+   531→  const n = Number(summary.n_micrographs) || 0;
+   532→  // Heuristic: avg CTF resolution < 8 Å is good, > 12 Å is poor
+   533→  const score = avgRes === 0 ? 7 : avgRes < 6 ? 9 : avgRes < 8 ? 8 : avgRes < 12 ? 6 : 4;
+   534→  const passed = score >= 6;
+   535→  return {
+   536→    passed,
+   537→    score,
+   538→    reasoning: `CTF fit avg resolution: ${avgRes} Å across ${n} micrographs. ${passed ? "Acceptable." : "Poor — consider re-running with different box size / resolution range."}`,
+   539→    issues: passed ? [] : [`avg_resolution_${avgRes}Å_is_poor`],
+   540→    suggestedParams: passed ? {} : { box_size: 256, min_res: 50, max_res: 8 },
+   541→  };
+   542→}
+   543→
+   544→// ---------------------------------------------------------------------------
+   545→// Main entry: dispatch to the right verifier
+   546→// ---------------------------------------------------------------------------
+   547→export async function verifyJobQuality(
+   548→  projectId: string,
+   549→  job: VerifiableJob,
+   550→): Promise<VerificationResult> {
+   551→  switch (job.taskType) {
+   552→    case "autopick":
+   553→      return verifyAutopick(projectId, job);
+   554→    case "extract":
+   555→      return verifyExtract(projectId, job);
+   556→    case "class2d":
+   557→      return verifyClass2D(projectId, job);
+   558→    case "class3d":
+   559→    case "refine3d":
+   560→    case "initialmodel":
+   561→      return verify3DRefinement(projectId, job);
+   562→    case "ctffind":
+   563→      return verifyCtffind(projectId, job);
+   564→    default:
+   565→      return { passed: true, score: 10, reasoning: "No verifier for this task type", issues: [], suggestedParams: {} };
+   566→  }
+   567→}
+   568→
+   569→// ---------------------------------------------------------------------------
+   570→// Retry parameter adjustment
+   571→// ---------------------------------------------------------------------------
+   572→
+   573→// Clamp VLM-suggested parameter values to safe ranges. The VLM sometimes
+   574→// proposes nonsensical values (e.g. particle_diameter=0, box_size=-1).
+   575→function clampSuggestedParam(key: string, value: string | number | boolean): string | number | boolean | null {
+   576→  if (typeof value === "boolean") return value;
+   577→  if (typeof value === "string") return value;
+   578→  const n = Number(value);
+   579→  if (!Number.isFinite(n)) return null;
+   580→  switch (key) {
+   581→    case "particle_diameter":
+   582→      return Math.max(20, Math.min(n, 500));
+   583→    case "box_size":
+   584→    case "extract_size":
+   585→      return Math.max(32, Math.min(n, 256));
+   586→    case "threshold":
+   587→      return Math.max(0, Math.min(n, 1));
+   588→    case "iter_nr_iter":
+   589→      return Math.max(3, Math.min(Math.round(n), 25));
+   590→    case "tau_fudge":
+   591→      return Math.max(0.1, Math.min(n, 20));
+   592→    case "nr_classes":
+   593→      return Math.max(2, Math.min(Math.round(n), 50));
+   594→    default:
+   595→      return n;
+   596→  }
+   597→}
+   598→
+   599→export function adjustParamsForRetry(
+   600→  taskType: string,
+   601→  currentParams: Record<string, string | number | boolean>,
+   602→  retryCount: number,
+   603→  verification: VerificationResult,
+   604→): Record<string, string | number | boolean> {
+   605→  const newParams: Record<string, string | number | boolean> = { ...currentParams };
+   606→
+   607→  // First, apply VLM-suggested params — but CLAMP them to safe ranges to
+   608→  // prevent the VLM from proposing nonsensical values (e.g. particle_diameter=0).
+   609→  if (verification.suggestedParams) {
+   610→    for (const [k, v] of Object.entries(verification.suggestedParams)) {
+   611→      const clamped = clampSuggestedParam(k, v);
+   612→      if (clamped !== null) {
+   613→        newParams[k] = clamped;
+   614→      }
+   615→    }
+   616→  }
+   617→
+   618→  // Then apply retry-strategy-specific defaults if the VLM didn't suggest values
+   619→  switch (taskType) {
+   620→    case "autopick":
+   621→      if (retryCount === 1 && newParams.do_topaz === undefined && newParams.do_LoG === undefined) {
+   622→        // switch from topaz to LoG
+   623→        newParams.do_topaz = false;
+   624→        newParams.do_LoG = true;
+   625→      } else if (retryCount === 2 && verification.suggestedParams.particle_diameter === undefined) {
+   626→        // adjust diameter ±25%
+   627→        const d = Number(newParams.particle_diameter) || 130;
+   628→        newParams.particle_diameter = Math.round(d * 1.25);
+   629→      } else if (retryCount >= 3 && verification.suggestedParams.threshold === undefined) {
+   630→        // lower threshold to pick more
+   631→        const t = Number(newParams.threshold) || 0;
+   632→        newParams.threshold = Math.max(0, t - 0.2);
+   633→      }
+   634→      break;
+   635→    case "class2d":
+   636→      if (retryCount === 1 && verification.suggestedParams.iter_nr_iter === undefined) {
+   637→        // increase iterations
+   638→        const it = Number(newParams.iter_nr_iter) || 5;
+   639→        newParams.iter_nr_iter = Math.min(it + 5, 15);
+   640→      } else if (retryCount === 2 && verification.suggestedParams.tau_fudge === undefined) {
+   641→        // increase regularization
+   642→        const t = Number(newParams.tau_fudge) || 2;
+   643→        newParams.tau_fudge = t * 2;
+   644→      } else if (retryCount >= 3 && verification.suggestedParams.nr_classes === undefined) {
+   645→        // try fewer classes (more particles per class)
+   646→        const k = Number(newParams.nr_classes) || 10;
+   647→        newParams.nr_classes = Math.max(5, k - 3);
+   648→      }
+   649→      break;
+   650→    case "class3d":
+   651→    case "refine3d":
+   652→    case "initialmodel":
+   653→      if (verification.suggestedParams.iter_nr_iter === undefined) {
+   654→        const it = Number(newParams.iter_nr_iter) || 3;
+   655→        newParams.iter_nr_iter = Math.min(it + 2, 10);
+   656→      }
+   657→      break;
+   658→    case "extract":
+   659→      if (retryCount === 1 && verification.suggestedParams.box_size === undefined) {
+   660→        const b = Number(newParams.box_size) || 64;
+   661→        newParams.box_size = Math.min(b + 16, 128);
+   662→      } else if (retryCount >= 2 && verification.suggestedParams.particle_diameter === undefined) {
+   663→        const d = Number(newParams.particle_diameter) || 130;
+   664→        newParams.particle_diameter = Math.round(d * 1.2);
+   665→      }
+   666→      break;
+   667→  }
+   668→  return newParams;
+   669→}
+   670→
+   671→// ---------------------------------------------------------------------------
+   672→// Retry count tracking — encoded in the parameters JSON as _retryCount
+   673→// ---------------------------------------------------------------------------
+   674→export function getRetryCount(params: Record<string, any>): number {
+   675→  return Number(params._retryCount) || 0;
+   676→}
+   677→
+   678→export function setRetryCount(params: Record<string, any>, count: number): Record<string, any> {
+   679→  return { ...params, _retryCount: count };
+   680→}
+   681→

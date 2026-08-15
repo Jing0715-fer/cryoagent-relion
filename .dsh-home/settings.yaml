@@ -1,0 +1,5 @@
+llm-deepseek:
+  baseURL: http://127.0.0.1:3005/v1
+  apiKeyEnv: DEEPSEEK_API_KEY
+  thinking: disabled
+  reasoningEffort: off

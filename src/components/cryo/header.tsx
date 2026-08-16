@@ -1,8 +1,10 @@
 "use client";
 
+import { useState } from "react";
 import { Icon } from "./icon";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { LLMSettingsDialog } from "./llm-settings-dialog";
 
 interface Props {
   projectName: string;
@@ -27,6 +29,7 @@ const STATUS_LABEL: Record<string, { label: string; color: string }> = {
 
 export function Header({ projectName, status, resolution, nJobs, nDone, taskCatalogCount, projectId, onExport, exporting }: Props) {
   const st = STATUS_LABEL[status] || STATUS_LABEL.idle;
+  const [llmOpen, setLlmOpen] = useState(false);
   return (
     <header className="border-b border-border/60 bg-card/40 backdrop-blur cryo-grid-bg">
       <div className="flex items-center gap-3 px-4 h-14">
@@ -78,12 +81,21 @@ export function Header({ projectName, status, resolution, nJobs, nDone, taskCata
               {exporting ? "zipping…" : "Export"}
             </button>
           )}
+          <button
+            onClick={() => setLlmOpen(true)}
+            className="flex items-center gap-1 text-[11px] rounded-md border border-border/60 bg-muted/30 hover:bg-violet-500/10 hover:border-violet-500/40 hover:text-violet-300 px-2 py-1 text-muted-foreground transition-colors"
+            title="Configure LLM provider, model, API key, and endpoint"
+          >
+            <Icon name="Settings" className="h-3 w-3" />
+            LLM
+          </button>
           <Badge variant="outline" className={cn("gap-1 capitalize", st.color)}>
             {status === "running" && <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 cryo-pulse" />}
             {st.label}
           </Badge>
         </div>
       </div>
+      <LLMSettingsDialog open={llmOpen} onOpenChange={setLlmOpen} />
     </header>
   );
 }

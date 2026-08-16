@@ -389,9 +389,10 @@ async function buildRunnerInputs(
         if (importCandidates.length > 0) {
           const imp = importCandidates[importCandidates.length - 1];
           // primaryOutput may be absolute or relative to project dir.
+          const projectId = imp.workflow?.projectId || workflow.projectId || "";
           inputs[key] = path.isAbsolute(imp.primaryOutput)
             ? imp.primaryOutput
-            : path.join(path.resolve(process.cwd(), "data", "projects", imp.workflow.projectId || ""), imp.primaryOutput);
+            : path.join(path.resolve(process.cwd(), "data", "projects", projectId), imp.primaryOutput);
         }
       }
       continue;
@@ -827,6 +828,22 @@ ${newRetryCount > 1 ? `+ retry strategy #${newRetryCount}` : ""}`,
   }
 
   // ---- SIMULATED PATH (original time-based logic) ----
+  // Check single_frame in simulated path too — skip motioncorr for single-frame data
+  const importJobSim = allJobs.find((j) => j.taskType === "import" && j.status === "done");
+  let isSingleFrameSim = false;
+  if (importJobSim) {
+    try {
+      const importSummarySim = JSON.parse(importJobSim.outputSummary);
+      isSingleFrameSim = !!importSummarySim.single_frame;
+    } catch {}
+  }
+  // Skip motioncorr in simulated path if single-frame
+  if (isSingleFrameSim) {
+    const mcQueued = allJobs.find((j) => j.taskType === "motioncorr" && j.status === "running");
+    if (mcQueued) {
+      await db.job.update({ where: { id: mcQueued.id }, data: { status: "skipped", progress: 100, finishedAt: new Date() } });
+    }
+  }
   const doneTasks = new Set(allJobs.filter((j) => j.status === "done").map((j) => j.taskType));
 
   // 2a. Advance running jobs

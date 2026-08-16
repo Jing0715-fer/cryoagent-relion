@@ -7,27 +7,30 @@ const SETTINGS_PATH = path.resolve(process.cwd(), ".dsh-home", "settings.yaml");
 
 const PROVIDERS = [
   { id: "deepseek-official", name: "DeepSeek (Official)", ns: "llm-deepseek", models: [
-    { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", contextWindow: 1000000 },
-    { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro", contextWindow: 1000000 },
-    { id: "deepseek-chat", name: "DeepSeek-V3 (Chat)", contextWindow: 64000 },
-    { id: "deepseek-reasoner", name: "DeepSeek-R1 (Reasoner)", contextWindow: 64000 },
+    { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash (Latest)", contextWindow: 1000000 },
+    { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro (Latest)", contextWindow: 1000000 },
+    { id: "deepseek-chat", name: "DeepSeek-V3 Chat (Legacy)", contextWindow: 64000 },
+    { id: "deepseek-reasoner", name: "DeepSeek-R1 Reasoner (Legacy)", contextWindow: 64000 },
   ]},
   { id: "openai", name: "OpenAI", ns: "llm-pi-ai", models: [
-    { id: "gpt-4o", name: "GPT-4o", contextWindow: 128000 },
-    { id: "gpt-4o-mini", name: "GPT-4o Mini", contextWindow: 128000 },
+    { id: "gpt-5", name: "GPT-5", contextWindow: 200000 },
+    { id: "gpt-5-mini", name: "GPT-5 Mini", contextWindow: 200000 },
+    { id: "gpt-5-nano", name: "GPT-5 Nano", contextWindow: 200000 },
     { id: "gpt-4.1", name: "GPT-4.1", contextWindow: 1047576 },
     { id: "gpt-4.1-mini", name: "GPT-4.1 Mini", contextWindow: 1047576 },
     { id: "gpt-4.1-nano", name: "GPT-4.1 Nano", contextWindow: 1047576 },
+    { id: "gpt-4o", name: "GPT-4o", contextWindow: 128000 },
+    { id: "gpt-4o-mini", name: "GPT-4o Mini", contextWindow: 128000 },
     { id: "o3", name: "o3", contextWindow: 200000 },
     { id: "o3-mini", name: "o3-mini", contextWindow: 200000 },
     { id: "o4-mini", name: "o4-mini", contextWindow: 200000 },
   ]},
   { id: "anthropic", name: "Anthropic (Claude)", ns: "llm-pi-ai", models: [
-    { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", contextWindow: 200000 },
+    { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 (Latest)", contextWindow: 200000 },
     { id: "claude-opus-4-5", name: "Claude Opus 4.5", contextWindow: 200000 },
     { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", contextWindow: 200000 },
-    { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet (Oct 2024)", contextWindow: 200000 },
-    { id: "claude-3-5-haiku-20241022", name: "Claude 3.5 Haiku (Oct 2024)", contextWindow: 200000 },
+    { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet", contextWindow: 200000 },
+    { id: "claude-3-5-haiku-20241022", name: "Claude 3.5 Haiku", contextWindow: 200000 },
   ]},
   { id: "google", name: "Google (Gemini)", ns: "llm-pi-ai", models: [
     { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", contextWindow: 1048576 },
@@ -37,11 +40,11 @@ const PROVIDERS = [
   ]},
   { id: "mistral", name: "Mistral AI", ns: "llm-pi-ai", models: [
     { id: "mistral-large-latest", name: "Mistral Large (Latest)", contextWindow: 128000 },
-    { id: "mistral-medium-latest", name: "Mistral Medium (Latest)", contextWindow: 128000 },
-    { id: "mistral-small-latest", name: "Mistral Small (Latest)", contextWindow: 128000 },
+    { id: "mistral-medium-latest", name: "Mistral Medium", contextWindow: 128000 },
+    { id: "mistral-small-latest", name: "Mistral Small", contextWindow: 128000 },
     { id: "codestral-latest", name: "Codestral", contextWindow: 256000 },
     { id: "pixtral-large-latest", name: "Pixtral Large (Vision)", contextWindow: 128000 },
-    { id: "magistral-medium-latest", name: "Magistral Medium", contextWindow: 128000 },
+    { id: "magistral-medium-latest", name: "Magistral Medium (Reasoning)", contextWindow: 128000 },
   ]},
   { id: "minimax", name: "MiniMax", ns: "llm-pi-ai", models: [
     { id: "MiniMax-M1", name: "MiniMax-M1", contextWindow: 1000000 },
@@ -55,7 +58,7 @@ const PROVIDERS = [
     { id: "abab6.5s-chat", name: "abab6.5s Chat", contextWindow: 245760 },
   ]},
   { id: "moonshotai", name: "Moonshot AI (Kimi)", ns: "llm-pi-ai", models: [
-    { id: "kimi-k2", name: "Kimi K2", contextWindow: 131072 },
+    { id: "kimi-k2", name: "Kimi K2 (Latest)", contextWindow: 131072 },
     { id: "kimi-k2-turbo", name: "Kimi K2 Turbo", contextWindow: 131072 },
     { id: "moonshot-v1-128k", name: "Moonshot v1 128K", contextWindow: 131072 },
     { id: "moonshot-v1-32k", name: "Moonshot v1 32K", contextWindow: 32768 },
@@ -70,7 +73,7 @@ const PROVIDERS = [
     { id: "qwen-max", name: "Qwen Max", contextWindow: 32768 },
     { id: "qwen-plus", name: "Qwen Plus", contextWindow: 131072 },
     { id: "qwen-turbo", name: "Qwen Turbo", contextWindow: 1000000 },
-    { id: "qwen-long", name: "Qwen Long", contextWindow: 10000000 },
+    { id: "qwen-long", name: "Qwen Long (10M ctx)", contextWindow: 10000000 },
   ]},
   { id: "groq", name: "Groq", ns: "llm-pi-ai", models: [
     { id: "llama-3.3-70b-versatile", name: "Llama 3.3 70B Versatile", contextWindow: 128000 },
@@ -98,7 +101,7 @@ const PROVIDERS = [
     { id: "auto", name: "Auto (route to best)", contextWindow: 200000 },
   ]},
   { id: "zai", name: "Z.AI (GLM)", ns: "llm-pi-ai", models: [
-    { id: "glm-4.6", name: "GLM-4.6", contextWindow: 128000 },
+    { id: "glm-4.6", name: "GLM-4.6 (Latest)", contextWindow: 128000 },
     { id: "glm-4.5v", name: "GLM-4.5V (Vision)", contextWindow: 128000 },
     { id: "glm-4-plus", name: "GLM-4 Plus", contextWindow: 128000 },
     { id: "glm-4-flash", name: "GLM-4 Flash (Free)", contextWindow: 128000 },

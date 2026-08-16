@@ -5,6 +5,7 @@ import { Icon } from "./icon";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { LLMSettingsDialog } from "./llm-settings-dialog";
+import { ServiceStatusBar } from "./service-status-bar";
 
 interface Props {
   projectName: string;
@@ -93,6 +94,13 @@ export function Header({ projectName, status, resolution, nJobs, nDone, taskCata
             {status === "running" && <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 cryo-pulse" />}
             {st.label}
           </Badge>
+        </div>
+      </div>
+      {/* Service status bar — shows runner/shim/dev health + start buttons */}
+      <div className="border-t border-border/40 bg-card/20 px-4 py-1.5 flex items-center justify-between gap-2">
+        <ServiceStatusBar />
+        <div className="text-[9px] text-muted-foreground/60 hidden sm:block">
+          runner = RELION 3.1.3 execution · shim = z-ai GLM LLM proxy
         </div>
       </div>
       <LLMSettingsDialog open={llmOpen} onOpenChange={setLlmOpen} />

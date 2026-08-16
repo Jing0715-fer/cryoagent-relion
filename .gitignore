@@ -60,3 +60,5 @@ skills/
 db/custom.db
 *.deb
 download/
+.dsh-home/settings.yaml
+.dsh-home/sessions/

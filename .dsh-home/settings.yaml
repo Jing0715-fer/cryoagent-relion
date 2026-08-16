@@ -1,5 +1,0 @@
-llm-deepseek:
-  apiKeyEnv: DEEPSEEK_API_KEY
-  baseURL: https://api.deepseek.com
-  thinking: disabled
-  reasoningEffort: off

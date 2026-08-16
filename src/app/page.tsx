@@ -79,7 +79,7 @@ export default function Home() {
     if (!selectedId) return;
     refreshProject(selectedId);
     // Poll while project is running
-    const iv = setInterval(() => refreshProject(selectedId), 5000);
+    const iv = setInterval(() => refreshProject(selectedId), 8000);
     return () => clearInterval(iv);
   }, [selectedId, refreshProject]);
 
@@ -95,7 +95,7 @@ export default function Home() {
       } catch {
         /* ignore */
       }
-      if (!cancelled) setTimeout(tick, 3000);
+      if (!cancelled) setTimeout(tick, 5000);
     }
     tick();
     return () => {
@@ -114,7 +114,7 @@ export default function Home() {
       } catch {
         // ignore transient errors
       }
-    }, 10000);
+    }, 15000);
     return () => clearInterval(t);
   }, []);
 

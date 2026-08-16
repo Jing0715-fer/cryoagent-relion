@@ -6,10 +6,12 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-  // Disable expensive dev optimizations that use extra memory
   eslint: {
     ignoreDuringBuilds: true,
   },
+  // Memory: disable source maps + file tracing in dev
+  productionBrowserSourceMaps: false,
+  outputFileTracing: false,
 };
 
 export default nextConfig;

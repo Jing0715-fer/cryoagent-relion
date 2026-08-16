@@ -49,7 +49,7 @@ export function ResultsGallery({ projectId, refreshKey }: Props) {
       }
     }
     load();
-    const t = setInterval(load, 8000);
+    const t = setInterval(load, 15000);
     return () => { cancelled = true; clearInterval(t); };
   }, [projectId, refreshKey]);
 

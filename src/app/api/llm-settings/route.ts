@@ -44,13 +44,13 @@ const PROVIDERS = [
     { id: "magistral-medium-latest", name: "Magistral Medium (Reasoning)", contextWindow: 128000 },
   ]},
   { id: "minimax", name: "MiniMax", ns: "llm-pi-ai", models: [
-    { id: "MiniMax-M2", name: "MiniMax-M2 (Latest)", contextWindow: 1000000 },
+    { id: "MiniMax-M3", name: "MiniMax-M3 (Latest)", contextWindow: 1000000 },
     { id: "MiniMax-M1", name: "MiniMax-M1", contextWindow: 1000000 },
     { id: "MiniMax-Text-01", name: "MiniMax-Text-01", contextWindow: 1000000 },
     { id: "abab6.5s-chat", name: "abab6.5s Chat (Legacy)", contextWindow: 245760 },
   ]},
   { id: "minimax-cn", name: "MiniMax (China)", ns: "llm-pi-ai", models: [
-    { id: "MiniMax-M2", name: "MiniMax-M2 (Latest)", contextWindow: 1000000 },
+    { id: "MiniMax-M3", name: "MiniMax-M3 (Latest)", contextWindow: 1000000 },
     { id: "MiniMax-M1", name: "MiniMax-M1", contextWindow: 1000000 },
     { id: "abab6.5s-chat", name: "abab6.5s Chat (Legacy)", contextWindow: 245760 },
   ]},

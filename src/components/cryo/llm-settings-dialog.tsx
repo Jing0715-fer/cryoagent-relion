@@ -111,38 +111,48 @@ export function LLMSettingsDialog({ open, onOpenChange }: Props) {
               </Select>
             </div>
 
-            {/* Model */}
-            {selectedProvider && selectedProvider.models.length > 0 && (
+            {/* Model — dropdown + manual input toggle */}
+            {selectedProvider && (
               <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Model</Label>
-                <Select value={model} onValueChange={setModel}>
-                  <SelectTrigger className="w-full">
-                    <SelectValue placeholder="Select model" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {selectedProvider.models.map((m) => (
-                      <SelectItem key={m.id} value={m.id}>
-                        <span className="flex items-center justify-between w-full">
-                          <span>{m.name}</span>
-                          <span className="text-[10px] text-muted-foreground ml-2">{(m.contextWindow / 1000).toFixed(0)}k ctx</span>
-                        </span>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
-
-            {/* Custom model input (for custom provider) */}
-            {provider === "custom" && (
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Model ID (comma-separated)</Label>
-                <Input
-                  placeholder="e.g. my-model-v1"
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                  className="text-sm"
-                />
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs text-muted-foreground">Model</Label>
+                  <button
+                    onClick={() => setModel("")}
+                    className="text-[10px] text-muted-foreground hover:text-violet-300 underline"
+                    title="Click to manually type a model ID not in the list"
+                  >
+                    ✏️ Manual input
+                  </button>
+                </div>
+                {model && selectedProvider.models.length > 0 ? (
+                  <Select value={model} onValueChange={setModel}>
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="Select model" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {selectedProvider.models.map((m) => (
+                        <SelectItem key={m.id} value={m.id}>
+                          <span className="flex items-center justify-between w-full">
+                            <span>{m.name}</span>
+                            <span className="text-[10px] text-muted-foreground ml-2">{(m.contextWindow / 1000).toFixed(0)}k ctx</span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input
+                    placeholder="Enter model ID (e.g. MiniMax-M3, gpt-5.5, custom-model)"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    className="text-sm font-mono"
+                  />
+                )}
+                {model && selectedProvider.models.find((m) => m.id === model) ? null : (
+                  <p className="text-[10px] text-amber-300/70">
+                    ⚠️ Manual model — not in preset list. Make sure your provider supports this model ID.
+                  </p>
+                )}
               </div>
             )}
 

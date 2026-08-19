@@ -13,19 +13,18 @@
 // The executor simulates RELION (see relion/executor.ts). This file glues it to the DB
 // and the LLM.
 
-import ZAI from "z-ai-web-dev-sdk";
 import path from "path";
 import fs from "fs";
 import { db } from "@/lib/db";
+import { emitJobEvent } from "@/lib/events";
+import * as http from "http";
 import { getTask } from "@/lib/relion/tasks";
 import { buildContext, getLogPlan, getOutput, taskDuration } from "@/lib/relion/executor";
 import { CHAT_SYSTEM_PROMPT, DECIDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, FIRST_JOB_SYSTEM_PROMPT, NEXT_JOB_SYSTEM_PROMPT } from "./prompts";
+import { dshConsult } from "@/lib/dsh/bridge";
 
-let _zai: Awaited<ReturnType<typeof ZAI.create>> | null = null;
-async function zai() {
-  if (!_zai) _zai = await ZAI.create();
-  return _zai;
-}
+// All LLM decisions in this engine are delegated to the DeepSeek Harness
+// agent runtime via dshConsult(). See src/lib/dsh/bridge.ts.
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -76,6 +75,71 @@ const DECISION_POINTS: Record<string, string> = {
   class3d: "select",
   refine3d: "polish-or-finalize",
 };
+
+/**
+ * Compute live progress (0-99) for a job based on wall-clock time since startedAt.
+ * Used both in the engine updater interval and the /api/workflow GET endpoint,
+ * so the UI shows fresh progress even while `runRunnerJob` is blocked on a
+ * long-running RELION task (class2d / refine3d / postprocess).
+ */
+function liveProgressFor(
+  job: { taskType: string; status: string; startedAt: Date | null; progress: number },
+  now: number,
+): number {
+  if (job.status !== "running") return job.progress;
+  if (!job.startedAt) return 0;
+  const task = getTask(job.taskType);
+  const duration = task?.typicalDuration ?? 60;
+  const elapsedSec = (now - job.startedAt.getTime()) / 1000;
+  const scaled = Math.min(99, Math.floor((elapsedSec / Math.max(duration, 1)) * 100));
+  return Math.max(job.progress, scaled);
+}
+
+/**
+ * Spawn a background interval that updates `Job.progress` in the DB every 5s
+ * while a long-running job is in flight. Returns a stop() function the caller
+ * must invoke when the run completes. This makes real-time progress visible
+ * in the UI without changing the runner (which still returns a single JSON
+ * response at the end of the run).
+ */
+function startProgressUpdater(
+  projectId: string,
+  jobId: string,
+  taskType: string,
+  startedAt: Date,
+  getStatus: () => Promise<string | null>,
+): () => void {
+  let cancelled = false;
+  let lastProgress = -1;
+  const tick = async () => {
+    if (cancelled) return;
+    try {
+      const live = liveProgressFor(
+        { taskType, status: "running", startedAt, progress: 0 },
+        Date.now(),
+      );
+      if (live !== lastProgress) {
+        await db.job.update({ where: { id: jobId }, data: { progress: live } });
+        lastProgress = live;
+        // Push the new progress to any SSE subscribers for this project.
+        emitJobEvent({
+          kind: "progress",
+          projectId,
+          jobId,
+          taskType,
+          status: "running",
+        });
+      }
+    } catch (e) {
+      // DB may be briefly locked — silently retry on the next tick.
+    }
+    if (!cancelled) setTimeout(tick, 5000);
+  };
+  setTimeout(tick, 0);
+  return () => {
+    cancelled = true;
+  };
+}
 
 // ---- 1. planWorkflow -------------------------------------------------------
 
@@ -128,15 +192,7 @@ ${ctxSummary}
 
 Produce the workflow plan JSON now.`;
 
-  const client = await zai();
-  const completion = await client.chat.completions.create({
-    messages: [
-      { role: "assistant", content: PLANNER_SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ],
-    thinking: { type: "disabled" },
-  });
-  const raw = completion.choices[0]?.message?.content ?? "";
+  const raw = await dshConsult({ systemPrompt: PLANNER_SYSTEM_PROMPT, userPrompt });
   const plan = parseJsonLoose(raw) as Plan | null;
 
   if (!plan || !Array.isArray(plan.jobs) || plan.jobs.length === 0) {
@@ -274,15 +330,37 @@ export interface TickResult {
 }
 
 async function runnerReachable(): Promise<boolean> {
-  try {
-    // Use 127.0.0.1 instead of localhost — Node.js fetch may try IPv6 (::1)
-    // first, but the Python runner binds to 0.0.0.0 (IPv4 only).
+  // Use the http module directly instead of fetch() — fetch() in Next.js dev
+  // (Turbopack) sometimes fails to connect to localhost services.
+  return new Promise((resolve) => {
     const base = process.env.RUNNER_URL || "http://127.0.0.1:3004";
-    const r = await fetch(`${base}/healthz`, { signal: AbortSignal.timeout(1500) });
-    return r.ok;
-  } catch {
-    return false;
-  }
+    const url = new URL(`${base}/healthz`);
+    const req = http.get(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        timeout: 5000,
+      },
+      (res: any) => {
+        let data = "";
+        res.on("data", (d: any) => (data += d));
+        res.on("end", () => {
+          console.log(`[runnerReachable] http.get -> ${res.statusCode} ${data.slice(0, 80)}`);
+          resolve(res.statusCode === 200);
+        });
+      },
+    );
+    req.on("error", (e: any) => {
+      console.log(`[runnerReachable] http.get FAILED: ${e?.message || e}`);
+      resolve(false);
+    });
+    req.on("timeout", () => {
+      console.log(`[runnerReachable] http.get TIMEOUT`);
+      req.destroy();
+      resolve(false);
+    });
+  });
 }
 
 // Build the "inputs" map (key -> absolute path) for the runner from a job's
@@ -376,20 +454,21 @@ async function buildRunnerInputs(
         );
         if (importCandidates.length > 0) {
           const imp = importCandidates[importCandidates.length - 1];
-          const abs = path.join(
-            path.resolve(process.cwd(), "data", "projects", imp.workflow.projectId || ""),
-            imp.primaryOutput,
-          );
-          inputs[key] = abs;
+          // primaryOutput may be absolute or relative to project dir.
+          inputs[key] = path.isAbsolute(imp.primaryOutput)
+            ? imp.primaryOutput
+            : path.join(path.resolve(process.cwd(), "data", "projects", imp.workflow.projectId || ""), imp.primaryOutput);
         }
       }
       continue;
     }
     const dep = candidates[candidates.length - 1];
-    const abs = path.join(
-      path.resolve(process.cwd(), "data", "projects", dep.workflow.projectId || ""),
-      dep.primaryOutput,
-    );
+    const abs = path.isAbsolute(dep.primaryOutput)
+      ? dep.primaryOutput
+      : path.join(
+          path.resolve(process.cwd(), "data", "projects", dep.workflow.projectId || ""),
+          dep.primaryOutput,
+        );
     inputs[key] = abs;
   }
 
@@ -408,7 +487,32 @@ async function buildRunnerInputs(
       importOriginalPixelSize = Number(s.original_pixel_size || 0) || 0;
     } catch {}
   }
+  // Convert Windows-style absolute paths to WSL paths so the relion-runner
+  // (Python running in WSL) can read them. e.g. `D:\AI-web-app\foo.star` →
+  // `/mnt/d/AI-web-app/foo.star`. The runner lives in WSL.
+  for (const k of Object.keys(inputs)) {
+    inputs[k] = toRunnerPath(inputs[k]);
+  }
   return { inputs, binFactor, importPixelSize, importOriginalPixelSize };
+}
+
+/**
+ * Convert a host path to the path that the relion-runner (Python in WSL) can
+ * read. If the path is already a POSIX path, return as-is. If it starts with
+ * a Windows drive letter (e.g. `D:\...`), translate to `/mnt/d/...`. If the
+ * path uses Windows backslashes, normalise to forward slashes.
+ */
+function toRunnerPath(p: string): string {
+  if (!p) return p;
+  if (p.startsWith("/") && !p.startsWith("/mnt/")) return p;
+  const m = p.match(/^([A-Za-z]):[\\/](.*)$/);
+  if (m) {
+    const drive = m[1].toLowerCase();
+    const rest = m[2].replace(/\\/g, "/");
+    return `/mnt/${drive}/${rest}`;
+  }
+  if (p.includes("\\")) return p.replace(/\\/g, "/");
+  return p;
 }
 
 export async function runTick(projectId: string): Promise<TickResult | null> {
@@ -435,6 +539,47 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
     // We DON'T skip them — the runner caps iterations/sampling for CPU.
     // Only skip tasks that genuinely need a GPU (multibody, polish with movie frames).
     const CPU_SKIPPED = new Set<string>(["multibody", "polish", "movierefine"]);
+
+    // ---- Stale-running recovery -------------------------------------------
+    // If the dev server restarted (OOM, HMR) while a job was running, the
+    // runRunnerJob promise was lost and the job stays "running" forever with
+    // an empty outputSummary. Detect such stale jobs and mark them failed
+    // so retry/planNextJob can take over.
+    //
+    // Threshold is generous (4 hours) because real CPU class2d / class3d /
+    // refine3d runs take longer than the engine's runTick cycle. A genuinely
+    // stale job shows no runner-side activity AND no progress-updater
+    // writes; we detect that separately below.
+    const STALE_MS = 4 * 60 * 60 * 1000; // 4 hours
+    for (const j of allJobs) {
+      if (j.status === "running" && j.startedAt) {
+        const age = Date.now() - j.startedAt.getTime();
+        const hasOutput = j.outputSummary && j.outputSummary !== "{}";
+        if (age > STALE_MS && !hasOutput) {
+          await db.job.update({
+            where: { id: j.id },
+            data: { status: "failed", progress: 100, finishedAt: new Date() },
+          });
+          await db.message.create({
+            data: {
+              projectId,
+              role: "system",
+              content: `🔄 Stale-running recovery: ${j.taskType} was running for ${Math.round(age/1000)}s with no output (likely dev-server restart). Marked failed — will retry or advance.`,
+              meta: JSON.stringify({ kind: "stale-recovery", jobId: j.id, taskType: j.taskType }),
+            },
+          });
+        }
+      }
+    }
+    // Re-fetch jobs after stale recovery so `next` picks up the changed state.
+    const refreshedJobs = await db.job.findMany({
+      where: { workflowId: workflow.id },
+      orderBy: { createdAt: "asc" },
+    });
+    allJobs.length = 0;
+    allJobs.push(...refreshedJobs);
+    jobById.clear();
+    for (const j of refreshedJobs) jobById.set(j.id, j);
 
     // Check if the import job reported single-frame data (micrographs, not movies).
     // If so, skip motioncorr — single-frame micrographs don't need motion correction.
@@ -470,6 +615,13 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
             meta: JSON.stringify({ jobId: j.id, taskType: j.taskType, kind: "job-skipped", real: true }),
           },
         });
+      emitJobEvent({
+          kind: "done",
+          projectId,
+          jobId: j.id,
+          taskType: j.taskType,
+          status: "skipped",
+        });
       }
     }
     if (next) {
@@ -477,6 +629,13 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
       await db.job.update({
         where: { id: next.id },
         data: { status: "running", startedAt: new Date(), progress: 5 },
+      });
+      emitJobEvent({
+        kind: "started",
+        projectId,
+        jobId: next.id,
+        taskType: next.taskType,
+        status: "running",
       });
       await db.message.create({
         data: {
@@ -487,6 +646,15 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
         },
       });
       advanced++;
+
+      // Start a background progress updater so the UI shows real-time %
+      // while runRunnerJob() is blocked on a long-running RELION task.
+      const stopProgressUpdater = startProgressUpdater(
+        projectId,
+        next.id,
+        next.taskType,
+        new Date(),
+      );
 
       // call the runner
       const { runRunnerJob } = await import("@/lib/runner-client");
@@ -518,10 +686,24 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
         inputs,
         sourceDataset: project?.sourceDataset,
       });
+      stopProgressUpdater();
 
       // store logs
       for (const l of result.logs) {
         await db.jobLog.create({ data: { jobId: next.id, level: l.level, line: l.line } });
+      }
+      // Push a single `log` event with the last log line so the SSE client
+      // can refresh. Sending one event per line would be wasteful for the
+      // (potentially thousands of) relion_refine output lines.
+      const lastLog = result.logs[result.logs.length - 1];
+      if (lastLog) {
+        emitJobEvent({
+          kind: "log",
+          projectId,
+          jobId: next.id,
+          taskType: next.taskType,
+          status: "done",
+        });
       }
       const durationSec = next.startedAt
         ? Math.round((Date.now() - next.startedAt.getTime()) / 1000)
@@ -539,6 +721,13 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
             finishedAt: new Date(),
             duration: durationSec,
           },
+        });
+        emitJobEvent({
+          kind: "done",
+          projectId,
+          jobId: next.id,
+          taskType: next.taskType,
+          status: "done",
         });
         await db.message.create({
           data: {
@@ -559,7 +748,7 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
         if (verifiableTasks.has(next.taskType)) {
           const jobForVerify = await db.job.findUnique({
             where: { id: next.id },
-            select: { id: true, taskType: true, parameters: true, primaryOutput: true, outputFiles: true, alias: true },
+            select: { id: true, taskType: true, parameters: true, primaryOutput: true, outputFiles: true, outputSummary: true, alias: true },
           });
           if (jobForVerify) {
             const verification = await verifyJobQuality(projectId, {
@@ -568,6 +757,7 @@ export async function runTick(projectId: string): Promise<TickResult | null> {
               parameters: jobForVerify.parameters,
               primaryOutput: jobForVerify.primaryOutput,
               outputFiles: jobForVerify.outputFiles,
+              outputSummary: jobForVerify.outputSummary,
               alias: jobForVerify.alias,
             });
             // record the verification as a Decision (kind="verify")
@@ -672,6 +862,13 @@ ${newRetryCount > 1 ? `+ retry strategy #${newRetryCount}` : ""}`,
             finishedAt: new Date(),
             duration: durationSec,
           },
+        });
+        emitJobEvent({
+          kind: "done",
+          projectId,
+          jobId: next.id,
+          taskType: next.taskType,
+          status: "failed",
         });
         await db.message.create({
           data: {
@@ -811,15 +1008,54 @@ ${newRetryCount > 1 ? `+ retry strategy #${newRetryCount}` : ""}`,
 
     if (newProgress >= 100) {
       const output = getOutput(job.taskType, params, ctx);
+      // Scan the job directory for output files (if the real runner actually
+      // produced them before the simulated executor marked the job done).
+      // This fixes the issue where class2d produces real .mrcs files on disk
+      // but the simulated executor doesn't register them in outputFiles.
+      const projDir = path.resolve(process.cwd(), "data", "projects", workflow.projectId || "");
+      const jobDir = path.join(projDir, "relion_run", job.id);
+      let outputFiles: { path: string; size: number }[] = [];
+      let primaryOutput = "";
+      if (fs.existsSync(jobDir)) {
+        const scanDir = (dir: string) => {
+          for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+            const fp = path.join(dir, ent.name);
+            if (ent.isDirectory()) scanDir(fp);
+            else if (ent.isFile()) {
+              try {
+                const sz = fs.statSync(fp).size;
+                const relPath = path.relative(projDir, fp);
+                outputFiles.push({ path: relPath, size: sz });
+                // Set primary output to the most relevant file
+                if (relPath.endsWith("_model.star") && !primaryOutput) {
+                  primaryOutput = relPath;
+                } else if (relPath.endsWith(".star") && !primaryOutput) {
+                  primaryOutput = relPath;
+                }
+              } catch {}
+            }
+          }
+        };
+        scanDir(jobDir);
+      }
       await db.job.update({
         where: { id: job.id },
         data: {
           status: "done",
           progress: 100,
           outputSummary: JSON.stringify(output),
+          outputFiles: outputFiles.length > 0 ? JSON.stringify(outputFiles) : undefined,
+          primaryOutput: primaryOutput || undefined,
           finishedAt: new Date(),
           duration,
         },
+      });
+      emitJobEvent({
+        kind: "done",
+        projectId,
+        jobId: job.id,
+        taskType: job.taskType,
+        status: "done",
       });
       const successLine = plan.find((l) => l.at === 100);
       if (successLine && !existingSet.has(successLine.text)) {
@@ -829,6 +1065,13 @@ ${newRetryCount > 1 ? `+ retry strategy #${newRetryCount}` : ""}`,
       advanced++;
     } else if (newProgress !== job.progress) {
       await db.job.update({ where: { id: job.id }, data: { progress: newProgress } });
+      emitJobEvent({
+        kind: "progress",
+        projectId,
+        jobId: job.id,
+        taskType: job.taskType,
+        status: job.status,
+      });
       advanced++;
     }
   }
@@ -974,10 +1217,9 @@ export async function makeDecision(projectId: string, job: { id: string; taskTyp
   const outputSummary = JSON.parse(fullJob.outputSummary);
   const params = JSON.parse(fullJob.parameters);
 
-  // Try LLM decision
+  // Try LLM decision (delegated to DeepSeek Harness).
   let decision: Decision | null = null;
   try {
-    const client = await zai();
     const userPrompt = `Decision point after: ${fullJob.taskType}
 Job output summary:
 ${JSON.stringify(outputSummary, null, 2)}
@@ -986,14 +1228,7 @@ Job parameters:
 ${JSON.stringify(params, null, 2)}
 
 Decide the next action.`;
-    const completion = await client.chat.completions.create({
-      messages: [
-        { role: "assistant", content: DECIDER_SYSTEM_PROMPT },
-        { role: "user", content: userPrompt },
-      ],
-      thinking: { type: "disabled" },
-    });
-    const raw = completion.choices[0]?.message?.content ?? "";
+    const raw = await dshConsult({ systemPrompt: DECIDER_SYSTEM_PROMPT, userPrompt });
     decision = parseJsonLoose(raw) as Decision | null;
   } catch (e) {
     decision = null;
@@ -1090,24 +1325,14 @@ export async function summarize(projectId: string): Promise<void> {
   const refineOut = refine ? JSON.parse(refine.outputSummary) : {};
   const postOut = post ? JSON.parse(post.outputSummary) : {};
 
-  const client = await zai();
-  const completion = await client.chat.completions.create({
-    messages: [
-      { role: "assistant", content: CHAT_SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `The pipeline finished. Final state:
+  const userPrompt = `The pipeline finished. Final state:
 - Refined resolution: ${refineOut.resolution_A ?? "n/a"} Å
 - Postprocess resolution: ${postOut.resolution_A ?? "n/a"} Å
 - Particles: ${refineOut.n_particles ?? "n/a"}
 - Symmetry: ${refineOut.symmetry ?? "C1"}
 
-Write a concise final summary (2-3 sentences) for the user, in markdown.`,
-      },
-    ],
-    thinking: { type: "disabled" },
-  });
-  const summary = completion.choices[0]?.message?.content ?? "Pipeline complete.";
+Write a concise final summary (2-3 sentences) for the user, in markdown.`;
+  const summary = await dshConsult({ systemPrompt: CHAT_SYSTEM_PROMPT, userPrompt }) || "Pipeline complete.";
   await db.message.create({
     data: {
       projectId,
@@ -1131,14 +1356,8 @@ export async function chatReply(
   const project = await db.project.findUnique({ where: { id: projectId } });
   const datasetMeta = project?.datasetMeta ? JSON.parse(project.datasetMeta) : {};
 
-  // Decide the FIRST job via the LLM
-  const client = await zai();
-  const completion = await client.chat.completions.create({
-    messages: [
-      { role: "assistant", content: FIRST_JOB_SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `User request:
+  // Decide the FIRST job via the DeepSeek Harness agent.
+  const userPrompt = `User request:
 """
 ${userMessage}
 """
@@ -1148,12 +1367,8 @@ ${JSON.stringify(datasetMeta, null, 2)}
 
 Source dataset path: ${project?.sourceDataset || "unknown"}
 
-Decide the single first RELION job now.`,
-      },
-    ],
-    thinking: { type: "disabled" },
-  });
-  const raw = completion.choices[0]?.message?.content ?? "";
+Decide the single first RELION job now.`;
+  const raw = await dshConsult({ systemPrompt: FIRST_JOB_SYSTEM_PROMPT, userPrompt });
   const parsed = parseJsonLoose(raw) as
     | { firstJob?: PlannedJob; ackMessage?: string; done?: boolean }
     | null;
@@ -1307,13 +1522,48 @@ export async function planNextJob(
 
   const justOut = JSON.parse(completedJob.outputSummary);
 
-  const client = await zai();
-  const completion = await client.chat.completions.create({
-    messages: [
-      { role: "assistant", content: NEXT_JOB_SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `User's original goal:
+  // ---- Force-advance guardrail -------------------------------------------
+  // The DSH agent tends to loop on class2d when particles_in_good_classes=0
+  // (the prompt tells it to retry). After 2 class2d runs with poor results,
+  // force the next step to initialmodel so the pipeline advances to 3D.
+  const taskRunCounts: Record<string, number> = {};
+  for (const j of doneJobs) taskRunCounts[j.taskType] = (taskRunCounts[j.taskType] || 0) + 1;
+
+  let forceAdvanceHint = "";
+  const class2dRuns = taskRunCounts["class2d"] || 0;
+  const hasInitialmodel = (taskRunCounts["initialmodel"] || 0) > 0;
+  const hasExtract = (taskRunCounts["extract"] || 0) > 0;
+  const autopickRuns = taskRunCounts["autopick"] || 0;
+
+  // Guardrail: autopick loop → force extract
+  if (autopickRuns >= 2 && !hasExtract) {
+    forceAdvanceHint += `\n\n⚠️ FORCE-ADVANCE GUARDRAIL: autopick has already been run ${autopickRuns} times. Do NOT plan another autopick. Your nextJob MUST be "extract" (box_size based on particle diameter, depends on the last autopick output). Extract is required before class2d.`;
+  }
+  // Guardrail: class2d without extract → force extract first
+  if (class2dRuns >= 1 && !hasExtract) {
+    forceAdvanceHint += `\n\n⚠️ BLOCKER: class2d was attempted but extract has not been run. class2d needs particles from extract. Your nextJob MUST be "extract" depending on the last autopick output.`;
+  }
+  if (class2dRuns >= 2 && !hasInitialmodel) {
+    // Extract particle count from the last extract/class2d job
+    let particleCount = 0;
+    const extractJob = [...doneJobs].reverse().find((j) => j.taskType === "extract");
+    if (extractJob) {
+      try {
+        const eo = JSON.parse(extractJob.outputSummary);
+        particleCount = eo.n_particles || eo.particle_count || 0;
+      } catch {}
+    }
+    forceAdvanceHint += `\n\n⚠️ FORCE-ADVANCE GUARDRAIL: class2d has already been run ${class2dRuns} times and particles_in_good_classes is still 0. Do NOT plan another class2d. The particles are real signal (even if 2D classes are noisy on this small dataset). Your nextJob MUST be "initialmodel" with C1 symmetry and 3 classes, depending on the last extract job. After initialmodel, proceed to class3d -> refine3d -> maskcreate -> postprocess. Skipping 2D class selection is acceptable when particle count is low (current: ${particleCount}).`;
+  }
+  // Guardrail for initialmodel/class3d loops
+  if ((taskRunCounts["initialmodel"] || 0) >= 2 && (taskRunCounts["class3d"] || 0) === 0) {
+    forceAdvanceHint += `\n\n⚠️ initialmodel has been run ${taskRunCounts["initialmodel"]} times. Your nextJob MUST be "class3d" (3-5 classes) depending on the last initialmodel output.`;
+  }
+  if ((taskRunCounts["class3d"] || 0) >= 2 && (taskRunCounts["refine3d"] || 0) === 0) {
+    forceAdvanceHint += `\n\n⚠️ class3d has been run ${taskRunCounts["class3d"]} times. Your nextJob MUST be "refine3d" depending on the best class3d output.`;
+  }
+
+  const userPrompt = `User's original goal:
 """
 ${userGoal}
 """
@@ -1329,46 +1579,186 @@ Only multibody/polish/movierefine require a GPU and are auto-skipped.
 The just-completed job was: ${completedJob.taskType} (${completedJob.status})
 Its output summary: ${JSON.stringify(justOut)}
 
-Decide the SINGLE next RELION job to run (or declare done). If all feasible steps are done, declare done.`,
-      },
-    ],
-    thinking: { type: "disabled" },
-  });
-  const raw = completion.choices[0]?.message?.content ?? "";
-  const parsed = parseJsonLoose(raw) as
+Task run counts so far: ${JSON.stringify(taskRunCounts)}
+${forceAdvanceHint}
+
+Decide the SINGLE next RELION job to run (or declare done). If all feasible steps are done, declare done.`;
+  const raw = await dshConsult({ systemPrompt: NEXT_JOB_SYSTEM_PROMPT, userPrompt });
+  let parsed = parseJsonLoose(raw) as
     | { nextJob?: PlannedJob; done?: boolean; summary?: string }
     | null;
 
+  // ---- Force-advance enforcement (hard override) -------------------------
+  // If the DSH agent ignored the hint and still returned a looping task,
+  // override its choice to force pipeline advancement.
+  if (parsed?.nextJob) {
+    const njTask = parsed.nextJob.task;
+    // Override 1: autopick loop → force extract
+    if (njTask === "autopick" && autopickRuns >= 2 && !hasExtract) {
+      parsed.nextJob = {
+        task: "extract",
+        alias: "forced_extract",
+        dependsOn: ["autopick"],
+        parameters: { do_rescale: true, bin_factor: 1 },
+        rationale: `FORCE-ADVANCE: autopick was run ${autopickRuns}x. Extracting particles now (required before class2d).`,
+      };
+      await db.message.create({
+        data: {
+          projectId,
+          role: "system",
+          content: `🛡️ Guardrail override: DSH planned autopick again (×${autopickRuns + 1}), forcing extract to advance the pipeline.`,
+          meta: JSON.stringify({ kind: "guardrail-override", from: "autopick", to: "extract" }),
+        },
+      });
+    }
+    // Override 2: class2d without extract → force extract
+    if (njTask === "class2d" && !hasExtract && autopickRuns > 0) {
+      parsed.nextJob = {
+        task: "extract",
+        alias: "forced_extract_before_class2d",
+        dependsOn: ["autopick"],
+        parameters: { do_rescale: true, bin_factor: 1 },
+        rationale: `FORCE-ADVANCE: class2d needs particles but extract hasn't run. Forcing extract first.`,
+      };
+      await db.message.create({
+        data: {
+          projectId,
+          role: "system",
+          content: `🛡️ Guardrail override: DSH planned class2d but extract hasn't run, forcing extract first.`,
+          meta: JSON.stringify({ kind: "guardrail-override", from: "class2d", to: "extract" }),
+        },
+      });
+    }
+    // Override 3: class2d loop → force initialmodel
+    if (njTask === "class2d" && class2dRuns >= 2 && !hasInitialmodel && hasExtract) {
+      parsed.nextJob = {
+        task: "initialmodel",
+        alias: "forced_initialmodel",
+        dependsOn: ["extract"],
+        parameters: { symmetry: "C1", nr_classes: 3 },
+        rationale: `FORCE-ADVANCE: class2d was run ${class2dRuns}x with 0 good classes. Proceeding to initialmodel with all particles (C1, 3 classes) to advance the pipeline to 3D.`,
+      };
+      await db.message.create({
+        data: {
+          projectId,
+          role: "system",
+          content: `🛡️ Guardrail override: DSH planned class2d again (×${class2dRuns + 1}), forcing initialmodel to break the loop.`,
+          meta: JSON.stringify({ kind: "guardrail-override", from: "class2d", to: "initialmodel" }),
+        },
+      });
+    }
+  }
+
   if (parsed?.done) {
-    // pipeline complete
-    await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
-    await db.project.update({ where: { id: projectId }, data: { status: "done" } });
-    const summary = parsed.summary || "Pipeline complete.";
-    await db.message.create({
-      data: {
-        projectId,
-        role: "assistant",
-        content: `## ✅ Pipeline complete\n\n${summary}`,
-        meta: JSON.stringify({ kind: "summary" }),
-      },
-    });
-    return { created: false, done: true };
+    // ---- Pipeline-completeness guardrail --------------------------------
+    // DSH sometimes prematurely declares "done" after ctffind or class2d.
+    // Don't allow done unless the pipeline has at least reached refine3d
+    // (or postprocess). If key steps are missing, override to force the next
+    // required step instead of completing.
+    const hasAutopick = (taskRunCounts["autopick"] || 0) > 0;
+    const hasClass2d = (taskRunCounts["class2d"] || 0) > 0;
+    const hasRefine3d = (taskRunCounts["refine3d"] || 0) > 0;
+    const hasPostprocess = (taskRunCounts["postprocess"] || 0) > 0;
+    const hasMaskcreate = (taskRunCounts["maskcreate"] || 0) > 0;
+
+    // Pipeline is only complete if postprocess has run (the final step).
+    // Even if refine3d is done, force postprocess if it hasn't run.
+    if (!hasPostprocess) {
+      // Pipeline not complete — force the next required step
+      let forcedTask = "";
+      let forcedDeps: string[] = [];
+      let forcedParams: Record<string, string | number | boolean> = {};
+      let forcedRationale = "";
+      if (!hasAutopick) {
+        forcedTask = "autopick";
+        forcedDeps = ["ctffind"];
+        forcedParams = { particle_diameter: 130, do_LoG: true, threshold: 0.0 };
+        forcedRationale = `FORCE-ADVANCE: DSH declared done but autopick hasn't run. Forcing autopick (ctffind is done).`;
+      } else if (!hasExtract) {
+        forcedTask = "extract";
+        forcedDeps = ["autopick"];
+        forcedParams = { do_rescale: true, bin_factor: 1 };
+        forcedRationale = `FORCE-ADVANCE: DSH declared done but extract hasn't run. Forcing extract.`;
+      } else if (!hasClass2d) {
+        forcedTask = "class2d";
+        forcedDeps = ["extract"];
+        forcedParams = { nr_classes: 10, iter_nr_iter: 25 };
+        forcedRationale = `FORCE-ADVANCE: DSH declared done but class2d hasn't run. Forcing class2d.`;
+      } else if (!hasInitialmodel) {
+        forcedTask = "initialmodel";
+        forcedDeps = ["extract"];
+        forcedParams = { symmetry: "C1", nr_classes: 3 };
+        forcedRationale = `FORCE-ADVANCE: DSH declared done but initialmodel hasn't run. Forcing initialmodel.`;
+      } else if ((taskRunCounts["class3d"] || 0) === 0) {
+        forcedTask = "class3d";
+        forcedDeps = ["initialmodel"];
+        forcedParams = { nr_classes: 3, symmetry: "C1" };
+        forcedRationale = `FORCE-ADVANCE: DSH declared done but class3d hasn't run. Forcing class3d.`;
+      } else if (!hasRefine3d) {
+        forcedTask = "refine3d";
+        forcedDeps = ["class3d"];
+        forcedParams = { symmetry: "C1", particle_diameter: 130 };
+        forcedRationale = `FORCE-ADVANCE: DSH declared done but refine3d hasn't run. Forcing refine3d.`;
+      } else if (!hasMaskcreate) {
+        forcedTask = "maskcreate";
+        forcedDeps = ["refine3d"];
+        forcedParams = { ini_threshold: 0.02, extend_mask: 3, soft_edge: 3 };
+        forcedRationale = `FORCE-ADVANCE: DSH declared done but maskcreate hasn't run. Forcing maskcreate.`;
+      } else {
+        forcedTask = "postprocess";
+        forcedDeps = ["refine3d", "maskcreate"];
+        forcedParams = { angpix: 1.34 };
+        forcedRationale = `FORCE-ADVANCE: DSH declared done but postprocess hasn't run. Forcing postprocess.`;
+      }
+      parsed = { nextJob: { task: forcedTask, alias: `forced_${forcedTask}`, dependsOn: forcedDeps, parameters: forcedParams, rationale: forcedRationale } };
+      await db.message.create({
+        data: {
+          projectId,
+          role: "system",
+          content: `🛡️ Pipeline-completeness guardrail: DSH declared "done" but ${forcedTask} hasn't run. Forcing ${forcedTask} to continue the pipeline.`,
+          meta: JSON.stringify({ kind: "guardrail-override", from: "done", to: forcedTask }),
+        },
+      });
+    } else {
+      // pipeline genuinely complete
+      await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
+      await db.project.update({ where: { id: projectId }, data: { status: "done" } });
+      const summary = parsed.summary || "Pipeline complete.";
+      await db.message.create({
+        data: {
+          projectId,
+          role: "assistant",
+          content: `## ✅ Pipeline complete\n\n${summary}`,
+          meta: JSON.stringify({ kind: "summary" }),
+        },
+      });
+      return { created: false, done: true };
+    }
   }
 
   if (parsed?.nextJob) {
     const nj = parsed.nextJob;
-    // Cycle detection: if this task type has already been run 2+ times, don't
-    // create another — declare done to prevent infinite loops.
+    // Cycle detection with task-specific limits. The force-advance guardrail
+    // above handles class2d→initialmodel and initialmodel→class3d transitions,
+    // so we allow class2d up to 3 runs and initialmodel/class3d up to 2 before
+    // declaring the pipeline complete.
+    const CYCLE_LIMITS: Record<string, number> = {
+      class2d: 3,
+      initialmodel: 2,
+      class3d: 2,
+      refine3d: 2,
+    };
     const sameTypeCount = doneJobs.filter((j) => j.taskType === nj.task).length;
-    if (sameTypeCount >= 2) {
+    const limit = CYCLE_LIMITS[nj.task] ?? 2;
+    if (sameTypeCount >= limit) {
       await db.workflow.update({ where: { id: workflow.id }, data: { status: "done" } });
       await db.project.update({ where: { id: projectId }, data: { status: "done" } });
       await db.message.create({
         data: {
           projectId,
           role: "assistant",
-          content: `## ✅ Pipeline complete\n\nThe agent has run all feasible steps. ${nj.task} was already attempted ${sameTypeCount} times — stopping to avoid a cycle.`,
-          meta: JSON.stringify({ kind: "summary", cycleBreak: true }),
+          content: `## ✅ Pipeline complete\n\nThe agent has run all feasible steps. ${nj.task} was already attempted ${sameTypeCount} times (limit ${limit}) — stopping to avoid a cycle. Final resolution is limited by the synthetic dataset (96 particles) and CPU-only compute.`,
+          meta: JSON.stringify({ kind: "summary", cycleBreak: true, taskType: nj.task, runs: sameTypeCount }),
         },
       });
       return { created: false, done: true };

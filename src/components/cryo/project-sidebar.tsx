@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Project, Decision } from "@/lib/types";
+import { Project, Decision, Message } from "@/lib/types";
 import { Icon } from "./icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,7 @@ interface Props {
   onSelect: (id: string) => void;
   onNew: () => void;
   decisions: Decision[];
+  messages?: Message[];
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -24,7 +25,7 @@ const STATUS_COLOR: Record<string, string> = {
   error: "bg-rose-500",
 };
 
-export function ProjectSidebar({ projects, selectedId, onSelect, onNew, decisions }: Props) {
+export function ProjectSidebar({ projects, selectedId, onSelect, onNew, decisions, messages }: Props) {
   const [relionStatus, setRelionStatus] = useState<{ installed: boolean; version: string; installing: boolean }>({
     installed: false,
     version: "",
@@ -160,18 +161,70 @@ export function ProjectSidebar({ projects, selectedId, onSelect, onNew, decision
           Autonomous decisions
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto cryo-scroll pr-1 space-y-1.5">
-          {decisions.length === 0 ? (
-            <div className="text-[11px] text-muted-foreground px-2 py-3">
-              The agent will record its decisions here as the pipeline runs.
-            </div>
-          ) : (
-            decisions.map((d) => {
+          {(() => {
+            // Merge decisions + guardrail system messages, sort by time desc
+            type Item = {
+              id: string;
+              time: Date;
+              kind: string;
+              reason: string;
+              action?: string;
+              isGuardrail: boolean;
+              guardrailType?: string;
+            };
+            const items: Item[] = [];
+            for (const d of decisions) {
+              items.push({
+                id: d.id,
+                time: new Date(d.createdAt),
+                kind: d.kind,
+                reason: d.reason,
+                action: d.action,
+                isGuardrail: false,
+              });
+            }
+            if (messages) {
+              for (const m of messages) {
+                if (m.role !== "system") continue;
+                let meta: any = {};
+                try { meta = JSON.parse(m.meta || "{}"); } catch {}
+                if (meta.kind === "guardrail-override" || meta.kind === "stale-recovery") {
+                  items.push({
+                    id: m.id,
+                    time: new Date(m.createdAt),
+                    kind: meta.kind === "stale-recovery" ? "stale-recovery" : "guardrail",
+                    reason: m.content,
+                    action: meta.from ? `${meta.from}→${meta.to}` : undefined,
+                    isGuardrail: true,
+                    guardrailType: meta.kind,
+                  });
+                }
+              }
+            }
+            items.sort((a, b) => b.time.getTime() - a.time.getTime());
+            if (items.length === 0) {
+              return (
+                <div className="text-[11px] text-muted-foreground px-2 py-3">
+                  The agent will record its decisions here as the pipeline runs.
+                </div>
+              );
+            }
+            return items.slice(0, 50).map((d) => {
               const isVerify = d.kind === "verify";
-              const isPass = isVerify && d.action === "pass";
+              const isSkip = isVerify && d.reason && /skipping VLM|skipping verification|skipped/i.test(d.reason);
+              const isPass = isVerify && d.action === "pass" && !isSkip;
               const isFail = isVerify && d.action === "fail";
-              const isRetry = d.kind === "retry" || (d.meta && typeof d.meta === "object" && (d.meta as any).kind === "job-retry");
+              const isRetry = d.kind === "retry" || d.kind === "job-retry";
               const isNextJob = d.kind === "next-job-planned";
-              const badgeColor = isPass
+              const isStale = d.kind === "stale-recovery";
+              const isGuardrailOverride = d.kind === "guardrail";
+              const badgeColor = isGuardrailOverride
+                ? "bg-violet-500/20 text-violet-300"
+                : isStale
+                ? "bg-orange-500/20 text-orange-300"
+                : isSkip
+                ? "bg-teal-500/20 text-teal-300"
+                : isPass
                 ? "bg-emerald-500/20 text-emerald-300"
                 : isFail
                 ? "bg-rose-500/20 text-rose-300"
@@ -180,20 +233,41 @@ export function ProjectSidebar({ projects, selectedId, onSelect, onNew, decision
                 : isNextJob
                 ? "bg-sky-500/20 text-sky-300"
                 : "bg-amber-500/20 text-amber-300";
+              const badgeLabel = isGuardrailOverride
+                ? "🛡️ guardrail"
+                : isStale
+                ? "🔄 stale-recovery"
+                : isSkip
+                ? "⊘ vlm-skipped"
+                : isPass
+                ? "✓ pass"
+                : isFail
+                ? "✗ fail"
+                : d.kind;
               return (
                 <div
                   key={d.id}
                   className={cn(
                     "rounded-md border px-2 py-1.5",
-                    isFail ? "border-rose-500/30 bg-rose-500/5" : isPass ? "border-emerald-500/30 bg-emerald-500/5" : "border-border/50 bg-muted/20",
+                    isGuardrailOverride
+                      ? "border-violet-500/40 bg-violet-500/10"
+                      : isStale
+                      ? "border-orange-500/40 bg-orange-500/5"
+                      : isSkip
+                      ? "border-teal-500/30 bg-teal-500/5"
+                      : isFail
+                      ? "border-rose-500/30 bg-rose-500/5"
+                      : isPass
+                      ? "border-emerald-500/30 bg-emerald-500/5"
+                      : "border-border/50 bg-muted/20",
                   )}
                 >
                   <div className="flex items-center gap-1.5 mb-0.5">
-                    <span className={cn("text-[9px] uppercase tracking-wider px-1 py-0.5 rounded", badgeColor)}>
-                      {isPass ? "✓ pass" : isFail ? "✗ fail" : d.kind}
+                    <span className={cn("text-[9px] uppercase tracking-wider px-1 py-0.5 rounded font-medium", badgeColor)}>
+                      {badgeLabel}
                     </span>
                     <span className="text-[10px] text-muted-foreground ml-auto">
-                      {new Date(d.createdAt).toLocaleTimeString("en-US", { hour12: false })}
+                      {d.time.toLocaleTimeString("en-US", { hour12: false })}
                     </span>
                   </div>
                   <div className="text-[11px] text-foreground/90 leading-snug">{d.reason}</div>
@@ -202,8 +276,8 @@ export function ProjectSidebar({ projects, selectedId, onSelect, onNew, decision
                   )}
                 </div>
               );
-            })
-          )}
+            });
+          })()}
         </div>
       </div>
     </div>

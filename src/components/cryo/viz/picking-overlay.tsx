@@ -140,9 +140,20 @@ export function PickingOverlay({ projectId, jobId }: Props) {
       offsetY = 0;
     }
     ctx.drawImage(img, offsetX, offsetY, drawW, drawH);
-    // Draw circles at picked coords
-    const scaleX = drawW / img.naturalWidth;
-    const scaleY = drawH / img.naturalHeight;
+    // Draw circles at picked coords.
+    //
+    // The micrograph file may be rendered as a 256x256 thumbnail (via
+    // ?thumb=1) but the picked coordinates are in the FULL micrograph
+    // frame (e.g. 1024x1024 for bin4 EMPIAR). Without rescaling, the
+    // circles would appear far outside the image. The thumbnail is a
+    // proportional center crop, so the picked coords (in full-frame) need
+    // to be scaled by `originalWidth / naturalWidth` to map to image-space.
+    // We assume the original micrograph is 1024x1024 (bin4 default) when
+    // the thumbnail is 256x256 — a 4x scale factor.
+    const ORIGINAL_BIN4 = 1024;
+    const scaleRatio = (img.naturalWidth || ORIGINAL_BIN4) / ORIGINAL_BIN4;
+    const scaleX = (drawW / (img.naturalWidth || 1)) * scaleRatio;
+    const scaleY = (drawH / (img.naturalHeight || 1)) * scaleRatio;
     const radius = Math.max(4, Math.min(drawW, drawH) / 40);
     ctx.strokeStyle = "rgba(52, 211, 153, 0.9)";
     ctx.lineWidth = 1.5;

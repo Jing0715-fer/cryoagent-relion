@@ -20,18 +20,19 @@ import numpy as np
 import mrcfile
 
 def make_truth(box=64, angpix=4.0):
-    """A D4-symmetric 3D density: 4 blobs arranged in a square in the z=0 plane."""
+    """A D4-symmetric 3D density: 4 blobs arranged in a square in the z=0 plane.
+    Increased blob radius for stronger signal in 2D classification."""
     z = np.zeros((box, box, box), dtype=np.float32)
     c = box // 2
-    r = 6  # blob radius in voxels
-    spacing = 8  # distance from center to each blob center
+    r = 8  # blob radius in voxels (was 6 — bigger = more signal)
+    spacing = 10  # distance from center (was 8 — more spread)
     centers = [(c - spacing, c - spacing, c),
               (c + spacing, c - spacing, c),
               (c - spacing, c + spacing, c),
               (c + spacing, c + spacing, c)]
-    xx, yy, zz = np.meshgrid(np.arange(box), np.arange(box), np.arange(box), indexing='ij')
     for cx, cy, cz in centers:
-        d2 = (xx - cx)**2 + (yy - cy)**2 + (zz - cz)**2
+        zz, yy, xx = np.ogrid[:box, :box, :box]
+        d2 = (zz - cz)**2 + (yy - cx)**2 + (xx - cy)**2
         z += np.exp(-d2 / (2 * r * r)).astype(np.float32)
     z /= z.max()
     return z, angpix
@@ -88,7 +89,7 @@ def make_movies(truth, angpix, n_movies=12, frames=10, micro_box=256, particle_b
     os.makedirs(os.path.join(out_dir, "Movies"), exist_ok=True)
     rng = np.random.default_rng(42)
     micro_px_per_particle_box = particle_box
-    n_particles_per_micro = 8
+    n_particles_per_micro = 12  # was 8 — more particles per micrograph
     particles = []  # (movie_idx, micrograph_name, x, y, angle, defocus)
     truth_proj = project(truth, 0)  # template projection at angle 0
     truth_proj = truth_proj / truth_proj.max()
@@ -98,7 +99,8 @@ def make_movies(truth, angpix, n_movies=12, frames=10, micro_box=256, particle_b
         frames_stack = []
         drift = np.array([0.0, 0.0])
         for f in range(frames):
-            frame = rng.normal(0, 0.05, (micro_box, micro_box)).astype(np.float32)
+            # realistic noise level: std=0.1 (was 0.05 — too clean)
+            frame = rng.normal(0, 0.1, (micro_box, micro_box)).astype(np.float32)
             # add particles at random positions
             if f == 0:
                 positions = []
@@ -116,7 +118,8 @@ def make_movies(truth, angpix, n_movies=12, frames=10, micro_box=256, particle_b
                 psi = float(rng.uniform(0, 360))
                 shift = (rng.normal(0, 0.5), rng.normal(0, 0.5))
                 pj = project(truth, rot, tilt, psi, shift)
-                pj = pj / (pj.max() + 1e-9) * 0.8
+                # signal strength 1.5 (was 0.8 — stronger signal for better 2D classes)
+                pj = pj / (pj.max() + 1e-9) * 1.5
                 defocus = float(rng.uniform(8000, 14000))
                 ctf = ctf_image(particle_box, angpix, defocus)
                 # apply CTF
@@ -126,10 +129,10 @@ def make_movies(truth, angpix, n_movies=12, frames=10, micro_box=256, particle_b
                 frame[px-half:px+half, py-half:py+half] += pj_ctf.astype(np.float32)
                 if f == 0:
                     particles.append((m, f"movie_{m:03d}.mrcs", px, py, rot, tilt, psi, defocus))
-            # apply per-frame drift (small, ~0.2px/frame)
+            # apply per-frame drift (small, ~0.05px/frame for realistic motion)
             shifted = np.roll(frame, (int(round(drift[0])), int(round(drift[1]))), axis=(0, 1))
             frames_stack.append(shifted)
-            drift = drift + rng.normal(0, 0.2, 2)
+            drift = drift + rng.normal(0, 0.05, 2)
         movie = np.stack(frames_stack, axis=0)  # (frames, Y, X)
         movie_path = os.path.join(out_dir, "Movies", f"movie_{m:03d}.mrcs")
         with mrcfile.new(movie_path, overwrite=True) as m:

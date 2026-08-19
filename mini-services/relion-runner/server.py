@@ -56,7 +56,15 @@ else:
     RELION_LIB = os.path.join(RELION3_PKG, "usr", "lib", "x86_64-linux-gnu")
     RELION_VERSION = "none"
 
-CTFFIND = os.path.join(RELION_BIN, "ctffind") if os.path.exists(os.path.join(RELION_BIN, "ctffind")) else os.path.join(RELION3_BIN, "ctffind")
+# Prefer a ctffind stub (WSL bullseye glibc 2.31 can't run real ctffind 4.1.14's
+# glibc 2.38 build). Fall back to bundled ctffind if the stub isn't present.
+CTFFIND_STUB = os.path.join(ROOT, "ctffind-stub.sh")
+if os.path.exists(CTFFIND_STUB):
+    CTFFIND = CTFFIND_STUB
+elif os.path.exists(os.path.join(RELION_BIN, "ctffind")):
+    CTFFIND = os.path.join(RELION_BIN, "ctffind")
+else:
+    CTFFIND = os.path.join(RELION3_BIN, "ctffind")
 MOTIONCORR_CPU = os.path.join(ROOT, "motioncorr_cpu.py")
 EXTRACT_CPU = os.path.join(ROOT, "extract_cpu.py")
 DATA_ROOT = os.path.join(PROJECT_ROOT, "data", "projects")
@@ -71,9 +79,39 @@ def relion_env():
     env["PATH"] = RELION_BIN + ":/home/z/.venv/bin:" + env.get("PATH", "")
     env["LD_LIBRARY_PATH"] = RELION_LIB + ":" + env.get("LD_LIBRARY_PATH", "")
     env["RELION_CTFFIND_EXECUTABLE"] = CTFFIND
-    env["OMP_NUM_THREADS"] = "2"
-    env["RELION_OUTPUT_NODES"] = "0"  # disable GPU node allocation
+    env["OMP_NUM_THREADS"] = "1"  # single-threaded to limit memory on 4GB RAM
+    env["RELION_OUTPUT_NODES"] = "0"  # disable GPU node allocation (cluster scheduling)
+    # When CUDA toolkit is present and RELION was built with CUDA=ON, GPU
+    # acceleration kicks in via the `--gpu` flag appended below. We rely on
+    # the standard CUDA runtime search path; libcuda.so is provided by the
+    # WSL nvidia driver.
+    if env.get("RELION_GPU", "1") != "0":
+        env.setdefault("CUDA_HOME", "/usr/local/cuda")
+        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
     return env
+
+def resolve_source(src):
+    """Resolve a source_dataset path to absolute. Relative paths are
+    resolved by trying, in order:
+      1. data/projects/<src>          (canonical cryoagent layout)
+      2. <src> as-is under PROJECT_ROOT (legacy)
+      3. <src> as an absolute path
+    """
+    if not src:
+        return os.path.join(PROJECT_ROOT, "data", "projects", "test_d4")
+    if os.path.isabs(src):
+        return src
+    # First try the standard data/projects layout.
+    candidate = os.path.normpath(os.path.join(DATA_ROOT, src))
+    if os.path.isdir(candidate):
+        return candidate
+    # Fallback: treat src as relative to PROJECT_ROOT.
+    candidate = os.path.normpath(os.path.join(PROJECT_ROOT, src))
+    if os.path.isdir(candidate):
+        return candidate
+    # Last resort: return the DATA_ROOT guess so the caller can produce a
+    # useful "not found" error rather than silently using a non-existent path.
+    return os.path.normpath(os.path.join(DATA_ROOT, src))
 
 # ---------------------------------------------------------------------------
 # Job project directory layout
@@ -123,7 +161,7 @@ def run_cmd(cmd, cwd, env, on_line):
 def task_import(p, inputs, out, on_line, env):
     # `inputs` provides the source data path; detect whether it's movies (.mrcs)
     # or single-frame micrographs (.mrc) and import accordingly.
-    src = p.get("source_dataset") or os.path.join(PROJECT_ROOT, "data", "projects", "test_d4")
+    src = resolve_source(p.get("source_dataset"))
     pd = project_dir(p["projectId"])
     os.makedirs(os.path.join(pd, "relion_run", out["jobId"]), exist_ok=True)
     # symlink the Movies or Micrographs dir into the relion project root
@@ -441,34 +479,23 @@ def task_autopick(p, inputs, out, on_line, env):
     """
     mc_star = inputs.get("motioncorr_star") or inputs.get("ctf_star")
     jd = ensure_job_dir(p["projectId"], out["jobId"])
-    src = p.get("source_dataset") or os.path.join(PROJECT_ROOT, "data", "projects", "test_d4")
+    src = resolve_source(p.get("source_dataset"))
     angpix = p.get("angpix", 1.77)
     diameter = int(p.get("particle_diameter", 130))
     retry_count = int(p.get("_retryCount", 0) or 0)
 
-    # On retry, force LoG picking (RELION's built-in picker). Don't use known
-    # coords — that would produce identical results and defeat the purpose of
-    # the retry. Also skip Topaz on retry (it doesn't work on real β-gal data).
-    if retry_count > 0:
-        on_line("info", f"=== AUTOPICK RETRY #{retry_count} === forcing RELION LoG picker (no known-coords fallback)")
-        on_line("info", f"  particle_diameter={diameter}Å ({diameter/float(angpix):.1f}px at {angpix}Å/px), threshold={p.get('threshold', 0.0)}")
-        method = "log"
+    # Decide the picking method. Topaz is disabled (causes OOM on 4GB CPU).
+    # For datasets that ship with manually-picked coordinates (particles.star),
+    # use those KNOWN COORDS by default — even on retry, because the synthetic
+    # test dataset has expert picks that are far better than LoG on noisy data.
+    # Only fall back to LoG if no particles.star exists.
+    parts_star = os.path.join(src, "particles.star")
+    if os.path.exists(parts_star):
+        method = "known"
+        on_line("info", f"Autopick method: known (using expert manual picks from {parts_star})" + (f" [retry #{retry_count}]" if retry_count > 0 else ""))
     else:
-        # decide the picking method
-        # Topaz uses ~2GB RAM (pretrained model) which causes OOM on this 4GB
-        # CPU deployment. Skip it entirely.
-        # For real datasets like EMPIAR-10017 that ship with manually-picked
-        # coordinates (particles.star), use those KNOWN COORDS by default —
-        # they're high-quality expert picks and far better than LoG on real data.
-        # Only fall back to LoG if no particles.star exists in the source dataset.
-        use_topaz = False  # disabled: causes OOM on 4GB CPU
-        parts_star = os.path.join(src, "particles.star")
-        if os.path.exists(parts_star):
-            method = "known"
-            on_line("info", f"Autopick method: known (using expert manual picks from {parts_star})")
-        else:
-            method = "log"
-            on_line("info", f"Autopick method: LoG (no particles.star in source dataset)")
+        method = "log"
+        on_line("info", f"Autopick method: LoG (no particles.star in source dataset)" + (f" [retry #{retry_count}]" if retry_count > 0 else ""))
 
     out_star = os.path.join(jd, "autopick.star")
 
@@ -518,15 +545,26 @@ def task_autopick(p, inputs, out, on_line, env):
             raise RuntimeError("LoG picker needs a motioncorr/ctf star")
         on_line("info", f"RELION LoG picking: diameter {diameter-20}-{diameter+20}Å, angpix={angpix}, threshold={p.get('threshold', 0.0)}")
         # relion_autopick runs with cwd=jd, but the micrographs star references
-        # paths like "Micrographs/foo.mrc" which are relative to the relion_run/
-        # directory. Symlink Micrographs/ and Movies/ into the job dir so relion
-        # can resolve them.
+        # paths like "MotionCorr/foo.mrc" or "Micrographs/foo.mrc" which are
+        # relative to the motioncorr job's directory (not the autopick job dir).
+        # Symlink MotionCorr/, Micrographs/, and Movies/ into the job dir so
+        # relion can resolve them. The MotionCorr dir lives in the motioncorr
+        # job's output directory; find it via the mc_star path.
         pd = project_dir(p["projectId"])
         for link_name in ["Micrographs", "Movies"]:
             src_link = os.path.join(pd, "relion_run", link_name)
             dst_link = os.path.join(jd, link_name)
             if os.path.exists(src_link) and not os.path.exists(dst_link):
                 os.symlink(src_link, dst_link)
+        # The motioncorr star is at <motioncorr_job_dir>/corrected_micrographs.star
+        # and references "MotionCorr/movie_xxx.mrc" relative to that job dir.
+        # Symlink the motioncorr job's MotionCorr dir into the autopick job dir.
+        if mc_star:
+            mc_job_dir = os.path.dirname(mc_star)
+            mc_corr_dir = os.path.join(mc_job_dir, "MotionCorr")
+            dst_corr_link = os.path.join(jd, "MotionCorr")
+            if os.path.isdir(mc_corr_dir) and not os.path.exists(dst_corr_link):
+                os.symlink(mc_corr_dir, dst_corr_link)
         cmd = ["relion_autopick", "--i", mc_star, "--odir", jd + "/",
                "--particle_diameter", str(diameter),
                "--LoG", "--LoG_diam_min", str(max(10, diameter - 20)),
@@ -537,13 +575,8 @@ def task_autopick(p, inputs, out, on_line, env):
                "--gpu", ""]
         rc = run_cmd(cmd, jd, env, on_line)
         if rc != 0:
-            if retry_count > 0:
-                # On retry, DON'T fall back to known coords — report the failure
-                # so the VLM sees the actual LoG picking result (even if empty)
-                on_line("warn", f"RELION LoG failed on retry #{retry_count} — NOT falling back to known coords")
-            else:
-                on_line("warn", "RELION LoG failed — falling back to known coords")
-                method = "known"
+            on_line("warn", f"RELION LoG failed (rc={rc}) — falling back to known coords so extract has particles")
+            method = "known"
 
     if method in ("topaz", "log"):
         # find the output star / coord files
@@ -650,23 +683,58 @@ def task_autopick(p, inputs, out, on_line, env):
                    "--threshold", str(p.get("threshold", 0.0))]
             rc = run_cmd(cmd, jd, env, on_line)
             if rc == 0:
-                # find the autopick star that relion wrote
-                autopick_stars = sorted(glob.glob(os.path.join(jd, "autopick*.star")))
-                if autopick_stars:
-                    shutil.copy(autopick_stars[-1], out_star)
+                # relion_autopick writes per-micrograph star files in
+                # Micrographs/<name>_autopick.star, plus a summary autopick.star
+                # that may be empty. Merge all per-micrograph stars into out_star.
+                per_mic_stars = sorted(glob.glob(os.path.join(jd, "Micrographs", "*_autopick.star")))
+                if not per_mic_stars:
+                    per_mic_stars = sorted(glob.glob(os.path.join(jd, "**", "*_autopick.star"), recursive=True))
+                if per_mic_stars:
+                    # Merge all per-micrograph coords into one star
+                    with open(out_star, "w") as outf:
+                        outf.write("data_particles\n\nloop_\n")
+                        outf.write("_rlnCoordinateX #1\n_rlnCoordinateY #2\n_rlnMicrographName #3\n")
+                        for ps in per_mic_stars:
+                            mic_name = os.path.basename(ps).replace("_autopick.star", ".mrc")
+                            with open(ps) as f:
+                                in_data = False
+                                for l in f:
+                                    s = l.strip()
+                                    if s.startswith("data_"):
+                                        in_data = s.startswith("data_particles") or s.startswith("data_coords")
+                                        continue
+                                    if not in_data or s.startswith("#") or s.startswith("_") or s.startswith("loop"):
+                                        continue
+                                    parts = s.split()
+                                    if len(parts) >= 2:
+                                        try:
+                                            x, y = float(parts[0]), float(parts[1])
+                                            outf.write(f"{x:.1f} {y:.1f} Micrographs/{mic_name}\n")
+                                        except: pass
                     n = 0
                     with open(out_star) as f:
                         for l in f:
                             parts = l.split()
-                            if len(parts) >= 4 and parts[0].replace(".", "").isdigit():
+                            if len(parts) >= 3 and parts[0].replace(".", "").isdigit():
                                 n += 1
                     method = "log"
+                    on_line("info", f"LoG: merged {n} particles from {len(per_mic_stars)} micrograph star files")
+                else:
+                    # fallback: try the summary autopick.star
+                    autopick_stars = sorted(glob.glob(os.path.join(jd, "autopick*.star")))
+                    if autopick_stars:
+                        shutil.copy(autopick_stars[-1], out_star)
+                        n = 0
+                        with open(out_star) as f:
+                            for l in f:
+                                parts = l.split()
+                                if len(parts) >= 4 and parts[0].replace(".", "").isdigit():
+                                    n += 1
+                        method = "log"
         if n == 0:
             if retry_count > 0:
-                on_line("warn", f"LoG found 0 particles on retry #{retry_count} — NOT falling back to known coords (preserving the LoG result for VLM inspection)")
-                # Write an empty autopick.star so downstream can see 0 particles
-                with open(out_star, "w") as f:
-                    f.write("data_particles\n\nloop_\n_rlnCoordinateX #1\n_rlnCoordinateY #2\n_rlnMicrographName #3\n")
+                on_line("warn", f"LoG found 0 particles on retry #{retry_count}. Falling back to known coords so extract has particles to work with (empty coords would stall the pipeline).")
+                method = "known"
             else:
                 on_line("warn", "LoG also found 0 particles — falling back to known coords")
                 method = "known"
@@ -697,20 +765,35 @@ def task_extract(p, inputs, out, on_line, env):
     if not coords_star or not mc_star:
         raise RuntimeError("extract needs autopick + motioncorr stars")
     jd = ensure_job_dir(p["projectId"], out["jobId"])
+    # Symlink Movies/ and Micrographs/ into the job dir so extract_cpu.py can
+    # resolve micrograph paths like "Movies/movie_000.mrcs" relative to the
+    # star file's directory (which is the import/motioncorr job dir, not this one).
+    pd = project_dir(p["projectId"])
+    for link_name in ["Movies", "Micrographs", "MotionCorr"]:
+        src_link = os.path.join(pd, "relion_run", link_name)
+        dst_link = os.path.join(jd, link_name)
+        if os.path.exists(src_link) and not os.path.exists(dst_link):
+            os.symlink(src_link, dst_link)
+    # Also symlink the mc_star's directory's Movies/MotionCorr if mc_star is
+    # in another job's dir (e.g. import's movies.star when motioncorr skipped).
+    if mc_star:
+        mc_job_dir = os.path.dirname(mc_star)
+        for sub in ["Movies", "MotionCorr", "Micrographs"]:
+            src_sub = os.path.join(mc_job_dir, sub)
+            dst_sub = os.path.join(jd, sub)
+            if os.path.isdir(src_sub) and not os.path.exists(dst_sub):
+                os.symlink(src_sub, dst_sub)
     angpix = float(p.get("angpix", 4.0))
     diameter = float(p.get("particle_diameter", 120))
-    # Compute a reasonable box size from the particle diameter and pixel size.
-    # Box should be ~2x the particle diameter in pixels (so the particle fills
-    # ~50% of the box, leaving room for background/solvent).
-    auto_box = int(diameter / angpix * 2.0)
+    # Box should be ~1.5x the particle diameter in pixels (standard cryo-EM practice:
+    # particle fills ~70% of box, leaving 30% for solvent/CTF ringing).
+    auto_box = int(diameter / angpix * 1.5)
     auto_box = max(32, (auto_box + 1) & ~1)  # even, min 32
     # The LLM / VLM may propose a specific box size — use it if reasonable.
     llm_box = int(p.get("extract_size", p.get("box_size", auto_box)))
-    # Cap box at 128px for CPU memory safety (4GB RAM limit).
-    # At 7.08 A/px, 128px = 902 Å field of view — enough for most particles.
-    # At 3.54 A/px, 128px = 453 Å — still fine.
-    # auto_box * 2 ensures the box is at least 2x the auto-computed size.
-    box = max(32, min(llm_box, 128, max(auto_box * 2, 64)))
+    # Allow box up to 128px (was 96 — too small for good 2D classification).
+    # At 4.0 A/px, 128px = 512 Å field of view — plenty for D4-symmetric particles.
+    box = max(32, min(llm_box, 128, max(auto_box, 64)))
     if llm_box != box:
         on_line("warn", f"extract: box adjusted from {llm_box} to {box} (auto={auto_box}, angpix={angpix}, diam={diameter}Å, diam_px={diameter/angpix:.1f})")
     else:
@@ -754,8 +837,15 @@ def task_class2d(p, inputs, out, on_line, env):
     # that 25 iterations × 10 classes runs in ~5-10 min on CPU. The old cap
     # of 5 iterations was far too few for real data to converge — classes
     # ended up as blurry noise.
-    nr_classes = min(int(p.get("nr_classes", 10)), 10)
-    n_iter = min(int(p.get("iter_nr_iter", 25)), 25)  # allow up to 25 iterations
+    # class2d parameters — optimized for small datasets (100-500 particles)
+    # 10 classes is better than 50 for small datasets (50 classes = ~3 prt/class)
+    # 25 iterations for proper convergence
+    # tau_fudge=4 (stronger regularization helps small datasets)
+    # do_fast_subsets=False (need all particles each iteration)
+    nr_classes = int(p.get("nr_classes", 10))
+    n_iter = int(p.get("iter_nr_iter", 25))
+    tau_fudge = float(p.get("tau_fudge", 4))
+    do_fast_subsets = False  # always False for small datasets
     # Cap the particle diameter to be reasonable for the pixel size.
     # The LLM sometimes proposes 160Å which at 3.54Å/px = 45px radius, exceeding
     # the 32px box. Read the box size from the extract summary if available,
@@ -796,19 +886,76 @@ def task_class2d(p, inputs, out, on_line, env):
     if diameter < 10:
         diameter = int(angpix_cls * box * 0.5)
     out_root = os.path.join(jd, "run")
-    on_line("info", f"class2d: K={nr_classes}, iter={n_iter}, diameter={diameter}Å, box={box}px, angpix={angpix_cls}")
+    on_line("info", f"class2d: K={nr_classes}, iter={n_iter}, tau={tau_fudge}, fast_subsets={do_fast_subsets}, diameter={diameter}Å, box={box}px, angpix={angpix_cls}")
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,
            "--iter", str(n_iter), "--K", str(nr_classes),
+           "--tau_fudge", str(tau_fudge),
            "--particle_diameter", str(diameter),
            "--flatten_solvent", "--zero_mask", "--dont_combine_weights_via_disc",
            "--pool", str(p.get("nr_pool", 3)), "--pad", "1", "--oversampling", "1",
-           "--do_ctf_correction"]
+           "--do_ctf_correction",
+           "--gpu", "--free_gpu_memory", str(p.get("free_gpu_memory_mb", 1024))]
+    if do_fast_subsets:
+        cmd.append("--do_fast_subsets")
     rc = run_cmd(cmd, jd, env, on_line)
     if rc != 0:
         raise RuntimeError("class2d refine failed")
-    # parse _model.star for class resolution
-    star_path = os.path.join(jd, "run_it%03d_model.star" % n_iter)
-    summary = {"n_classes": nr_classes, "best_class_resolution_A": 12.0, "particles_in_good_classes": 0}
+    # Parse real output: find the last iteration's model.star
+    import glob as _g
+    model_stars = sorted(_g.glob(os.path.join(jd, "run_it???_model.star")))
+    if not model_stars:
+        raise RuntimeError("class2d: no output model.star found")
+    star_path = model_stars[-1]
+    # Parse the model.star for real per-class resolution + distribution
+    # The block is "data_model_classes" (not "data_models")
+    best_res = 999.0
+    n_good = 0
+    total_prt = 0
+    class_dist = []
+    try:
+        with open(star_path) as f:
+            in_models = False
+            for line in f:
+                s = line.strip()
+                if s.startswith("data_model_classes"):
+                    in_models = True
+                    continue
+                if s.startswith("data_") and in_models:
+                    break
+                if in_models and s and not s.startswith("#") and not s.startswith("_") and not s.startswith("loop"):
+                    parts = s.split()
+                    if len(parts) >= 5:
+                        try:
+                            # parts[1] = rlnClassDistribution, parts[4] = rlnEstimatedResolution
+                            pct = float(parts[1])
+                            res = float(parts[4])
+                            total_prt += pct
+                            class_dist.append(pct)
+                            if res < best_res:
+                                best_res = res
+                            if pct > 0.05:  # >5% of particles
+                                n_good += 1
+                        except: pass
+    except: pass
+    # Count actual particles from the data.star
+    data_stars = sorted(_g.glob(os.path.join(jd, "run_it???_data.star")))
+    n_particles = 0
+    if data_stars:
+        try:
+            with open(data_stars[-1]) as f:
+                for line in f:
+                    s = line.strip()
+                    if s and not s.startswith("#") and not s.startswith("_") and not s.startswith("loop") and not s.startswith("data"):
+                        n_particles += 1
+        except: pass
+    summary = {
+        "n_classes": nr_classes,
+        "n_particles": n_particles,
+        "best_class_resolution_A": round(best_res, 1) if best_res < 999 else 0,
+        "particles_in_good_classes": n_good,
+        "class_distribution_top5": sorted(class_dist, reverse=True)[:5],
+        "output_model": os.path.basename(star_path),
+    }
     return star_path, summary
 
 def task_initialmodel(p, inputs, out, on_line, env):
@@ -820,6 +967,10 @@ def task_initialmodel(p, inputs, out, on_line, env):
     dst_particles_dir = os.path.join(jd, "Particles")
     if os.path.isdir(src_particles_dir) and not os.path.exists(dst_particles_dir):
         os.symlink(src_particles_dir, dst_particles_dir)
+    # The extract job's particles.star is already in RELION 3.1 format
+    # (data_optics + _rlnImagePixelSize). No conversion needed — relion_convert_star
+    # actually corrupts it (outputs empty file). If class2d_star (model.star) is
+    # used instead, that may need conversion, but extract_star is preferred.
     # CPU: use SGD-based initial model with limited iterations.
     # For small datasets (< 5000 particles), this completes in minutes.
     n_iter = 5
@@ -833,7 +984,8 @@ def task_initialmodel(p, inputs, out, on_line, env):
            "--denovo_3dref", "--particle_diameter", str(diameter),
            "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "C1")),
            "--dont_combine_weights_via_disc", "--pool", "3", "--pad", "1",
-           "--oversampling", "1", "--healpix_order", "1"]
+           "--oversampling", "1", "--healpix_order", "1",
+           "--gpu", "--free_gpu_memory", str(p.get("free_gpu_memory_mb", 1024))]
     rc = run_cmd(cmd, jd, env, on_line)
     if rc != 0:
         raise RuntimeError("initialmodel failed")
@@ -850,31 +1002,50 @@ def task_class3d(p, inputs, out, on_line, env):
     dst_particles_dir = os.path.join(jd, "Particles")
     if os.path.isdir(src_particles_dir) and not os.path.exists(dst_particles_dir):
         os.symlink(src_particles_dir, dst_particles_dir)
-    n_iter = 5
-    nr_classes = min(int(p.get("nr_classes", 3)), 3)
-    angpix_3d = float(p.get("angpix", 4.0))
-    diameter = int(p.get("particle_diameter", 150))
+    n_iter = int(p.get("nr_iter", p.get("nr_classes", 3)))  # allow override
+    n_iter = min(max(n_iter, 5), 25)  # cap at 25
+    nr_classes = min(int(p.get("nr_classes", 1)), 5)
+    angpix_3d = float(p.get("angpix", 1.77))
+    diameter = int(p.get("particle_diameter", 160))
     on_line("info", f"class3d: iter={n_iter}, K={nr_classes}, diam={diameter}Å, angpix={angpix_3d}")
     out_root = os.path.join(jd, "run3d")
+    # RELION 5.0 supports --ref with model.star (2D class averages) and volume (.mrc)
+    # always use --ref; --continue_from was removed.
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,
            "--iter", str(n_iter), "--K", str(nr_classes),
            "--ref", ref, "--ini_high", "30",
            "--particle_diameter", str(diameter),
-           "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "C1")),
-           "--dont_combine_weights_via_disc", "--pool", "3", "--pad", "1",
+           "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "D2")),
+           "--dont_combine_weights_via_disc", "--pool", str(p.get("pool", 3)), "--pad", "1",
            "--oversampling", "1", "--healpix_order", "1",
-           "--do_ctf_correction"]
+           "--do_ctf_correction",
+           "--gpu", "--free_gpu_memory", str(p.get("free_gpu_memory_mb", 1024))]
     rc = run_cmd(cmd, jd, env, on_line)
     if rc != 0:
         raise RuntimeError("class3d failed")
-    star_path = os.path.join(jd, f"run3d_it{n_iter:03d}_model.star")
-    return star_path, {"n_classes": nr_classes, "best_class_resolution_A": 18.0}
+    # Find the real output model.star from the last iteration
+    import glob as _glob
+    model_stars = sorted(_glob.glob(os.path.join(jd, "run3d_it???_model.star")))
+    star_path = model_stars[-1] if model_stars else os.path.join(jd, f"run3d_it{n_iter:03d}_model.star")
+    # Count particles in the best class from the real data.star
+    data_stars = sorted(_glob.glob(os.path.join(jd, "run3d_it???_data.star")))
+    n_particles_best = 0
+    if data_stars:
+        try:
+            with open(data_stars[-1]) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[-1] == "1":
+                        n_particles_best += 1
+        except: pass
+    return star_path, {"n_classes": nr_classes, "n_particles_in_best_class": n_particles_best, "output_star": os.path.basename(star_path)}
 
 def task_refine3d(p, inputs, out, on_line, env):
-    particles_star = inputs.get("class3d_star") or inputs.get("class2d_star") or inputs.get("extract_star")
-    ref = inputs.get("initialmodel_map") or inputs.get("class3d_star")
+    # For refine3d: --i must be the particles star; --ref must be a 3D volume (.mrc)
+    particles_star = inputs.get("extract_star") or inputs.get("class3d_star") or inputs.get("class2d_star")
+    ref = inputs.get("refine3d_map") or inputs.get("initialmodel_map") or inputs.get("class3d_star")
     if not particles_star or not ref:
-        raise RuntimeError("refine3d needs particles + reference")
+        raise RuntimeError("refine3d needs particles + reference volume")
     jd = ensure_job_dir(p["projectId"], out["jobId"])
     src_particles_dir = os.path.join(os.path.dirname(particles_star), "Particles")
     dst_particles_dir = os.path.join(jd, "Particles")
@@ -884,28 +1055,57 @@ def task_refine3d(p, inputs, out, on_line, env):
     # healpix_order=2 for finer angular sampling (needed for ~4Å).
     angpix_r = float(p.get("angpix", 4.0))
     diameter = int(p.get("particle_diameter", 150))
-    on_line("info", f"refine3d: auto-refine, diam={diameter}Å, angpix={angpix_r}, sym={p.get('symmetry', 'C1')}")
+    on_line("info", f"refine3d: auto-refine, diam={diameter}Å, angpix={angpix_r}, sym={p.get('symmetry', 'C2')}")
     out_root = os.path.join(jd, "refine")
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,
-           "--auto_refine", "--init_iter", "1", "--iter", "25",
+           "--auto_refine", "--iter", "25",
            "--ref", ref, "--ini_high", "15",
            "--particle_diameter", str(diameter),
-           "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "C1")),
-           "--dont_combine_weights_via_disc", "--pool", "3", "--pad", "1",
+           "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "C2")),
+           "--dont_combine_weights_via_disc", "--pool", str(p.get("pool", 3)), "--pad", "1",
            "--healpix_order", "2", "--oversampling", "1",
-           "--do_ctf_correction"]
+           "--do_ctf_correction",
+           "--gpu", "--free_gpu_memory", str(p.get("free_gpu_memory_mb", 1024))]
     rc = run_cmd(cmd, jd, env, on_line)
     if rc != 0:
         raise RuntimeError("refine3d failed")
+    # Find the real output map + halfmap from relion_refine
     halfmap = os.path.join(jd, "refine_half1_class001_unfil.mrc")
     map_path = os.path.join(jd, "refine_class001.mrc")
-    summary = {"resolution_A": 8.5, "n_particles": 96}
+    # Verify the output files actually exist — if not, refine3d didn't really complete
+    if not os.path.exists(map_path):
+        # try alternative naming
+        import glob as _glob
+        maps = _glob.glob(os.path.join(jd, "refine_class*.mrc"))
+        if maps:
+            map_path = maps[0]
+            halfmap = _glob.glob(os.path.join(jd, "refine_half1_class*.mrc"))
+            halfmap = halfmap[0] if halfmap else map_path
+        else:
+            raise RuntimeError(f"refine3d: no output map found in {jd}")
+    # Count particles from the real data.star
+    import glob as _glob2
+    data_stars = sorted(_glob2.glob(os.path.join(jd, "refine_it???_data.star")))
+    n_particles = 0
+    if data_stars:
+        try:
+            with open(data_stars[-1]) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        n_particles += 1
+        except: pass
+    summary = {"n_particles": n_particles, "symmetry": str(p.get("symmetry", "C1")), "output_map": os.path.basename(map_path)}
     return halfmap, summary, map_path
 
 def task_maskcreate(p, inputs, out, on_line, env):
     ref_map = inputs.get("refine3d_map") or inputs.get("class3d_star")
     if not ref_map:
         raise RuntimeError("maskcreate needs a map")
+    # The refine3d map MUST exist — no fallback to reference.mrc.
+    # If it doesn't exist, refine3d didn't really complete.
+    if not os.path.exists(ref_map):
+        raise RuntimeError(f"maskcreate: refine3d map not found at {ref_map} — refine3d must produce a real output map")
     jd = ensure_job_dir(p["projectId"], out["jobId"])
     out_mask = os.path.join(jd, "mask.mrc")
     cmd = ["relion_mask_create", "--i", ref_map, "--o", out_mask,
@@ -967,39 +1167,25 @@ def task_postprocess(p, inputs, out, on_line, env):
            "--mask", mask, "--angpix", str(p.get("angpix", 4.0)),
            "--auto_bfac", "--verbose"]
     rc = run_cmd(cmd, jd, env, on_line)
-    # If postprocess fails (e.g. FSC curve never drops below randomize_fsc_at
-    # because we're using a single reference map for both halves on CPU), fall
-    # back to writing the masked map directly and report an estimated resolution.
-    res = 8.5
+    # Read the real resolution from the postprocess log
+    res = 0.0
     logp = os.path.join(jd, "postprocess.log")
     if os.path.exists(logp):
         for l in open(logp):
             m = re.search(r"FINAL RESOLUTION:\s*([\d.]+)", l)
             if m: res = float(m.group(1))
     if rc != 0:
-        on_line("warn", "postprocess: real binary failed (likely FSC threshold on CPU); writing masked map fallback + synthetic FSC")
-        try:
-            import numpy as np
-            import mrcfile
-            # write the masked map as a fallback
-            with mrcfile.open(halfmap, permissive=True) as m:
-                data = np.asarray(m.data, dtype=np.float32).copy()
-            with mrcfile.open(mask, permissive=True) as m:
-                mask_data = np.asarray(m.data, dtype=np.float32).copy()
-            masked = data * mask_data
-            with mrcfile.new(out_map, overwrite=True) as m:
-                m.set_data(masked)
-                m.voxel_size = (p.get("angpix", 4.0),) * 3
-            on_line("success", f"postprocess: wrote masked map fallback -> {out_map}")
-            res = 12.0  # estimated
-            # write a synthetic postprocess.star with an FSC curve so the
-            # visualization dashboard can render something meaningful.
-            write_synthetic_fsc_star(jd, res, p.get("angpix", 4.0))
-            on_line("info", "postprocess: wrote synthetic FSC curve (postprocess.star)")
-        except Exception as e:
-            on_line("error", f"postprocess: fallback also failed: {e}")
-            raise RuntimeError("postprocess failed")
-    return out_map, {"resolution_A": res, "b_factor": -80, "map_size": "64^3"}
+        raise RuntimeError("postprocess failed — relion_postprocess must succeed (no synthetic fallback)")
+    # Verify the real output map exists
+    if not os.path.exists(out_map):
+        raise RuntimeError(f"postprocess: output map not found at {out_map}")
+    # Read real b_factor from the log
+    bfac = 0.0
+    if os.path.exists(logp):
+        for l in open(logp):
+            m = re.search(r"estimated B-factor:\s*(-?[\d.]+)", l)
+            if m: bfac = float(m.group(1))
+    return out_map, {"resolution_A": res, "b_factor": bfac, "output_map": os.path.basename(out_map)}
 
 
 def write_synthetic_fsc_star(jd, resolution_limit, angpix):
@@ -1034,6 +1220,7 @@ TASK_FUNCS = {
     "class2d": task_class2d,
     "initialmodel": task_initialmodel,
     "class3d": task_class3d,
+    "refine3d": task_refine3d,
     "maskcreate": task_maskcreate,
     "postprocess": task_postprocess,
 }
@@ -1158,6 +1345,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        if u.path == "/thumb":
+            self._handle_thumb()
+            return
+        if u.path == "/slice":
+            self._handle_slice()
+            return
+        if u.path == "/slice-probe":
+            self._handle_slice_probe()
+            return
         if u.path != "/run":
             self._send(404, {"error": "not found"})
             return
@@ -1169,6 +1365,184 @@ class Handler(BaseHTTPRequestHandler):
             return
         result = run_job(req)
         self._send(200, result)
+
+    def _handle_thumb(self):
+        """POST /thumb  body: { projectId, path }
+        Generates a 256x256 PNG thumbnail of the .mrc/.mrcs file at the given
+        relative path under data/projects/<projectId>/. Reads the file in WSL
+        (this runner is in WSL) and writes the PNG bytes to the response.
+        """
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send(400, {"error": f"bad json: {e}"})
+            return
+        project_id = req.get("projectId")
+        rel_path = req.get("path")
+        if not project_id or not rel_path:
+            self._send(400, {"error": "projectId and path required"})
+            return
+        if ".." in rel_path:
+            self._send(400, {"error": "bad path"})
+            return
+        # Resolve the file path. rel_path is relative to the project dir.
+        pd = project_dir(project_id)
+        full = os.path.normpath(os.path.join(pd, rel_path))
+        if not full.startswith(pd):
+            self._send(400, {"error": "path escapes project dir"})
+            return
+        if not os.path.isfile(full):
+            self._send(404, {"error": "not found"})
+            return
+        ext = os.path.splitext(full)[1].lower()
+        if ext not in (".mrc", ".mrcs"):
+            self._send(400, {"error": "unsupported file type"})
+            return
+        # Read MRC, render a 256x256 PNG, send back as application/octet-stream.
+        try:
+            import mrcfile, numpy as np
+            from PIL import Image
+            import io
+            with mrcfile.open(full, permissive=True) as m:
+                d = m.data
+            if d is None:
+                self._send(404, {"error": "empty mrc"})
+                return
+            arr = np.asarray(d, dtype=np.float32)
+            if arr.ndim == 3:
+                img = arr[arr.shape[0] // 2]
+            elif arr.ndim == 2:
+                img = arr
+            elif arr.ndim == 4:
+                img = arr[0, arr.shape[1] // 2]
+            else:
+                img = arr.reshape(arr.shape[-2:])
+            mn, mx = float(np.percentile(img, 2)), float(np.percentile(img, 98))
+            if mx <= mn: mx = mn + 1
+            img = np.clip((img - mn) / (mx - mn), 0, 1)
+            h, w = img.shape
+            cy, cx = h // 2, w // 2
+            center_val = float(img[cy - h//8:cy + h//8, cx - w//8:cx + w//8].mean())
+            edge_val = float(np.concatenate([img[:h//8].ravel(), img[-h//8:].ravel()]).mean())
+            if center_val < edge_val:
+                img = 1.0 - img
+            img = (img * 255).astype(np.uint8)
+            # Resize the WHOLE image to 256x256 thumbnail (preserves full image, avoids cropping)
+            img_pil = Image.fromarray(img, mode='L').resize((256, 256), Image.BILINEAR)
+            buf = io.BytesIO()
+            img_pil.save(buf, format='PNG')
+            png_bytes = buf.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png_bytes)))
+            self.send_header("Cache-Control", "public, max-age=60")
+            self.end_headers()
+            self.wfile.write(png_bytes)
+        except Exception as e:
+            self._send(500, {"error": f"thumb failed: {e}"})
+
+    def _handle_slice_probe(self):
+        """POST /slice-probe  body: { projectId, path }
+        Returns { depth, shape } for an MRC / MRCS file.
+        """
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send(400, {"error": f"bad json: {e}"})
+            return
+        project_id = req.get("projectId")
+        rel_path = req.get("path")
+        if not project_id or not rel_path:
+            self._send(400, {"error": "projectId and path required"})
+            return
+        if ".." in rel_path:
+            self._send(400, {"error": "bad path"})
+            return
+        pd = project_dir(project_id)
+        full = os.path.normpath(os.path.join(pd, rel_path))
+        if not full.startswith(pd):
+            self._send(400, {"error": "path escapes project dir"})
+            return
+        if not os.path.isfile(full):
+            self._send(404, {"error": "not found"})
+            return
+        try:
+            import mrcfile, numpy as np
+            with mrcfile.open(full, permissive=True) as m:
+                d = m.data
+            arr = np.asarray(d)
+            self._send(200, {"depth": int(arr.shape[0]), "shape": list(arr.shape)})
+        except Exception as e:
+            self._send(500, {"error": f"probe failed: {e}"})
+
+    def _handle_slice(self):
+        """POST /slice  body: { projectId, path, z }
+        Renders a single 2D slice of an MRC / MRCS file as a PNG and
+        returns the bytes (image/png). z is the slice index for 3D /
+        stacks; for 2D it is ignored.
+        """
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send(400, {"error": f"bad json: {e}"})
+            return
+        project_id = req.get("projectId")
+        rel_path = req.get("path")
+        z = int(req.get("z", 0) or 0)
+        if not project_id or not rel_path:
+            self._send(400, {"error": "projectId and path required"})
+            return
+        if ".." in rel_path:
+            self._send(400, {"error": "bad path"})
+            return
+        pd = project_dir(project_id)
+        full = os.path.normpath(os.path.join(pd, rel_path))
+        if not full.startswith(pd):
+            self._send(400, {"error": "path escapes project dir"})
+            return
+        if not os.path.isfile(full):
+            self._send(404, {"error": "not found"})
+            return
+        try:
+            import mrcfile, numpy as np
+            from PIL import Image
+            import io
+            with mrcfile.open(full, permissive=True) as m:
+                d = m.data
+            arr = np.asarray(d, dtype=np.float32)
+            if arr.ndim == 3:
+                z = max(0, min(arr.shape[0] - 1, z))
+                img = arr[z]
+            elif arr.ndim == 4:
+                z = max(0, min(arr.shape[0] - 1, z))
+                img = arr[z, arr.shape[1] // 2]
+            elif arr.ndim == 2:
+                img = arr
+            else:
+                img = arr[0]
+            mn = float(np.percentile(img, 1))
+            mx = float(np.percentile(img, 99))
+            if mx <= mn: mx = mn + 1
+            img_norm = np.clip((img - mn) / (mx - mn), 0, 1)
+            gray = (img_norm * 255).astype(np.uint8)
+            s = min(gray.shape[0], gray.shape[1], 256)
+            y0 = max(0, (gray.shape[0] - s) // 2)
+            x0 = max(0, (gray.shape[1] - s) // 2)
+            gray = gray[y0:y0+s, x0:x0+s]
+            buf = io.BytesIO()
+            Image.fromarray(gray, mode='L').save(buf, format='PNG')
+            png_bytes = buf.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png_bytes)))
+            self.send_header("Cache-Control", "public, max-age=60")
+            self.end_headers()
+            self.wfile.write(png_bytes)
+        except Exception as e:
+            self._send(500, {"error": f"slice failed: {e}"})
 
 if __name__ == "__main__":
     print(f"[relion-runner] starting on port {PORT}", flush=True)

@@ -83,16 +83,37 @@ def main():
     with open(args.micrographs) as f:
         for line in f:
             s = line.strip()
-            if s and not s.startswith("#") and not s.startswith("_") and not s.startswith("loop_") and not s.startswith("data_") and s.split()[0].endswith(".mrc"):
+            if s and not s.startswith("#") and not s.startswith("_") and not s.startswith("loop_") and not s.startswith("data_") and (s.split()[0].endswith(".mrc") or s.split()[0].endswith(".mrcs")):
                 parts = s.split()
                 name = parts[0]  # e.g. MotionCorr/movie_000.mrc or Micrographs/foo.mrc
-                # resolve relative to the star file's directory, then parent, then grandparent
+                # resolve relative to the star file's directory, then parent,
+                # then grandparent, then cwd, then search up for a project root
+                # (data/projects/<id>/relion_run) and try there.
                 if not os.path.isabs(name):
                     full = os.path.join(star_dir, name)
                     if not os.path.exists(full):
                         full = os.path.join(star_parent, name)
                     if not os.path.exists(full):
                         full = os.path.join(os.path.dirname(star_parent), name)
+                    if not os.path.exists(full):
+                        full = os.path.join(os.getcwd(), name)
+                    if not os.path.exists(full):
+                        # Walk up from star_dir to find a relion_run dir that has Movies/
+                        d = star_dir
+                        for _ in range(6):
+                            candidate = os.path.join(d, name)
+                            if os.path.exists(candidate):
+                                full = candidate
+                                break
+                            # also try Movies/ at this level
+                            base_name = os.path.basename(name)
+                            cand2 = os.path.join(d, "Movies", base_name)
+                            if os.path.exists(cand2):
+                                full = cand2
+                                break
+                            d = os.path.dirname(d)
+                            if d == "/":
+                                break
                 else:
                     full = name
                 mic_paths[name] = full
@@ -102,6 +123,17 @@ def main():
                 mic_paths["MotionCorr/" + base] = full
                 mic_paths["Micrographs/" + base] = full
                 mic_paths[base] = full
+                # If the micrograph is a .mrcs movie, also register a .mrc alias
+                # so coords referencing "Movies/movie_000.mrc" (corrected micrograph
+                # naming) resolve to the .mrcs movie when motioncorr was skipped.
+                if base.endswith(".mrcs"):
+                    mrc_base = base.replace(".mrcs", ".mrc")
+                    mrc_full = full.replace(".mrcs", ".mrc")
+                    mic_paths["Movies/" + mrc_base] = full  # point .mrc to .mrcs file
+                    mic_paths["MotionCorr/" + mrc_base] = full
+                    mic_paths["Micrographs/" + mrc_base] = full
+                    mic_paths[mrc_base] = full
+                    _ = mrc_full  # (unused; the .mrc file doesn't exist, but .mrcs does)
     print(f"[extract] micrograph index: {len(mic_paths)} entries")
     # cache micrographs
     mic_cache = {}
@@ -117,17 +149,39 @@ def main():
                 if os.path.basename(k) == base:
                     mic_full = v
                     break
+        # If the micrograph name ends in .mrc but only .mrcs exists (motioncorr
+        # was skipped, so corrected .mrc wasn't produced), try the .mrcs variant.
+        if mic_full and not os.path.exists(mic_full) and mic_name.endswith(".mrc"):
+            mrcs_alt = mic_full.replace(".mrc", ".mrcs")
+            if os.path.exists(mrcs_alt):
+                mic_full = mrcs_alt
+            # also try in the mic_paths map with .mrcs suffix
+            if not os.path.exists(mic_full):
+                mrcs_name = mic_name.replace(".mrc", ".mrcs")
+                mrcs_entry = mic_paths.get(mrcs_name)
+                if mrcs_entry and os.path.exists(mrcs_entry):
+                    mic_full = mrcs_entry
         if not mic_full or not os.path.exists(mic_full):
             print(f"[extract] SKIP {mic_name} (not found)")
             continue
         if mic_full not in mic_cache:
             with mrcfile.open(mic_full, permissive=True) as m:
-                mic_cache[mic_full] = m.data.copy()
+                data = m.data.copy()
+                # If this is a multi-frame movie (.mrcs, 3D), take the first frame
+                # (motioncorr was skipped, so no averaged micrograph exists).
+                if data.ndim == 3:
+                    data = data[0]
+                mic_cache[mic_full] = data
         mic = mic_cache[mic_full]
         cy = int(round(y)); cx = int(round(x))
         half = args.box // 2
-        if cy - half < 0 or cy + half > mic.shape[0] or cx - half < 0 or cx + half > mic.shape[1]:
-            continue
+        # Clamp the box to the micrograph bounds instead of skipping the
+        # particle entirely. Particles near the edge get a box shifted inward
+        # (the particle may be slightly off-center, but that's better than
+        # losing it entirely — especially on small 256x256 test micrographs
+        # where most coords are near the edge).
+        cy = max(half, min(cy, mic.shape[0] - half))
+        cx = max(half, min(cx, mic.shape[1] - half))
         box_img = mic[cy-half:cy+half, cx-half:cx+half].astype(np.float32)
         # Invert contrast so protein is white (high values) and background
         # is dark (low values) — cryo-EM micrographs have dark protein on

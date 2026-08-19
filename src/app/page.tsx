@@ -78,9 +78,40 @@ export default function Home() {
   useEffect(() => {
     if (!selectedId) return;
     refreshProject(selectedId);
-    // Poll while project is running
-    const iv = setInterval(() => refreshProject(selectedId), 1500);
-    return () => clearInterval(iv);
+    // Open an SSE connection to the engine so we get push notifications
+    // for job progress changes, new logs, and job done/failed events
+    // instead of polling /api/workflow every few seconds.
+    let es: EventSource | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    try {
+      es = new EventSource(`/api/events/stream?projectId=${selectedId}`);
+      es.addEventListener("job", () => {
+        // Refresh workflow + project state on any job event. The actual
+        // payload is small (event metadata only) — the heavy data is still
+        // pulled via /api/workflow, but only when there's actually a change.
+        refreshProject(selectedId);
+      });
+      es.addEventListener("ready", () => {
+        // Connected; nothing to do.
+      });
+      es.onerror = () => {
+        // SSE dropped (proxy timeout, dev-server restart, etc). Fall back
+        // to a slow poll so the UI still updates while we reconnect.
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(() => refreshProject(selectedId), 15_000);
+      };
+    } catch (e) {
+      // EventSource unavailable (SSR / disabled cookies). Fall back to poll.
+      pollTimer = setInterval(() => refreshProject(selectedId), 5000);
+    }
+    // Always keep a slow safety poll even when SSE works, in case an event
+    // gets lost (e.g. dev server briefly unavailable, reconnect window).
+    const safety = setInterval(() => refreshProject(selectedId), 30_000);
+    return () => {
+      clearInterval(safety);
+      if (pollTimer) clearInterval(pollTimer);
+      if (es) es.close();
+    };
   }, [selectedId, refreshProject]);
 
   const isRunning = workflow?.status === "running";
@@ -95,7 +126,7 @@ export default function Home() {
       } catch {
         /* ignore */
       }
-      if (!cancelled) setTimeout(tick, 1100);
+      if (!cancelled) setTimeout(tick, 3000);
     }
     tick();
     return () => {
@@ -114,7 +145,7 @@ export default function Home() {
       } catch {
         // ignore transient errors
       }
-    }, 4000);
+    }, 10000);
     return () => clearInterval(t);
   }, []);
 
@@ -259,6 +290,7 @@ export default function Home() {
             onSelect={setSelectedId}
             onNew={() => setNewProjectOpen(true)}
             decisions={decisions}
+            messages={messages}
           />
         </aside>
 

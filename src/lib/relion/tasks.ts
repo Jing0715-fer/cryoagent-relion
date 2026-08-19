@@ -307,7 +307,7 @@ export const RELION_TASKS: RelionTask[] = [
       { key: "nr_classes", label: "Number of classes", type: "int", default: 10, group: "Classify", help: "Number of 2D references." },
       { key: "tau_fudge", label: "Regularization T", type: "float", default: 2, group: "Classify", help: "T regularization factor." },
       { key: "do_fast_subsets", label: "Fast subsets", type: "bool", default: true, group: "Classify", help: "Split into subsets for speed." },
-      { key: "iter_nr_iter", label: "Iterations", type: "int", default: 5, group: "Optimisation", help: "Number of EM iterations." },
+      { key: "iter_nr_iter", label: "Iterations", type: "int", default: 25, group: "Optimisation", help: "Number of EM iterations." },
       { key: "particle_diameter", label: "Mask diameter (Å)", type: "int", default: 160, group: "Classify", help: "Circular mask diameter." },
       { key: "do_center", label: "Center classes", type: "bool", default: true, group: "Optimisation", help: "Re-center class averages." },
       { key: "do_ctf_correction", label: "CTF correction", type: "bool", default: true, group: "Classify", help: "Apply CTF during classification." },

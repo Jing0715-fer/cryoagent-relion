@@ -1,7 +1,8 @@
 // Client for the relion-runner mini-service (port 3004).
-// All requests go through the gateway using XTransformPort=3004.
+// Uses Node.js http module instead of fetch() — fetch() in Next.js dev
+// (Turbopack) sometimes fails to connect to localhost services.
 
-const RUNNER_PORT = "3004";
+import * as http from "http";
 
 export interface RunnerLogLine {
   level: "info" | "warn" | "error" | "success";
@@ -26,45 +27,56 @@ export interface RunnerJobRequest {
   sourceDataset?: string;
 }
 
-// In server-side code we can hit the runner directly (bypassing the gateway)
-// since we're in the same network namespace. But to honor the gateway contract
-// we still use the relative path with XTransformPort so it works regardless of
-// how the app is exposed.
-export async function runRunnerJob(req: RunnerJobRequest, timeoutMs = 1800000): Promise<RunnerResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    // Server-side fetch needs an absolute URL. The runner is on localhost:3004
-    // and the gateway forwards /run?XTransformPort=3004 to it, but to keep this
-    // independent of the gateway we hit the runner port directly from the server.
-    // Use 127.0.0.1 instead of localhost — Node.js fetch may try IPv6 (::1)
-    // first, but the Python runner binds to 0.0.0.0 (IPv4 only).
-    const base = process.env.RUNNER_URL || "http://127.0.0.1:3004";
-    const res = await fetch(`${base}/run`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(req),
-      signal: controller.signal,
-      // @ts-ignore
-      next: { revalidate: 0 },
+// Default timeout: 4 hours. CPU-only RELION tasks can take a while
+// (class2d: 18700 particles × 25 iter ≈ 2 hours; class3d / refine3d similar).
+// The previous default of 30 min caused the engine to mark long-running
+// jobs as failed while relion_refine was still happily chugging on the disk.
+export async function runRunnerJob(req: RunnerJobRequest, timeoutMs = 4 * 60 * 60 * 1000): Promise<RunnerResult> {
+  const base = process.env.RUNNER_URL || "http://127.0.0.1:3004";
+  const url = new URL(`${base}/run`);
+  const body = JSON.stringify(req);
+
+  return new Promise((resolve) => {
+    const req_obj = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+        timeout: timeoutMs,
+      },
+      (res: http.IncomingMessage) => {
+        let data = "";
+        res.on("data", (d: any) => (data += d));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(data) as RunnerResult);
+          } catch (e: any) {
+            resolve({ ok: false, logs: [], outputs: [], summary: {}, error: `parse error: ${e?.message}` });
+          }
+        });
+      },
+    );
+    req_obj.on("error", (e: any) => {
+      resolve({ ok: false, logs: [], outputs: [], summary: {}, error: `http error: ${e?.message || e}` });
     });
-    if (!res.ok) {
-      return { ok: false, logs: [], outputs: [], summary: {}, error: `runner HTTP ${res.status}` };
-    }
-    return (await res.json()) as RunnerResult;
-  } catch (e: any) {
-    return { ok: false, logs: [], outputs: [], summary: {}, error: e?.message || String(e) };
-  } finally {
-    clearTimeout(timer);
-  }
+    req_obj.on("timeout", () => {
+      req_obj.destroy();
+      resolve({ ok: false, logs: [], outputs: [], summary: {}, error: "timeout" });
+    });
+    req_obj.write(body);
+    req_obj.end();
+  });
 }
 
-// Resolve runner output file path -> a downloadable URL through the gateway.
 export function fileDownloadUrl(projectId: string, relPath: string): string {
   return `/api/files?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(relPath)}`;
 }
 
-// Resolve runner thumbnail URL for a map/mrcs file.
 export function fileThumbUrl(projectId: string, relPath: string): string {
   return `/api/files?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(relPath)}&thumb=1`;
 }

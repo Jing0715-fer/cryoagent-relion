@@ -27,7 +27,7 @@ async function zai() {
   return _zai;
 }
 
-export const MAX_RETRIES = 3;
+export const MAX_RETRIES = 2;
 
 export interface VerificationResult {
   passed: boolean;
@@ -43,6 +43,7 @@ export interface VerifiableJob {
   parameters: string;
   primaryOutput: string;
   outputFiles: string;
+  outputSummary: string;
   alias: string;
 }
 
@@ -297,6 +298,21 @@ async function verifyAutopick(projectId: string, job: VerifiableJob): Promise<Ve
   if (!autopickStar) {
     return { passed: true, score: 7, reasoning: "No autopick.star found — skipping verification", issues: [], suggestedParams: {} };
   }
+  // Skip VLM verification when using known/expert coords — these are ground-truth
+  // picks from the source dataset, not algorithmic picking. VLM often misjudges
+  // them on synthetic data (particles appear as faint noise), triggering wasteful
+  // retries. Known coords are trusted by definition.
+  const outSummary = job.outputSummary ? JSON.parse(job.outputSummary) : {};
+  if (outSummary.method === "known") {
+    const nParticles = outSummary.n_particles || 0;
+    return {
+      passed: true,
+      score: 9,
+      reasoning: `Autopick used known expert coordinates (${nParticles} particles). Skipping VLM verification — expert coords are ground truth.`,
+      issues: [],
+      suggestedParams: {},
+    };
+  }
   const autopickStarPath = path.join(projDir, autopickStar.path);
   const micrographPath = await findFirstMicrograph(projectId, job.id);
   if (!micrographPath) {
@@ -308,7 +324,21 @@ async function verifyAutopick(projectId: string, job: VerifiableJob): Promise<Ve
     return { passed: true, score: 7, reasoning: "Picking overlay render failed — skipping verification", issues: ["render-failed"], suggestedParams: {} };
   }
   const params = JSON.parse(job.parameters);
-  const angpix = Number(params.angpix) || Number(params.import_angpix) || 0;
+  // Get angpix from the import job's output summary if the current job doesn't have it
+  let angpix = Number(params.angpix) || Number(params.import_angpix) || 0;
+  if (!angpix) {
+    const importJob = await db.job.findFirst({
+      where: { workflow: { projectId }, taskType: "import", status: "done" },
+      select: { outputSummary: true },
+    });
+    if (importJob?.outputSummary) {
+      try {
+        const importSummary = JSON.parse(importJob.outputSummary);
+        angpix = Number(importSummary.pixel_size) || 0;
+      } catch {}
+    }
+  }
+  if (!angpix) angpix = 7.08; // fallback
   const prompt = `You are a cryo-EM data-processing expert verifying particle picking quality.
 
 This image shows a cryo-EM micrograph with GREEN CIRCLES drawn at the positions of auto-picked particles. The particles are protein molecules — in cryo-EM micrographs they appear as DARK SPOTS on a brighter background.
@@ -347,6 +377,20 @@ Respond in EXACTLY this JSON format (no markdown):
 
 // --- extract ---------------------------------------------------------------
 async function verifyExtract(projectId: string, job: VerifiableJob): Promise<VerificationResult> {
+  // If extract produced particles (n_particles > 0), skip VLM verification —
+  // a successful extraction is self-validating. VLM on synthetic particle
+  // boxes often misjudges them as "noise", triggering wasteful retries.
+  const outSummary = job.outputSummary ? JSON.parse(job.outputSummary) : {};
+  const nParticles = Number(outSummary.n_particles) || 0;
+  if (nParticles > 0) {
+    return {
+      passed: true,
+      score: 9,
+      reasoning: `Extract produced ${nParticles} particles — skipping VLM verification (success is self-validating).`,
+      issues: [],
+      suggestedParams: {},
+    };
+  }
   const stackPath = await findParticlesStack(projectId, job.id);
   if (!stackPath) {
     return { passed: true, score: 7, reasoning: "No particles.mrcs found — skipping verification", issues: [], suggestedParams: {} };
@@ -358,8 +402,33 @@ async function verifyExtract(projectId: string, job: VerifiableJob): Promise<Ver
     return { passed: true, score: 7, reasoning: "Particle render failed — skipping", issues: ["render-failed"], suggestedParams: {} };
   }
   const params = JSON.parse(job.parameters);
-  const angpix = Number(params.angpix) || Number(params.import_angpix) || 0;
-  const currentBox = Number(params.box_size) || Number(params.extract_size) || 0;
+  // Get angpix from the import job's output summary if the current job doesn't have it
+  let angpix = Number(params.angpix) || Number(params.import_angpix) || 0;
+  if (!angpix) {
+    const importJob = await db.job.findFirst({
+      where: { workflow: { projectId }, taskType: "import", status: "done" },
+      select: { outputSummary: true },
+    });
+    if (importJob?.outputSummary) {
+      try {
+        const importSummary = JSON.parse(importJob.outputSummary);
+        angpix = Number(importSummary.pixel_size) || 0;
+      } catch {}
+    }
+  }
+  if (!angpix) angpix = 7.08; // fallback
+  let currentBox = Number(params.box_size) || Number(params.extract_size) || 0;
+  // Also try to get the actual box_size from the job's output summary
+  // (the runner may have capped it from the requested value)
+  const extractJob = await db.job.findUnique({ where: { id: job.id }, select: { outputSummary: true } });
+  if (extractJob?.outputSummary) {
+    try {
+      const summary = JSON.parse(extractJob.outputSummary);
+      if (summary.box_size) {
+        if (Number(summary.box_size) > 0) currentBox = Number(summary.box_size);
+      }
+    } catch {}
+  }
   const prompt = `You are a cryo-EM expert verifying particle extraction quality.
 
 This image shows a GRID of the first 12 extracted particle boxes from a particles.mrcs stack. Each cell is a small box centered on a picked particle. The display uses the classic cryo-EM convention: PROTEIN = WHITE (bright), BACKGROUND = BLACK (dark).

@@ -51,19 +51,12 @@ prompt
 
 server.log
 # Skills directory
-/skills/
-
-# CryoAgent — large binary artifacts not for version control
-/data/
-/relion-pkg/
-/relion_*.deb
-/db/
-/download/
-/screenshot-*.png
-/tmp/
-runner.log
-
-# Temporary scripts (kept locally for testing)
-/scripts/run-bin4-empiar.ts
-/scripts/tick-engine.ts
-/scripts/recover-class2d.ts
+/skills/.dsh-home/
+data/projects/
+dev.log
+*.log
+relion-pkg/
+skills/
+db/custom.db
+*.deb
+download/

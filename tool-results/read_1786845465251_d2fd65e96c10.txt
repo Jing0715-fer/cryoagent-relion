@@ -1,0 +1,782 @@
+     1→import z from "@deepseek-ai/schemastery";
+     2→import { CONTEXT_WINDOW_EXCEEDED_CODE, CallId, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, ProviderRequestId, QUOTA_EXCEEDED_CODE, ReasoningEffortId, RetryPolicySchema, assertUsableApiKey, attributionHeaders, contentHasImage, isContextWindowExceededError, isQuotaExceededError, resolveRetryPolicy } from "@deepseek-ai/dsh-llm";
+     3→import { credentialRef } from "@deepseek-ai/dsh-credentials";
+     4→import { launchEnvironmentOf } from "@deepseek-ai/dsh-launch-environment";
+     5→import { deepEqualJson, installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
+     6→import { MAX_TIMER_DELAY_MS, idleWatchdog, timeoutOf } from "@deepseek-ai/dsh-timeout";
+     7→import { getOrCreateAnonymousUserId } from "@deepseek-ai/dsh-anonymous-user-id";
+     8→import { EventSourceParserStream } from "eventsource-parser/stream";
+     9→//#region lib/types/serialize.js
+    10→/**
+    11→* Serialize harness messages into DeepSeek chat completions. User text is joined; assistant text
+    12→* becomes `content`, tool calls become `tool_calls`, and tool results become separate tool messages.
+    13→* Assistant reasoning is replayed as `reasoning_content` only on tool-call turns, as required by
+    14→* thinking-mode passback. Core image blocks are rejected explicitly because this wire route is text-only;
+    15→* unknown declaration-merged block types retain the adapter's documented extension fallback.
+    16→* @module dsh-llm-deepseek/serialize
+    17→*/
+    18→/** Validate the adapter-owned effort before resolving its DeepSeek wire fields. */
+    19→function reasoningEffort(effort) {
+    20→        if (effort === "off" || effort === "high" || effort === "max") return effort;
+    21→        throw new LlmError(`DeepSeek does not support reasoning effort "${effort}"`, "UNSUPPORTED_REASONING_EFFORT");
+    22→}
+    23→/** Resolve one legal thinking/effort pair without exposing `off` as a wire effort. */
+    24→function resolveThinking(options, defaults) {
+    25→        if (options.purpose === "session-title") return { thinking: "disabled" };
+    26→        const effort = options.reasoningEffort === void 0 ? defaults.reasoningEffort : reasoningEffort(options.reasoningEffort);
+    27→        if (defaults.thinking === "disabled" && effort !== void 0 && effort !== "off") throw new LlmError(`DeepSeek deployment does not support reasoning effort "${effort}"`, "UNSUPPORTED_REASONING_EFFORT");
+    28→        if (effort === "off") return { thinking: "disabled" };
+    29→        if (effort === "high" || effort === "max") return {
+    30→                thinking: "enabled",
+    31→                reasoningEffort: effort
+    32→        };
+    33→        return defaults.thinking === void 0 ? {} : { thinking: defaults.thinking };
+    34→}
+    35→/** Join the text blocks of a message (used for user/tool-result content). */
+    36→function flattenText(blocks) {
+    37→        return blocks.filter((block) => block.type === "text").map((block) => block.text).join("");
+    38→}
+    39→/** Reject core image content before any text-flattening path can silently erase it. */
+    40→function assertTextOnly(blocks) {
+    41→        if (contentHasImage(blocks)) throw new LlmError("The DeepSeek chat-completions adapter does not support image content.", "UNSUPPORTED_CONTENT");
+    42→}
+    43→/** Serialize one assistant message (text + reasoning + tool calls). */
+    44→function serializeAssistant(message) {
+    45→        const text = flattenText(message.content);
+    46→        const reasoning = message.content.filter((block) => block.type === "reasoning").map((block) => block.text).join("");
+    47→        const toolCalls = message.content.filter((block) => block.type === "tool-call").map((block) => ({
+    48→                id: block.id,
+    49→                type: "function",
+    50→                function: {
+    51→                        name: block.name,
+    52→                        arguments: block.arguments
+    53→                }
+    54→        }));
+    55→        return {
+    56→                role: "assistant",
+    57→                content: text,
+    58→                ...toolCalls.length > 0 && reasoning.length > 0 ? { reasoning_content: reasoning } : {},
+    59→                ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {}
+    60→        };
+    61→}
+    62→/**
+    63→* Serialize the conversation. `tool-result` blocks become standalone
+    64→* `{role: 'tool'}` messages; the harness puts each tool result in its own
+    65→* user-role message, so a mixed user message contributes its text first and
+    66→* its tool results as separate wire messages after.
+    67→* @param messages - the harness conversation, in order.
+    68→* @returns the wire messages; order preserved, each tool result expanded into its own entry.
+    69→*/
+    70→function serializeMessages(messages) {
+    71→        const wire = [];
+    72→        for (const message of messages) {
+    73→                assertTextOnly(message.content);
+    74→                if (message.role === "system") {
+    75→                        wire.push({
+    76→                                role: "system",
+    77→                                content: flattenText(message.content)
+    78→                        });
+    79→                        continue;
+    80→                }
+    81→                if (message.role === "assistant") {
+    82→                        wire.push(serializeAssistant(message));
+    83→                        continue;
+    84→                }
+    85→                const toolResults = message.content.filter((block) => block.type === "tool-result");
+    86→                const text = flattenText(message.content);
+    87→                if (text.length > 0 || toolResults.length === 0) wire.push({
+    88→                        role: "user",
+    89→                        content: text
+    90→                });
+    91→                for (const result of toolResults) wire.push({
+    92→                        role: "tool",
+    93→                        tool_call_id: result.toolCallId,
+    94→                        content: flattenText(result.content) || "(no output)"
+    95→                });
+    96→        }
+    97→        return wire;
+    98→}
+    99→/**
+   100→* Build the full wire request. Always streaming (`stream: true`, usage
+   101→* reporting on); optional fields are omitted rather than sent as null, so
+   102→* provider defaults apply.
+   103→* @param options - the harness request (model, history, system, tools, sampling).
+   104→* @param defaults - adapter-level thinking defaults; undefined fields put nothing on the wire.
+   105→* @returns the chat-completions request body.
+   106→*/
+   107→function serializeRequest(options, defaults = {}) {
+   108→        const messages = [];
+   109→        if (options.system !== void 0) messages.push({
+   110→                role: "system",
+   111→                content: options.system
+   112→        });
+   113→        messages.push(...serializeMessages(options.messages));
+   114→        const tools = options.tools?.map((tool) => ({
+   115→                type: "function",
+   116→                function: {
+   117→                        name: tool.name,
+   118→                        description: tool.description,
+   119→                        parameters: tool.parameters
+   120→                }
+   121→        }));
+   122→        const resolvedThinking = resolveThinking(options, defaults);
+   123→        return {
+   124→                model: options.model,
+   125→                messages,
+   126→                stream: true,
+   127→                stream_options: { include_usage: true },
+   128→                ...resolvedThinking.thinking !== void 0 ? { thinking: { type: resolvedThinking.thinking } } : {},
+   129→                ...resolvedThinking.reasoningEffort !== void 0 ? { reasoning_effort: resolvedThinking.reasoningEffort } : {},
+   130→                ...tools !== void 0 && tools.length > 0 ? { tools } : {},
+   131→                ...options.temperature !== void 0 ? { temperature: options.temperature } : {},
+   132→                ...options.maxTokens === void 0 ? {} : { max_tokens: options.maxTokens },
+   133→                ...options.stop !== void 0 ? { stop: options.stop } : {}
+   134→        };
+   135→}
+   136→/**
+   137→* Parse an SSE byte stream into data payloads. Yields `[DONE]` as the final
+   138→* value and returns; throws `LlmError('STREAM_CLOSED')` when the stream ends
+   139→* without it (truncated response — the model call cannot be trusted).
+   140→* @param stream - raw SSE bytes; reads may split anywhere, including mid-UTF-8 sequence.
+   141→* @param onComment - optional transport-activity callback; comments never enter the yielded payload stream.
+   142→* @returns each event's data payload in arrival order, the `[DONE]` sentinel last.
+   143→*/
+   144→async function* parseSse(stream, onComment) {
+   145→        const events = stream.pipeThrough(new TextDecoderStream()).pipeThrough(new EventSourceParserStream({ onComment }));
+   146→        for await (const { data } of events) {
+   147→                yield data;
+   148→                if (data === "[DONE]") return;
+   149→        }
+   150→        throw new LlmError("SSE stream ended without [DONE]", "STREAM_CLOSED");
+   151→}
+   152→//#endregion
+   153→//#region lib/types/translate.js
+   154→/**
+   155→* Translate DeepSeek SSE payloads with one stateful harness block per content, reasoning, or tool
+   156→* call index. An empty initial reasoning delta does not open a block. Finish reason and the latest
+   157→* usage are deferred until `[DONE]`, covering both finish-attached and trailing usage-only shapes
+   158→* while ensuring no chunk follows `finish`.
+   159→*
+   160→* Translate DeepSeek wire chunks into the harness `StreamChunk` protocol.
+   161→* @module dsh-llm-deepseek/translate
+   162→*/
+   163→/**
+   164→* Map the wire finish_reason vocabulary to the harness FinishReason.
+   165→* @param reason - the wire `finish_reason` string.
+   166→* @returns the mapped reason; unrecognized values (content_filter, …) become `{kind: 'error'}` with the uppercased value as `code`.
+   167→*/
+   168→function mapFinishReason(reason) {
+   169→        switch (reason) {
+   170→                case "stop": return { kind: "stop" };
+   171→                case "tool_calls": return { kind: "tool-calls" };
+   172→                case "length": return { kind: "max-tokens" };
+   173→                default: return {
+   174→                        kind: "error",
+   175→                        failure: {
+   176→                                message: `model stopped: ${reason}`,
+   177→                                code: reason.toUpperCase()
+   178→                        }
+   179→                };
+   180→        }
+   181→}
+   182→/**
+   183→* Map wire usage fields. DeepSeek's `prompt_tokens` INCLUDES cache hits
+   184→* (`prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens`,
+   185→* api/create-chat-completion); the harness TokenUsage convention is
+   186→* DISJOINT counts, so cache reads are subtracted out of `inputTokens`.
+   187→* @param usage - wire usage from the finish chunk or the trailing usage-only chunk.
+   188→* @returns disjoint harness counts; cache/reasoning fields present only when the wire reported them.
+   189→*/
+   190→function mapUsage(usage) {
+   191→        const cacheRead = usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens;
+   192→        const reasoning = usage.completion_tokens_details?.reasoning_tokens;
+   193→        return {
+   194→                inputTokens: usage.prompt_tokens - (cacheRead ?? 0),
+   195→                outputTokens: usage.completion_tokens,
+   196→                ...cacheRead !== void 0 ? { cacheReadTokens: cacheRead } : {},
+   197→                ...reasoning !== void 0 ? { reasoningTokens: reasoning } : {}
+   198→        };
+   199→}
+   200→/** Assemble the final ContentBlock for one open block. */
+   201→function closeBlock(block) {
+   202→        switch (block.kind) {
+   203→                case "text": return {
+   204→                        type: "text",
+   205→                        text: block.text
+   206→                };
+   207→                case "reasoning": return {
+   208→                        type: "reasoning",
+   209→                        text: block.text
+   210→                };
+   211→                case "tool-call": return {
+   212→                        type: "tool-call",
+   213→                        id: CallId(block.callId ?? ""),
+   214→                        name: block.name ?? "",
+   215→                        arguments: block.text
+   216→                };
+   217→        }
+   218→}
+   219→/**
+   220→* Consume SSE data payloads (ending with `[DONE]`) and yield StreamChunks.
+   221→* Malformed JSON payloads abort the stream with `MALFORMED_RESPONSE`.
+   222→* @param payloads - SSE data payloads from {@link parseSse}, `[DONE]`-terminated.
+   223→* @returns deltas as they arrive; `block-end`s, `usage`, and `finish` are all deferred to the `[DONE]` sentinel.
+   224→*   A `stop` (or absent) finish with no opened blocks is a degenerate provider completion and maps to an
+   225→*   `EMPTY_RESPONSE` error finish instead of a successful empty message.
+   226→*/
+   227→async function* translate(payloads) {
+   228→        let nextIndex = 0;
+   229→        let textBlock;
+   230→        let reasoningBlock;
+   231→        const toolBlocks = /* @__PURE__ */ new Map();
+   232→        const order = [];
+   233→        let pendingFinish;
+   234→        let pendingUsage;
+   235→        function open(kind) {
+   236→                const block = {
+   237→                        index: nextIndex++,
+   238→                        kind,
+   239→                        text: ""
+   240→                };
+   241→                order.push(block);
+   242→                return block;
+   243→        }
+   244→        for await (const payload of payloads) {
+   245→                if (payload === "[DONE]") {
+   246→                        for (const block of order) yield {
+   247→                                type: "block-end",
+   248→                                index: block.index,
+   249→                                block: closeBlock(block)
+   250→                        };
+   251→                        if (pendingUsage) yield {
+   252→                                type: "usage",
+   253→                                usage: pendingUsage
+   254→                        };
+   255→                        const reason = pendingFinish ?? { kind: "stop" };
+   256→                        yield {
+   257→                                type: "finish",
+   258→                                reason: reason.kind === "stop" && order.length === 0 ? {
+   259→                                        kind: "error",
+   260→                                        failure: {
+   261→                                                message: "model returned a completed response with no content",
+   262→                                                code: EMPTY_RESPONSE_CODE
+   263→                                        }
+   264→                                } : reason
+   265→                        };
+   266→                        return;
+   267→                }
+   268→                let chunk;
+   269→                try {
+   270→                        chunk = JSON.parse(payload);
+   271→                } catch {
+   272→                        throw new LlmError(`malformed SSE payload: ${payload.slice(0, 120)}`, "MALFORMED_RESPONSE");
+   273→                }
+   274→                for (const choice of chunk.choices ?? []) {
+   275→                        const delta = choice.delta;
+   276→                        const reasoning = delta?.reasoning_content;
+   277→                        if (typeof reasoning === "string" && reasoning.length > 0) {
+   278→                                if (!reasoningBlock) {
+   279→                                        reasoningBlock = open("reasoning");
+   280→                                        yield {
+   281→                                                type: "block-start",
+   282→                                                index: reasoningBlock.index,
+   283→                                                blockType: "reasoning"
+   284→                                        };
+   285→                                }
+   286→                                reasoningBlock.text += reasoning;
+   287→                                yield {
+   288→                                        type: "reasoning-delta",
+   289→                                        index: reasoningBlock.index,
+   290→                                        text: reasoning
+   291→                                };
+   292→                        }
+   293→                        const content = delta?.content;
+   294→                        if (typeof content === "string" && content.length > 0) {
+   295→                                if (!textBlock) {
+   296→                                        textBlock = open("text");
+   297→                                        yield {
+   298→                                                type: "block-start",
+   299→                                                index: textBlock.index,
+   300→                                                blockType: "text"
+   301→                                        };
+   302→                                }
+   303→                                textBlock.text += content;
+   304→                                yield {
+   305→                                        type: "text-delta",
+   306→                                        index: textBlock.index,
+   307→                                        text: content
+   308→                                };
+   309→                        }
+   310→                        for (const call of delta?.tool_calls ?? []) {
+   311→                                let block = toolBlocks.get(call.index);
+   312→                                if (!block) {
+   313→                                        block = open("tool-call");
+   314→                                        toolBlocks.set(call.index, block);
+   315→                                        yield {
+   316→                                                type: "block-start",
+   317→                                                index: block.index,
+   318→                                                blockType: "tool-call"
+   319→                                        };
+   320→                                }
+   321→                                if (call.id !== void 0) block.callId = call.id;
+   322→                                if (call.function?.name !== void 0) block.name = call.function.name;
+   323→                                const fragment = call.function?.arguments ?? "";
+   324→                                block.text += fragment;
+   325→                                yield {
+   326→                                        type: "tool-call-delta",
+   327→                                        index: block.index,
+   328→                                        id: CallId(block.callId ?? ""),
+   329→                                        ...block.name !== void 0 ? { name: block.name } : {},
+   330→                                        argumentsDelta: fragment
+   331→                                };
+   332→                        }
+   333→                        if (typeof choice.finish_reason === "string") pendingFinish = mapFinishReason(choice.finish_reason);
+   334→                }
+   335→                if (chunk.usage) pendingUsage = mapUsage(chunk.usage);
+   336→        }
+   337→        throw new LlmError("SSE payload stream ended without [DONE]", "STREAM_CLOSED");
+   338→}
+   339→//#endregion
+   340→//#region lib/types/adapter.js
+   341→/**
+   342→* `DeepSeekAdapter`: fetch + SSE against a DeepSeek (OpenAI-compatible)
+   343→* chat-completions endpoint, emitting harness StreamChunks. The adapter is
+   344→* transport-only: connection facts arrive through a thunk resolved once per
+   345→* operation and the bearer token through a per-request resolver, so the
+   346→* registering plugin owns validation, layering, and credential policy.
+   347→*
+   348→* @module dsh-llm-deepseek/adapter
+   349→*/
+   350→var __addDisposableResource = function(env, value, async) {
+   351→        if (value !== null && value !== void 0) {
+   352→                if (typeof value !== "object" && typeof value !== "function") throw new TypeError("Object expected.");
+   353→                var dispose, inner;
+   354→                if (async) {
+   355→                        if (!Symbol.asyncDispose) throw new TypeError("Symbol.asyncDispose is not defined.");
+   356→                        dispose = value[Symbol.asyncDispose];
+   357→                }
+   358→                if (dispose === void 0) {
+   359→                        if (!Symbol.dispose) throw new TypeError("Symbol.dispose is not defined.");
+   360→                        dispose = value[Symbol.dispose];
+   361→                        if (async) inner = dispose;
+   362→                }
+   363→                if (typeof dispose !== "function") throw new TypeError("Object not disposable.");
+   364→                if (inner) dispose = function() {
+   365→                        try {
+   366→                                inner.call(this);
+   367→                        } catch (e) {
+   368→                                return Promise.reject(e);
+   369→                        }
+   370→                };
+   371→                env.stack.push({
+   372→                        value,
+   373→                        dispose,
+   374→                        async
+   375→                });
+   376→        } else if (async) env.stack.push({ async: true });
+   377→        return value;
+   378→};
+   379→var __disposeResources = (function(SuppressedError) {
+   380→        return function(env) {
+   381→                function fail(e) {
+   382→                        env.error = env.hasError ? new SuppressedError(e, env.error, "An error was suppressed during disposal.") : e;
+   383→                        env.hasError = true;
+   384→                }
+   385→                var r, s = 0;
+   386→                function next() {
+   387→                        while (r = env.stack.pop()) try {
+   388→                                if (!r.async && s === 1) return s = 0, env.stack.push(r), Promise.resolve().then(next);
+   389→                                if (r.dispose) {
+   390→                                        var result = r.dispose.call(r.value);
+   391→                                        if (r.async) return s |= 2, Promise.resolve(result).then(next, function(e) {
+   392→                                                fail(e);
+   393→                                                return next();
+   394→                                        });
+   395→                                } else s |= 1;
+   396→                        } catch (e) {
+   397→                                fail(e);
+   398→                        }
+   399→                        if (s === 1) return env.hasError ? Promise.reject(env.error) : Promise.resolve();
+   400→                        if (env.hasError) throw env.error;
+   401→                }
+   402→                return next();
+   403→        };
+   404→})(typeof SuppressedError === "function" ? SuppressedError : function(error, suppressed, message) {
+   405→        var e = new Error(message);
+   406→        return e.name = "SuppressedError", e.error = error, e.suppressed = suppressed, e;
+   407→});
+   408→/** Default maximum idle interval while an adapter stream read is outstanding. */
+   409→const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 3e5;
+   410→/** Default combined request/response context capacity. */
+   411→const DEFAULT_CONTEXT_WINDOW = 1e6;
+   412→/** Default per-request output-token cap. */
+   413→const DEFAULT_MAX_TOKENS = 256e3;
+   414→const STREAM_IDLE_TIMEOUT_CODE = "LLM_STREAM_IDLE_TIMEOUT";
+   415→const OFF_REASONING_EFFORT = ReasoningEffortId("off");
+   416→const HIGH_REASONING_EFFORT = ReasoningEffortId("high");
+   417→const MAX_REASONING_EFFORT = ReasoningEffortId("max");
+   418→const REASONING_EFFORTS = [
+   419→        {
+   420→                id: OFF_REASONING_EFFORT,
+   421→                name: "Off"
+   422→        },
+   423→        {
+   424→                id: HIGH_REASONING_EFFORT,
+   425→                name: "High"
+   426→        },
+   427→        {
+   428→                id: MAX_REASONING_EFFORT,
+   429→                name: "Max"
+   430→        }
+   431→];
+   432→const OFF_ONLY_REASONING_EFFORTS = [{
+   433→        id: OFF_REASONING_EFFORT,
+   434→        name: "Off"
+   435→}];
+   436→function modelInfo(provider, model) {
+   437→        return {
+   438→                provider,
+   439→                id: model.id,
+   440→                name: model.name ?? model.id,
+   441→                ...model.description === void 0 ? {} : { description: model.description },
+   442→                inputModalities: ["text"]
+   443→        };
+   444→}
+   445→function providerRetryAfterMs(value) {
+   446→        if (value === null) return void 0;
+   447→        if (/^\d+$/.test(value)) {
+   448→                const delay = Number(value) * 1e3;
+   449→                return Number.isFinite(delay) && delay > 0 ? delay : void 0;
+   450→        }
+   451→        const delay = Date.parse(value) - Date.now();
+   452→        return Number.isFinite(delay) && delay > 0 ? delay : void 0;
+   453→}
+   454→function requestId(headers) {
+   455→        const value = headers.get("x-request-id") ?? headers.get("x-deepseek-request-id");
+   456→        return value === null || value.length === 0 ? void 0 : ProviderRequestId(value);
+   457→}
+   458→/**
+   459→* Map an HTTP status to a stable LlmError code.
+   460→* @param status - status of a non-2xx provider response.
+   461→* @param error - parsed provider error body, when available.
+   462→* @returns the normalized harness error code.
+   463→*/
+   464→function httpErrorCode(status, error) {
+   465→        if (status === 401 || status === 403) return "AUTH";
+   466→        const detail = [
+   467→                error?.code,
+   468→                error?.type,
+   469→                error?.message
+   470→        ].filter(Boolean).join(" ");
+   471→        if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE;
+   472→        if (status === 429) return "RATE_LIMIT";
+   473→        if (status === 400) {
+   474→                if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE;
+   475→                return "INVALID_REQUEST";
+   476→        }
+   477→        if (status >= 500) return "SERVER";
+   478→        return `HTTP_${status}`;
+   479→}
+   480→/**
+   481→* The first real `LlmAdapter`. One instance serves every model name it was
+   482→* registered under (the harness model name IS the wire model name).
+   483→*
+   484→* One stable signal reaches both initial fetch and body reads. Caller aborts
+   485→* map to `ABORTED`; the configured per-read idle watchdog maps to `TIMEOUT`.
+   486→*/
+   487→var DeepSeekAdapter = class extends LlmAdapter {
+   488→        config;
+   489→        constructor(config) {
+   490→                super();
+   491→                this.config = config;
+   492→        }
+   493→        providerInfo(provider) {
+   494→                return {
+   495→                        id: provider,
+   496→                        name: "DeepSeek"
+   497→                };
+   498→        }
+   499→        providerRetryPolicy(_provider) {
+   500→                return this.config.options().retryPolicy;
+   501→        }
+   502→        listModels(provider) {
+   503→                return Promise.resolve(this.config.options().models.map((model) => modelInfo(provider, model)));
+   504→        }
+   505→        resolveModel(provider, model, _signal) {
+   506→                const connection = this.config.options();
+   507→                const configured = connection.models.find((entry) => entry.id === model);
+   508→                const contextWindow = configured?.contextWindow ?? connection.defaultContextWindow;
+   509→                return Promise.resolve({
+   510→                        ...configured === void 0 ? {
+   511→                                provider,
+   512→                                id: model,
+   513→                                name: model,
+   514→                                inputModalities: ["text"]
+   515→                        } : modelInfo(provider, configured),
+   516→                        context: { contextWindow },
+   517→                        defaultMaxTokens: configured?.maxTokens ?? connection.maxTokens,
+   518→                        ...connection.defaults.thinking === "disabled" ? { reasoning: {
+   519→                                efforts: OFF_ONLY_REASONING_EFFORTS,
+   520→                                defaultEffort: OFF_REASONING_EFFORT
+   521→                        } } : { reasoning: {
+   522→                                efforts: REASONING_EFFORTS,
+   523→                                defaultEffort: connection.defaults.reasoningEffort === "off" ? OFF_REASONING_EFFORT : connection.defaults.reasoningEffort === "max" ? MAX_REASONING_EFFORT : HIGH_REASONING_EFFORT
+   524→                        } }
+   525→                });
+   526→        }
+   527→        async *stream(options) {
+   528→                const env_1 = {
+   529→                        stack: [],
+   530→                        error: void 0,
+   531→                        hasError: false
+   532→                };
+   533→                try {
+   534→                        const connection = this.config.options();
+   535→                        const apiKey = await this.config.resolveApiKey(connection);
+   536→                        const userId = this.config.resolveUserId();
+   537→                        const consumer = new AbortController();
+   538→                        const watchdog = __addDisposableResource(env_1, idleWatchdog(options.signal === void 0 ? consumer.signal : AbortSignal.any([options.signal, consumer.signal]), connection.streamIdleTimeoutMs, STREAM_IDLE_TIMEOUT_CODE), false);
+   539→                        const iterator = this.request(options, watchdog.signal, connection, apiKey, userId, () => {
+   540→                                watchdog.pulse();
+   541→                        })[Symbol.asyncIterator]();
+   542→                        let exhausted = false;
+   543→                        try {
+   544→                                while (true) {
+   545→                                        const result = await watchdog.next(iterator);
+   546→                                        if (result.done) {
+   547→                                                exhausted = true;
+   548→                                                return;
+   549→                                        }
+   550→                                        yield result.value;
+   551→                                }
+   552→                        } catch (error) {
+   553→                                if (timeoutOf(watchdog.signal, STREAM_IDLE_TIMEOUT_CODE) !== void 0) throw new LlmError(`DeepSeek stream idle timeout after ${connection.streamIdleTimeoutMs}ms`, "TIMEOUT", { cause: error });
+   554→                                if (options.signal?.aborted) throw new LlmError("DeepSeek request aborted by caller", "ABORTED", { cause: error });
+   555→                                if (error instanceof LlmError) throw error;
+   556→                                throw new LlmError(`DeepSeek API stream from ${connection.baseURL} failed`, "TRANSPORT", { cause: error });
+   557→                        } finally {
+   558→                                consumer.abort("DeepSeek stream consumer stopped");
+   559→                                if (!exhausted && iterator.return !== void 0) try {
+   560→                                        await iterator.return();
+   561→                                } catch (_abortedTransportTeardown) {}
+   562→                        }
+   563→                } catch (e_1) {
+   564→                        env_1.error = e_1;
+   565→                        env_1.hasError = true;
+   566→                } finally {
+   567→                        __disposeResources(env_1);
+   568→                }
+   569→        }
+   570→        async *request(options, signal, connection, apiKey, userId, onComment) {
+   571→                const body = serializeRequest(options, connection.defaults);
+   572→                const payload = JSON.stringify(body);
+   573→                const headers = {
+   574→                        "authorization": `Bearer ${apiKey}`,
+   575→                        "content-type": "application/json",
+   576→                        "accept": "text/event-stream",
+   577→                        ...attributionHeaders(),
+   578→                        "x-deepseek-harness-user-id": String(userId),
+   579→                        ...options.sessionId !== void 0 ? { "x-deepseek-harness-session-id": String(options.sessionId) } : {},
+   580→                        ...options.purpose === "compaction" ? { "x-deepseek-harness-compact": "1" } : {}
+   581→                };
+   582→                let response;
+   583→                try {
+   584→                        response = await fetch(`${connection.baseURL}/chat/completions`, {
+   585→                                method: "POST",
+   586→                                headers,
+   587→                                body: payload,
+   588→                                signal
+   589→                        });
+   590→                } catch (error) {
+   591→                        if (signal.aborted) throw error;
+   592→                        throw new LlmError(`DeepSeek API request to ${connection.baseURL} failed`, "TRANSPORT", { cause: error });
+   593→                }
+   594→                if (!response.ok) {
+   595→                        let message = `DeepSeek API error (HTTP ${response.status})`;
+   596→                        let providerError;
+   597→                        try {
+   598→                                providerError = (await response.json()).error;
+   599→                                if (providerError?.message) message = providerError.message;
+   600→                        } catch {}
+   601→                        const delay = providerRetryAfterMs(response.headers.get("retry-after"));
+   602→                        const id = requestId(response.headers);
+   603→                        throw new LlmError(message, httpErrorCode(response.status, providerError), {
+   604→                                status: response.status,
+   605→                                ...delay === void 0 ? {} : { providerRetryAfterMs: delay },
+   606→                                ...id === void 0 ? {} : { requestId: id }
+   607→                        });
+   608→                }
+   609→                if (!response.body) throw new LlmError("DeepSeek API returned no response body", "EMPTY_RESPONSE");
+   610→                yield* translate(parseSse(response.body, onComment));
+   611→        }
+   612→};
+   613→//#endregion
+   614→//#region lib/types/index.js
+   615→/**
+   616→* Register a {@link DeepSeekAdapter} for the `deepseek-official` provider route on
+   617→* `ctx.llm`, with connection facts resolved per request instead of frozen at
+   618→* load: the plugin layers its `cordis.yml` entry config under the optional
+   619→* `llm-deepseek` user-settings section (`ctx.settings`) and resolves the API
+   620→* key through the optional credential seam (`ctx.credentials`), so a changed
+   621→* base URL, catalog, or key reaches the very next request without restarting
+   622→* anything, while an in-flight stream keeps the facts it started with. The
+   623→* one registration-captured fact — the retry policy — re-registers the route
+   624→* in place when it changes.
+   625→* @module @deepseek-ai/dsh-llm-deepseek
+   626→*/
+   627→const name = "llm-deepseek";
+   628→const inject = ["llm"];
+   629→const NS = settingsNamespace("llm-deepseek");
+   630→const DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY";
+   631→/** The single provider route this plugin owns. */
+   632→const PROVIDER = "deepseek-official";
+   633→const DEFAULT_MODELS = [{
+   634→        id: "deepseek-v4-flash",
+   635→        name: "DeepSeek-V4-Flash",
+   636→        contextWindow: DEFAULT_CONTEXT_WINDOW
+   637→}, {
+   638→        id: "deepseek-v4-pro",
+   639→        name: "DeepSeek-V4-Pro",
+   640→        contextWindow: DEFAULT_CONTEXT_WINDOW
+   641→}];
+   642→const catalogModel = z.object({
+   643→        id: z.string().required(),
+   644→        name: z.string(),
+   645→        description: z.string(),
+   646→        contextWindow: z.number().step(1).min(1),
+   647→        maxTokens: z.number().step(1).min(1)
+   648→});
+   649→const Config = z.object({
+   650→        apiKeyEnv: z.string().role("credential-ref").default(DEFAULT_API_KEY_ENV),
+   651→        baseURL: z.string(),
+   652→        thinking: z.union(["enabled", "disabled"]),
+   653→        reasoningEffort: z.union([
+   654→                "off",
+   655→                "high",
+   656→                "max"
+   657→        ]),
+   658→        maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
+   659→        defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
+   660→        models: z.array(catalogModel).default(DEFAULT_MODELS),
+   661→        streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+   662→        retryPolicy: RetryPolicySchema
+   663→});
+   664→/** Public API default; the internal endpoint comes from $DEEPSEEK_BASE_URL. */
+   665→const PUBLIC_BASE_URL = "https://api.deepseek.com";
+   666→/** Environment variable naming this provider's endpoint, honored only from trusted layers. */
+   667→const BASE_URL_ENV = "DEEPSEEK_BASE_URL";
+   668→/** Resolve, validate, and detach the advisory model catalog. */
+   669→function resolveModels(models) {
+   670→        const seen = /* @__PURE__ */ new Set();
+   671→        return (models ?? DEFAULT_MODELS).map((model) => {
+   672→                if (model.id.length === 0) throw new Error("llm-deepseek: catalog model ids must be non-empty");
+   673→                if (model.name !== void 0 && model.name.length === 0) throw new Error(`llm-deepseek: catalog model "${model.id}" has an empty name`);
+   674→                if (model.contextWindow !== void 0 && (!Number.isInteger(model.contextWindow) || model.contextWindow <= 0)) throw new Error(`llm-deepseek: catalog model "${model.id}" contextWindow must be a positive integer`);
+   675→                if (model.maxTokens !== void 0 && (!Number.isInteger(model.maxTokens) || model.maxTokens <= 0)) throw new Error(`llm-deepseek: catalog model "${model.id}" maxTokens must be a positive integer`);
+   676→                if (seen.has(model.id)) throw new Error(`llm-deepseek: duplicate catalog model "${model.id}"`);
+   677→                seen.add(model.id);
+   678→                return {
+   679→                        id: model.id,
+   680→                        ...model.name === void 0 ? {} : { name: model.name },
+   681→                        ...model.description === void 0 ? {} : { description: model.description },
+   682→                        ...model.contextWindow === void 0 ? {} : { contextWindow: model.contextWindow },
+   683→                        ...model.maxTokens === void 0 ? {} : { maxTokens: model.maxTokens }
+   684→                };
+   685→        });
+   686→}
+   687→/**
+   688→* The one explicit resolve step from raw config to validated connection
+   689→* facts. Programmatic construction may bypass Schemastery normalization, so
+   690→* every default and bound is re-judged here — for the composition entry at
+   691→* load (fail loud) and for each settings snapshot at its first use.
+   692→* @param config - raw plugin config or resolved settings snapshot.
+   693→* @param environment - this run's environment layers, or `undefined` outside
+   694→* the product CLI. Every layer may supply an endpoint: the product trusts the
+   695→* project it is launched in, so a checkout can point its own agent at the
+   696→* gateway that checkout is meant to use.
+   697→* @returns validated connection facts plus the credential reference.
+   698→*/
+   699→function resolveAdapterOptions(config, environment) {
+   700→        if (config.thinking === "disabled" && config.reasoningEffort !== void 0 && config.reasoningEffort !== "off") throw new Error("llm-deepseek: only reasoningEffort \"off\" can be configured when thinking is disabled");
+   701→        if (config.defaultContextWindow !== void 0 && (!Number.isInteger(config.defaultContextWindow) || config.defaultContextWindow <= 0)) throw new Error("llm-deepseek: defaultContextWindow must be a positive integer");
+   702→        if (config.maxTokens !== void 0 && (!Number.isSafeInteger(config.maxTokens) || config.maxTokens <= 0)) throw new Error("llm-deepseek: maxTokens must be a positive safe integer");
+   703→        const streamIdleTimeoutMs = config.streamIdleTimeoutMs ?? 3e5;
+   704→        if (!Number.isFinite(streamIdleTimeoutMs) || streamIdleTimeoutMs <= 0 || streamIdleTimeoutMs > MAX_TIMER_DELAY_MS) throw new Error(`llm-deepseek: streamIdleTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`);
+   705→        return {
+   706→                apiKeyEnv: credentialRef(config.apiKeyEnv ?? DEFAULT_API_KEY_ENV),
+   707→                baseURL: config.baseURL ?? environment?.get(BASE_URL_ENV)?.value ?? "https://api.deepseek.com",
+   708→                defaults: {
+   709→                        thinking: config.thinking,
+   710→                        reasoningEffort: config.reasoningEffort
+   711→                },
+   712→                maxTokens: config.maxTokens ?? 256e3,
+   713→                defaultContextWindow: config.defaultContextWindow ?? 1e6,
+   714→                models: resolveModels(config.models),
+   715→                streamIdleTimeoutMs,
+   716→                retryPolicy: resolveRetryPolicy(config.retryPolicy, "llm-deepseek: retryPolicy")
+   717→        };
+   718→}
+   719→function apply(ctx, config) {
+   720→        let current = () => config;
+   721→        let lastRaw;
+   722→        let lastGood;
+   723→        const options = () => {
+   724→                const raw = current();
+   725→                if (raw === lastRaw && lastGood !== void 0) return lastGood;
+   726→                try {
+   727→                        const next = resolveAdapterOptions(raw, launchEnvironmentOf(ctx));
+   728→                        lastRaw = raw;
+   729→                        lastGood = next;
+   730→                        return next;
+   731→                } catch (error) {
+   732→                        if (lastGood === void 0) throw error;
+   733→                        lastRaw = raw;
+   734→                        ctx.logger.error("llm-deepseek: keeping the last good configuration after an invalid settings section");
+   735→                        ctx.logger.error(error);
+   736→                        return lastGood;
+   737→                }
+   738→        };
+   739→        options();
+   740→        const resolveApiKey = async (connection) => {
+   741→                const ref = connection.apiKeyEnv;
+   742→                const credentials = ctx.get("credentials");
+   743→                if (credentials !== void 0) {
+   744→                        const hit = await credentials.resolve(ref);
+   745→                        if (hit !== void 0) return assertUsableApiKey(hit.value, "llm-deepseek", ref);
+   746→                } else {
+   747→                        const ambient = launchEnvironmentOf(ctx).get(ref);
+   748→                        if (ambient !== void 0 && ambient.value.length > 0) return assertUsableApiKey(ambient.value, "llm-deepseek", ref);
+   749→                }
+   750→                throw new LlmError(`llm-deepseek: no API key for provider route "${PROVIDER}"; store ${ref} through the credentials service (the web Models page writes it), or export ${ref} in the launching environment`, "MISSING_CREDENTIAL");
+   751→        };
+   752→        let userId;
+   753→        const resolveUserId = () => userId ??= getOrCreateAnonymousUserId();
+   754→        const adapter = new DeepSeekAdapter({
+   755→                options,
+   756→                resolveApiKey,
+   757→                resolveUserId
+   758→        });
+   759→        ctx.llm.registerConfigurableProviders([{
+   760→                provider: PROVIDER,
+   761→                displayName: "DeepSeek",
+   762→                settingsNs: NS,
+   763→                settingsPath: []
+   764→        }]);
+   765→        const registration = ctx.llm.registerAdapter([PROVIDER], adapter);
+   766→        let registeredPolicy = options().retryPolicy;
+   767→        const ensureRegistrationFacts = () => {
+   768→                const policy = options().retryPolicy;
+   769→                if (deepEqualJson(policy, registeredPolicy)) return;
+   770→                registration.replace([PROVIDER]);
+   771→                registeredPolicy = policy;
+   772→        };
+   773→        installSettingsSection(ctx, NS, Config, config, {
+   774→                setSource: (source) => {
+   775→                        current = source;
+   776→                },
+   777→                onChange: ensureRegistrationFacts
+   778→        });
+   779→}
+   780→//#endregion
+   781→export { Config, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, DeepSeekAdapter, PUBLIC_BASE_URL, apply, inject, name, resolveAdapterOptions };
+   782→

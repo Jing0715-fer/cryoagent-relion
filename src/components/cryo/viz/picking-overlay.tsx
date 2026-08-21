@@ -20,7 +20,8 @@ interface Props {
 // coordinates. The user can switch between micrographs.
 export function PickingOverlay({ projectId, jobId }: Props) {
   const [micrographs, setMicrographs] = useState<{ name: string; path: string }[]>([]);
-  const [coords, setCoords] = useState<PickedCoord[]>([]);
+  // coordsByMic: map from micrograph basename -> its picked coords
+  const [coordsByMic, setCoordsByMic] = useState<Record<string, PickedCoord[]>>({});
   const [selectedMic, setSelectedMic] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [imgLoaded, setImgLoaded] = useState(false);
@@ -41,9 +42,9 @@ export function PickingOverlay({ projectId, jobId }: Props) {
         // Fetch and parse the star file
         const starRes = await fetch("/api/files?projectId=" + projectId + "&path=" + encodeURIComponent(autopickStar.path));
         const text = await starRes.text();
-        // Parse coordinates — the autopick.star has columns:
-        // _rlnCoordinateX _rlnCoordinateY _rlnImageName _rlnMicrographName ...
-        // Data rows look like: "103 156 000001@... Movies/movie_010.mrc 1 ..."
+        // Parse coordinates — autopick.star has columns:
+        // _rlnCoordinateX _rlnCoordinateY _rlnImageName _rlnMicrographName
+        // _rlnImageSize (2 ints: px, py of original micrograph frame)
         const parsed: Record<string, PickedCoord[]> = {};
         let inParticles = false;
         const colIdx: Record<string, number> = {};
@@ -52,7 +53,6 @@ export function PickingOverlay({ projectId, jobId }: Props) {
           if (s.startsWith("data_particles")) { inParticles = true; continue; }
           if (s.startsWith("data_") && inParticles) break;
           if (!inParticles) continue;
-          // parse column headers
           if (s.startsWith("_rln")) {
             const m = s.match(/^(_\S+)\s+#(\d+)/);
             if (m) colIdx[m[1]] = parseInt(m[2]);
@@ -61,17 +61,23 @@ export function PickingOverlay({ projectId, jobId }: Props) {
           if (!s || s.startsWith("#") || s.startsWith("loop")) continue;
           const parts = s.split(/\s+/);
           if (parts.length < 4) continue;
-          // Find X, Y, and micrograph name columns
           const xCol = colIdx["_rlnCoordinateX"] || 1;
           const yCol = colIdx["_rlnCoordinateY"] || 2;
-          const micCol = colIdx["_rlnMicrographName"] || 4;
+          const micCol = colIdx["_rlnMicrographName"] || colIdx["_rlnImageName"] || 4;
+          const xSizeCol = colIdx["_rlnImageSize"] || -1;
+          const ySizeCol = (xSizeCol >= 0) ? xSizeCol + 1 : -1;
           const x = parseFloat(parts[xCol - 1]);
           const y = parseFloat(parts[yCol - 1]);
           const micName = parts[micCol - 1] || parts[parts.length - 1];
           if (!isNaN(x) && !isNaN(y)) {
             const base = micName.split("/").pop() || micName;
+            let w = 4096, h = 4096;
+            if (xSizeCol >= 0 && parts.length >= ySizeCol) {
+              w = parseInt(parts[xSizeCol - 1]) || 4096;
+              h = parseInt(parts[ySizeCol - 1]) || 4096;
+            }
             if (!parsed[base]) parsed[base] = [];
-            parsed[base].push({ x, y });
+            parsed[base].push({ x, y, micrographWidth: w, micrographHeight: h });
           }
         }
         // Build micrograph list — match coords to the corrected micrograph files
@@ -98,9 +104,9 @@ export function PickingOverlay({ projectId, jobId }: Props) {
         }
         if (!cancelled) {
           setMicrographs(mics);
+          setCoordsByMic(parsed);
           if (mics.length > 0) {
             setSelectedMic(mics[0].path);
-            setCoords(parsed[mics[0].name] || parsed[Object.keys(parsed)[0]] || []);
           }
         }
       } catch { /* ignore */ }
@@ -142,18 +148,17 @@ export function PickingOverlay({ projectId, jobId }: Props) {
     ctx.drawImage(img, offsetX, offsetY, drawW, drawH);
     // Draw circles at picked coords.
     //
-    // The micrograph file may be rendered as a 256x256 thumbnail (via
-    // ?thumb=1) but the picked coordinates are in the FULL micrograph
-    // frame (e.g. 1024x1024 for bin4 EMPIAR). Without rescaling, the
-    // circles would appear far outside the image. The thumbnail is a
-    // proportional center crop, so the picked coords (in full-frame) need
-    // to be scaled by `originalWidth / naturalWidth` to map to image-space.
-    // We assume the original micrograph is 1024x1024 (bin4 default) when
-    // the thumbnail is 256x256 — a 4x scale factor.
-    const ORIGINAL_BIN4 = 1024;
-    const scaleRatio = (img.naturalWidth || ORIGINAL_BIN4) / ORIGINAL_BIN4;
-    const scaleX = (drawW / (img.naturalWidth || 1)) * scaleRatio;
-    const scaleY = (drawH / (img.naturalHeight || 1)) * scaleRatio;
+    // The picked coordinates are in the FULL micrograph frame (e.g. 4096x4096
+    // for raw EMPIAR Falcon, or 1024x1024 for bin4). The thumbnail is
+    // downsampled to 256x256 (full image, no crop), so the scale factor
+    // is drawW / originalMicWidth. Use coordsByMic so each micrograph
+    // shows its own coordinates when clicked.
+    const selectedMicName = micrographs.find(m => m.path === selectedMic)?.name;
+    const coords = (selectedMicName && coordsByMic[selectedMicName]) || [];
+    const origW = coords[0]?.micrographWidth ?? img.naturalWidth ?? 4096;
+    const origH = coords[0]?.micrographHeight ?? img.naturalHeight ?? 4096;
+    const scaleX = drawW / origW;
+    const scaleY = drawH / origH;
     const radius = Math.max(4, Math.min(drawW, drawH) / 40);
     ctx.strokeStyle = "rgba(52, 211, 153, 0.9)";
     ctx.lineWidth = 1.5;
@@ -166,7 +171,7 @@ export function PickingOverlay({ projectId, jobId }: Props) {
       ctx.fill();
       ctx.stroke();
     }
-  }, [imgLoaded, coords]);
+  }, [imgLoaded, coordsByMic, selectedMic, micrographs]);
 
   function selectMic(path: string, name: string) {
     setSelectedMic(path);
@@ -211,7 +216,7 @@ export function PickingOverlay({ projectId, jobId }: Props) {
           onError={() => setImgLoaded(false)}
         />
         <div className="absolute top-1 left-2 text-[10px] font-mono text-emerald-300 bg-black/60 rounded px-1.5 py-0.5">
-          {coords.length} particles
+          {(coordsByMic[micrographs.find(m => m.path === selectedMic)?.name || ''] || []).length} particles
         </div>
         {micrographs.find(m => m.path === selectedMic) && (
           <div className="absolute top-1 right-2 text-[10px] font-mono text-slate-300 bg-black/60 rounded px-1.5 py-0.5">

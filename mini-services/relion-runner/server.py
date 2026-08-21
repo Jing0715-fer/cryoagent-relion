@@ -1058,7 +1058,7 @@ def task_refine3d(p, inputs, out, on_line, env):
     on_line("info", f"refine3d: auto-refine, diam={diameter}Å, angpix={angpix_r}, sym={p.get('symmetry', 'C2')}")
     out_root = os.path.join(jd, "refine")
     cmd = ["relion_refine", "--i", particles_star, "--o", out_root,
-           "--auto_refine", "--iter", "25",
+           "--auto_refine", "--iter", "25", "--split_random_halves", "--debug_split_random_half", "1",
            "--ref", ref, "--ini_high", "15",
            "--particle_diameter", str(diameter),
            "--flatten_solvent", "--zero_mask", "--sym", str(p.get("symmetry", "C2")),
@@ -1354,6 +1354,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/slice-probe":
             self._handle_slice_probe()
             return
+        if u.path == "/file":
+            self._handle_file()
+            return
         if u.path != "/run":
             self._send(404, {"error": "not found"})
             return
@@ -1366,7 +1369,52 @@ class Handler(BaseHTTPRequestHandler):
         result = run_job(req)
         self._send(200, result)
 
+    def _handle_file(self):
+        """POST /file  body: { projectId, path }"""
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send(400, {"error": f"bad json: {e}"})
+            return
+        project_id = req.get("projectId") or ""
+        rel_path = req.get("path") or ""
+        if not project_id or not rel_path:
+            self._send(400, {"error": "projectId and path required"})
+            return
+        if ".." in rel_path:
+            self._send(400, {"error": "bad path"})
+            return
+        candidates = [
+            os.path.join("/home/z/my-project/data/projects", project_id, rel_path),
+            os.path.join("/mnt/d/AI-web-app/cryoagent-relion/data/projects", project_id, rel_path),
+        ]
+        full = None
+        for c in candidates:
+            if os.path.exists(c):
+                full = c
+                break
+        if not full:
+            self._send(404, {"error": "not found"})
+            return
+        try:
+            with open(full, "rb") as f:
+                buf = f.read()
+        except Exception as e:
+            self._send(500, {"error": f"read failed: {e}"})
+            return
+        lower = rel_path.lower()
+        is_text = lower.endswith(".star") or lower.endswith(".log") or lower.endswith(".bild") or lower.endswith(".json") or lower.endswith(".txt")
+        ctype = "text/plain; charset=utf-8" if is_text else "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(buf)))
+        self.send_header("Content-Disposition", chr(34) + "attachment; filename=" + os.path.basename(full) + chr(34))
+        self.end_headers()
+        self.wfile.write(buf)
+
     def _handle_thumb(self):
+
         """POST /thumb  body: { projectId, path }
         Generates a 256x256 PNG thumbnail of the .mrc/.mrcs file at the given
         relative path under data/projects/<projectId>/. Reads the file in WSL
